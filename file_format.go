@@ -63,12 +63,12 @@ func FileMetadataFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*Fil
 }
 
 type DataBlockMetadata struct {
-	offset uint64
+	Offset uint64
 
 	// size includes the uint64 xxhash at the end of the byte slice
-	size uint64
+	Size uint64
 
-	bloomFilter *bloom.BloomFilter // must exist
+	BloomFilter *bloom.BloomFilter // must exist
 
 	MinMaxIndexes map[string]MinMaxIndex `json:",omitempty"`
 	PartitionID   string                 `json:",omitempty"`
