@@ -94,3 +94,79 @@ func TestUniqueFields(t *testing.T) {
 		})
 	}
 }
+
+func TestBasicWhitespaceTokenizer(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    any
+		expected []string
+	}{
+		{
+			name:     "basic alphanumeric string",
+			input:    "hello world 123",
+			expected: []string{"hello", "world", "123"},
+		},
+		{
+			name:     "string with special characters",
+			input:    "hello@world.com!test",
+			expected: []string{"hello", "world", "com", "test"},
+		},
+		{
+			name:     "string with dashes and underscores",
+			input:    "hello-world_test",
+			expected: []string{"hello-world_test"},
+		},
+		{
+			name:     "string with emojis",
+			input:    "hello 😊 world 🎉",
+			expected: []string{"hello", "😊", "world", "🎉"},
+		},
+		{
+			name:     "mixed alphanumeric with punctuation",
+			input:    "user@domain.com, password123!",
+			expected: []string{"user", "domain", "com", "password123"},
+		},
+		{
+			name:     "number input",
+			input:    42,
+			expected: []string{"42"},
+		},
+		{
+			name:     "boolean input",
+			input:    true,
+			expected: []string{"true"},
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: []string{},
+		},
+		{
+			name:     "string with multiple spaces",
+			input:    "hello   world",
+			expected: []string{"hello", "world"},
+		},
+		{
+			name:     "string with only special characters",
+			input:    "!@#$%^&*()",
+			expected: []string{"$", "^"},
+		},
+		{
+			name:     "string with tabs and newlines",
+			input:    "hello\tworld\ntest",
+			expected: []string{"hello", "world", "test"},
+		},
+		{
+			name:     "complex mixed content",
+			input:    "user-name_123@example.com (active)",
+			expected: []string{"user-name_123", "example", "com", "active"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := BasicWhitespaceTokenizer(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}

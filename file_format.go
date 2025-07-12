@@ -18,14 +18,18 @@ var (
 	ErrInvalidHash = errors.New("invalid hash")
 )
 
-type FileMetadata struct {
-	BloomFilter *bloom.BloomFilter // must exist
-}
+// File format constants
+const (
+	FileVersion = uint32(1)
+	MagicBytes  = "BLOMSRCH"
+)
 
-func NewFileMetadata(bloomFilter *bloom.BloomFilter) *FileMetadata {
-	return &FileMetadata{
-		BloomFilter: bloomFilter,
-	}
+type FileMetadata struct {
+	FieldBloomFilter      *bloom.BloomFilter // must exist
+	TokenBloomFilter      *bloom.BloomFilter // must exist
+	FieldTokenBloomFilter *bloom.BloomFilter // must exist
+
+	DataBlocks []DataBlockMetadata
 }
 
 // Returns the file metadata as a byte slice and the xxhash of the file metadata
@@ -64,11 +68,11 @@ func FileMetadataFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*Fil
 
 type DataBlockMetadata struct {
 	// Absolute file offset
-	Offset uint64
+	Offset int
 
 	// Size includes the uint64 xxhash at the end of the byte slice
-	Size uint64
-	Rows uint64
+	Size int
+	Rows int
 
 	BloomFilter *bloom.BloomFilter // must exist
 

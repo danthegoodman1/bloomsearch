@@ -11,13 +11,10 @@ import (
 // For example, for an S3DataStore, this might be a serialzed JSON object of the bucket and file key.
 type DataStore interface {
 	// CreateFile creates a file for single-pass writing, returning the handle for writing and the file pointer bytes.
-	//
-	// The partitionID and minMaxIndexes are provided in case they need to determine the file pointer, but they do not need to be stored
-	// (as the writer will already write them in through the file format).
-	CreateFile(ctx context.Context, partitionID string, minMaxIndexes map[string]MinMaxIndex, filePointerBytes []byte) (*io.WriteCloser, []byte, error)
+	CreateFile(ctx context.Context) (io.WriteCloser, []byte, error)
 
 	// OpenFile opens a file for reading.
-	OpenFile(ctx context.Context, filePointerBytes []byte) (*io.ReadSeekCloser, error)
+	OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error)
 }
 
 // TESTING
@@ -27,11 +24,11 @@ type NullDataStoreFilePointer struct {
 	ID string
 }
 
-func (n *NullDataStore) OpenFile(ctx context.Context, filePointerBytes []byte) (*io.ReadSeekCloser, error) {
+func (n *NullDataStore) OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error) {
 	return nil, nil
 }
 
-func (n *NullDataStore) CreateFile(ctx context.Context, partitionID string, minMaxIndexes map[string]MinMaxIndex, filePointerBytes []byte) (*io.WriteCloser, []byte, error) {
+func (n *NullDataStore) CreateFile(ctx context.Context) (io.WriteCloser, []byte, error) {
 	return nil, nil, nil
 }
 

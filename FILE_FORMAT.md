@@ -12,6 +12,7 @@ The bloomsearch file format is designed for efficient, single-pass writing of un
 [File Metadata]
 [uint64: File Metadata xxhash]
 [uint32: File Metadata Length]
+[uint32: File Version]
 [8 bytes: magic bytes "BLOMSRCH"]
 ```
 
@@ -36,7 +37,7 @@ Dedicated metadata stores can store the partition IDs and mixmax index values ex
 ## Data Block Structure
 
 ```
-[N row bytes]
+[uint32: N row bytes]
 [row bytes]
 ...
 [uint64: Data Block xxhash]

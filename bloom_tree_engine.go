@@ -2,12 +2,19 @@ package bloomsearch
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/bits-and-blooms/bloom/v3"
+	"github.com/cespare/xxhash"
+)
+
+var (
+	ErrInvalidConfig = errors.New("invalid configuration")
 )
 
 type PartitionFunc func(row map[string]any) string
@@ -57,9 +64,10 @@ type BloomSearchEngineConfig struct {
 }
 
 type partitionBuffer struct {
+	partitionID           string
 	rowCount              int
 	minMaxIndexes         map[string]MinMaxIndex
-	buffer                [][]byte // serialized rows
+	buffer                []byte
 	fieldBloomFilter      *bloom.BloomFilter
 	tokenBloomFilter      *bloom.BloomFilter
 	fieldTokenBloomFilter *bloom.BloomFilter
@@ -80,8 +88,12 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 	}
 }
 
-func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, dataStore DataStore) *BloomSearchEngine {
+func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, dataStore DataStore) (*BloomSearchEngine, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	if config.Tokenizer == nil {
+		return nil, fmt.Errorf("%w: tokenizer is required", ErrInvalidConfig)
+	}
 
 	return &BloomSearchEngine{
 		config:    config,
@@ -97,7 +109,7 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		},
 		ctx:    ctx,
 		cancel: cancel,
-	}
+	}, nil
 }
 
 // Start begins the ingestion and flush workers
@@ -189,8 +201,9 @@ func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBu
 	for partitionID := range partitionedRows {
 		if partitionBuffers[partitionID] == nil {
 			partitionBuffers[partitionID] = &partitionBuffer{
+				partitionID:           partitionID,
 				minMaxIndexes:         make(map[string]MinMaxIndex),
-				buffer:                make([][]byte, 0),
+				buffer:                make([]byte, 0),
 				fieldBloomFilter:      bloom.NewWithEstimates(1000000, 0.01),
 				tokenBloomFilter:      bloom.NewWithEstimates(1000000, 0.01),
 				fieldTokenBloomFilter: bloom.NewWithEstimates(1000000, 0.01),
@@ -217,8 +230,11 @@ func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBu
 			for _, field := range uniqueFields {
 				partitionBuffer.fieldBloomFilter.AddString(field.Path)
 				for _, value := range field.Values {
-					partitionBuffer.tokenBloomFilter.AddString(value)
-					partitionBuffer.fieldTokenBloomFilter.AddString(field.Path + "::" + value)
+					tokens := b.config.Tokenizer(value)
+					for _, token := range tokens {
+						partitionBuffer.tokenBloomFilter.AddString(token)
+						partitionBuffer.fieldTokenBloomFilter.AddString(field.Path + "::" + token)
+					}
 				}
 			}
 
@@ -248,19 +264,27 @@ func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBu
 				return
 			}
 
+			// Check if row is too large for uint32 length prefix
+			if len(rowBytes) > 0xFFFFFFFF {
+				req.doneChan <- fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF)
+				return
+			}
+
+			// Write length prefix (uint32) followed by row bytes
+			lengthBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(lengthBytes, uint32(len(rowBytes)))
+			partitionBuffer.buffer = append(partitionBuffer.buffer, lengthBytes...)
+			partitionBuffer.buffer = append(partitionBuffer.buffer, rowBytes...)
+
 			// Increment stats
-			*bufferedBytes += len(rowBytes)
-			partitionBuffer.buffer = append(partitionBuffer.buffer, rowBytes)
+			*bufferedBytes += len(rowBytes) + 4 // +4 for length prefix
 			partitionBuffer.rowCount += 1
 			*bufferedRowCount += 1
 		}
 
 		// Check partition-level limits
 		if !shouldFlush {
-			partitionBytes := 0
-			for _, rowBytes := range partitionBuffer.buffer {
-				partitionBytes += len(rowBytes)
-			}
+			partitionBytes := len(partitionBuffer.buffer)
 
 			if partitionBuffer.rowCount >= b.config.MaxRowGroupRows ||
 				partitionBytes >= b.config.MaxRowGroupBytes {
@@ -341,15 +365,131 @@ func (b *BloomSearchEngine) flushWorker() {
 }
 
 func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
-	// TODO: merge bloom filters
-	// TODO: calculate final metadata
-	// TODO: write to data store
-	// TODO: write to meta store
-
-	// For now, just signal completion
-	for _, doneChan := range flushReq.doneChans {
-		if doneChan != nil {
-			doneChan <- nil
-		}
+	// Merge bloom filters for file-level bloom filters
+	fileFieldBloomFilter := bloom.NewWithEstimates(1000000, 0.01)
+	fileTokenBloomFilter := bloom.NewWithEstimates(1000000, 0.01)
+	fileFieldTokenBloomFilter := bloom.NewWithEstimates(1000000, 0.01)
+	for _, partitionBuffer := range flushReq.partitionBuffers {
+		fileFieldBloomFilter.Merge(partitionBuffer.fieldBloomFilter)
+		fileTokenBloomFilter.Merge(partitionBuffer.tokenBloomFilter)
+		fileFieldTokenBloomFilter.Merge(partitionBuffer.fieldTokenBloomFilter)
 	}
+
+	// Calculate final metadata
+	fileMetadata := FileMetadata{
+		FieldBloomFilter:      fileFieldBloomFilter,
+		TokenBloomFilter:      fileTokenBloomFilter,
+		FieldTokenBloomFilter: fileFieldTokenBloomFilter,
+		DataBlocks:            make([]DataBlockMetadata, 0),
+	}
+
+	// Stream write to data store
+	writer, filePointerBytes, err := b.dataStore.CreateFile(b.ctx)
+	if err != nil {
+		fmt.Println("failed to create file: %w", err)
+		// Write error to all done channels
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to create file: %w", err))
+		return
+	}
+
+	fileHash := xxhash.New()
+	currentOffset := 0
+
+	// For each partition buffer, write the data block to the data store
+	for _, partitionBuffer := range flushReq.partitionBuffers {
+		partitionHash := xxhash.Sum64(partitionBuffer.buffer)
+
+		// Write the entire buffer + hash
+		if _, err := writer.Write(partitionBuffer.buffer); err != nil {
+			// Write error to all done channels
+			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write data block: %w", err))
+			return
+		}
+
+		// Write the partition hash as uint64 (8 bytes)
+		hashBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(hashBytes, partitionHash)
+		if _, err := writer.Write(hashBytes); err != nil {
+			// Write error to all done channels
+			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write data block hash: %w", err))
+			return
+		}
+
+		if _, err := fileHash.Write(partitionBuffer.buffer); err != nil {
+			// Write error to all done channels
+			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
+			return
+		}
+
+		// Also include the hash in the file hash
+		if _, err := fileHash.Write(hashBytes); err != nil {
+			// Write error to all done channels
+			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
+			return
+		}
+
+		fileMetadata.DataBlocks = append(fileMetadata.DataBlocks, DataBlockMetadata{
+			PartitionID:   partitionBuffer.partitionID,
+			BloomFilter:   partitionBuffer.fieldBloomFilter,
+			Rows:          partitionBuffer.rowCount,
+			Offset:        currentOffset,
+			Size:          len(partitionBuffer.buffer) + 8, // +8 for the uint64 hash
+			MinMaxIndexes: partitionBuffer.minMaxIndexes,
+		})
+
+		// Update offset for next data block (buffer + hash)
+		currentOffset += len(partitionBuffer.buffer) + 8
+	}
+
+	// Write final metadata to data store and footer
+	metadataBytes, metadataHashBytes := fileMetadata.Bytes()
+
+	// Write file metadata
+	if _, err := writer.Write(metadataBytes); err != nil {
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata: %w", err))
+		return
+	}
+
+	// Write file metadata hash (uint64)
+	if _, err := writer.Write(metadataHashBytes); err != nil {
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata hash: %w", err))
+		return
+	}
+
+	// Write file metadata length (uint32)
+	metadataLengthBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(metadataLengthBytes, uint32(len(metadataBytes)))
+	if _, err := writer.Write(metadataLengthBytes); err != nil {
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata length: %w", err))
+		return
+	}
+
+	// Write file version (uint32)
+	versionBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(versionBytes, FileVersion)
+	if _, err := writer.Write(versionBytes); err != nil {
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file version: %w", err))
+		return
+	}
+
+	// Write magic bytes (8 bytes)
+	if _, err := writer.Write([]byte(MagicBytes)); err != nil {
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write magic bytes: %w", err))
+		return
+	}
+
+	// Close the writer to finalize the file
+	if err := writer.Close(); err != nil {
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to close file writer: %w", err))
+		return
+	}
+
+	// Write to meta store
+	if err := b.metaStore.WriteFileMetadata(b.ctx, &fileMetadata, filePointerBytes); err != nil {
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to store file metadata: %w", err))
+		return
+	}
+
+	// Signal completion
+	TryWriteToChannels(flushReq.doneChans, nil)
 }
