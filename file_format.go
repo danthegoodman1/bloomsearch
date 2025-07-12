@@ -68,6 +68,7 @@ type DataBlockMetadata struct {
 
 	// Size includes the uint64 xxhash at the end of the byte slice
 	Size uint64
+	Rows uint64
 
 	BloomFilter *bloom.BloomFilter // must exist
 
