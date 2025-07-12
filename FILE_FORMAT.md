@@ -31,6 +31,8 @@ To query whether something exists in a file, generally you'd want to follow:
 3. Consult the file-level bloom filter
 4. If the file-level bloom filter says maybe, consult the per-block bloom filters
 
+Dedicated metadata stores can store the partition IDs and mixmax index values externally such that they can filter down the list of potential files at query time.
+
 ## Data Block Structure
 
 ```
