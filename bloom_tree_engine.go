@@ -45,7 +45,6 @@ type BloomSearchEngineConfig struct {
 }
 
 type partitionBuffer struct {
-	partitionMu           sync.Mutex
 	rowCount              int
 	minMaxIndexes         map[string]MinMaxIndex
 	buffer                [][]byte // serialized rows
@@ -96,19 +95,17 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 		partitionedRows[""] = rows
 	}
 
-	// Get partition buffer references in a local map copy so we don't need to hold the lock
+	// Hold the global lock for the entire operation to avoid deadlocks with flush
 	b.partitionBuffersMu.Lock()
-	// Manually unlocking below to avoid an extra function call with `go func()`` for defer use.
-	// Don't lose track of this lock!
+	defer b.partitionBuffersMu.Unlock()
 
 	if b.partitionBuffers == nil {
 		b.partitionBuffers = make(map[string]*partitionBuffer)
 	}
 
-	partitionReferences := map[string]*partitionBuffer{}
+	// Create partition buffers if they don't exist
 	for partitionID := range partitionedRows {
 		if b.partitionBuffers[partitionID] == nil {
-			// Doesn't exist, we need to create it
 			b.partitionBuffers[partitionID] = &partitionBuffer{
 				minMaxIndexes: make(map[string]MinMaxIndex),
 				buffer:        make([][]byte, 0),
@@ -118,34 +115,34 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 				fieldTokenBloomFilter: bloom.NewWithEstimates(1000000, 0.01),
 			}
 		}
-		partitionReferences[partitionID] = b.partitionBuffers[partitionID]
 	}
-
-	b.partitionBuffersMu.Unlock()
 
 	// If we haven't saved the buffer start time yet, do it
 	if b.bufferStartTimeMilli.Load() == 0 {
 		b.bufferStartTimeMilli.CompareAndSwap(0, time.Now().UnixMilli())
 	}
 
-	// Now for each partitions we can concurrently serialize rows and store in the buffers
+	// Track if we should flush
+	shouldFlush := &atomic.Bool{}
+
+	// Now for each partition we can concurrently serialize rows and store in the buffers
 	wg := sync.WaitGroup{}
+
 	for partitionID, rows := range partitionedRows {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			partitionReferences[partitionID].partitionMu.Lock()
-			defer partitionReferences[partitionID].partitionMu.Unlock()
+			partitionBuffer := b.partitionBuffers[partitionID]
 
 			// Process each row
 			for _, row := range rows {
 				// Add info to bloom filters
 				uniqueFields := UniqueFields(row, ".")
 				for _, field := range uniqueFields {
-					partitionReferences[partitionID].fieldBloomFilter.AddString(field.Path)
+					partitionBuffer.fieldBloomFilter.AddString(field.Path)
 					for _, value := range field.Values {
-						partitionReferences[partitionID].tokenBloomFilter.AddString(value)
-						partitionReferences[partitionID].fieldTokenBloomFilter.AddString(field.Path + "::" + value)
+						partitionBuffer.tokenBloomFilter.AddString(value)
+						partitionBuffer.fieldTokenBloomFilter.AddString(field.Path + "::" + value)
 					}
 				}
 
@@ -158,12 +155,12 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 							continue
 						}
 
-						if existingIndex, exists := partitionReferences[partitionID].minMaxIndexes[index]; exists {
+						if existingIndex, exists := partitionBuffer.minMaxIndexes[index]; exists {
 							// Update existing min/max with the new min/max values
-							partitionReferences[partitionID].minMaxIndexes[index] = UpdateMinMaxIndex(existingIndex, minVal, maxVal)
+							partitionBuffer.minMaxIndexes[index] = UpdateMinMaxIndex(existingIndex, minVal, maxVal)
 						} else {
 							// Create new min/max index with the converted min/max values
-							partitionReferences[partitionID].minMaxIndexes[index] = MinMaxIndex{
+							partitionBuffer.minMaxIndexes[index] = MinMaxIndex{
 								Min: minVal,
 								Max: maxVal,
 							}
@@ -180,18 +177,58 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 
 				// Increment stats
 				b.bufferedBytes.Add(int64(len(rowBytes)))
-				partitionReferences[partitionID].buffer = append(partitionReferences[partitionID].buffer, rowBytes)
-				partitionReferences[partitionID].rowCount += 1
+				partitionBuffer.buffer = append(partitionBuffer.buffer, rowBytes)
+				partitionBuffer.rowCount += 1
 				b.bufferedRowCount.Add(1)
+			}
+
+			// Check partition-level limits after processing all rows for this partition
+			if !shouldFlush.Load() {
+				partitionBytes := 0
+				for _, rowBytes := range partitionBuffer.buffer {
+					partitionBytes += len(rowBytes)
+				}
+
+				if partitionBuffer.rowCount >= b.config.MaxRowGroupRows ||
+					partitionBytes >= b.config.MaxRowGroupBytes {
+					shouldFlush.Store(true)
+				}
 			}
 		}()
 	}
 	wg.Wait()
 
-	// We need to take the lock again to store the doneChan
-	b.partitionBuffersMu.Lock()
-	defer b.partitionBuffersMu.Unlock()
+	// If we haven't decided to flush based on partition limits, check buffer-level limits
+	if !shouldFlush.Load() {
+		// Check buffered row count
+		if b.bufferedRowCount.Load() >= int64(b.config.MaxBufferedRows) {
+			shouldFlush.Store(true)
+		}
+
+		// Check buffered bytes
+		if !shouldFlush.Load() && b.bufferedBytes.Load() >= int64(b.config.MaxBufferedBytes) {
+			shouldFlush.Store(true)
+		}
+
+		// Check buffered time
+		if !shouldFlush.Load() {
+			startTime := b.bufferStartTimeMilli.Load()
+			if startTime > 0 {
+				elapsed := time.Duration(time.Now().UnixMilli()-startTime) * time.Millisecond
+				if elapsed >= b.config.MaxBufferedTime {
+					shouldFlush.Store(true)
+				}
+			}
+		}
+	}
+
+	// Store the doneChan
 	b.doneChans = append(b.doneChans, doneChan)
+
+	// Trigger flush if needed
+	if shouldFlush.Load() {
+		go b.flush()
+	}
 
 	return nil
 }
@@ -202,4 +239,9 @@ func (b *BloomSearchEngine) flush() {
 	// TODO: calculate final metadata
 	// TODO: write to data store
 	// TODO: write to meta store
+
+	// Reset counters after flush
+	b.bufferedRowCount.Store(0)
+	b.bufferedBytes.Store(0)
+	b.bufferStartTimeMilli.Store(0)
 }
