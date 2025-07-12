@@ -6,7 +6,14 @@ import (
 	"unicode"
 )
 
-// UniquePaths extracts all unique field paths from a nested map structure using the specified delimiter.
+// FieldValues represents a field path and its associated values
+type FieldValues struct {
+	Path   string
+	Values []string
+}
+
+// UniqueFields extracts all unique field paths from a nested map structure using the specified delimiter,
+// returning tuples of (field_name, []values) where values are deduplicated per field.
 // Arrays are traversed but indices are ignored, so duplicate paths from array elements are deduplicated.
 //
 // Example:
@@ -15,20 +22,24 @@ import (
 //
 // Returns:
 //
-//	["user.name", "user.tags.type", "user.tags.role"] (with delimiter ".")
-func UniquePaths(row map[string]any, delimiter string) []string {
-	pathSet := make(map[string]bool)
-	collectPaths(row, "", pathSet, delimiter)
+//	[{Field: "user.name", Values: ["John"]}, {Field: "user.tags.type", Values: ["admin"]}, {Field: "user.tags.role", Values: ["user"]}] (with delimiter ".")
+func UniqueFields(row map[string]any, delimiter string) []FieldValues {
+	pathValues := make(map[string]map[string]bool)
+	collectPathsAndValues(row, "", pathValues, delimiter)
 
-	// Convert set to slice
-	paths := make([]string, 0, len(pathSet))
-	for path := range pathSet {
-		paths = append(paths, path)
+	// Convert map to slice
+	result := make([]FieldValues, 0, len(pathValues))
+	for path, valueSet := range pathValues {
+		values := make([]string, 0, len(valueSet))
+		for value := range valueSet {
+			values = append(values, value)
+		}
+		result = append(result, FieldValues{Path: path, Values: values})
 	}
-	return paths
+	return result
 }
 
-func collectPaths(obj any, prefix string, pathSet map[string]bool, delimiter string) {
+func collectPathsAndValues(obj any, prefix string, pathValues map[string]map[string]bool, delimiter string) {
 	switch v := obj.(type) {
 	case map[string]any:
 		// Handle map type
@@ -37,17 +48,21 @@ func collectPaths(obj any, prefix string, pathSet map[string]bool, delimiter str
 			if prefix != "" {
 				newPath = prefix + delimiter + key
 			}
-			collectPaths(value, newPath, pathSet, delimiter)
+			collectPathsAndValues(value, newPath, pathValues, delimiter)
 		}
 	case []any:
 		// Handle slice of any
 		for _, item := range v {
-			collectPaths(item, prefix, pathSet, delimiter)
+			collectPathsAndValues(item, prefix, pathValues, delimiter)
 		}
 	default:
-		// Primitive type - add the path if we have a prefix
+		// Primitive type - add the path and value if we have a prefix
 		if prefix != "" {
-			pathSet[prefix] = true
+			if pathValues[prefix] == nil {
+				pathValues[prefix] = make(map[string]bool)
+			}
+			valueStr := fmt.Sprintf("%v", v)
+			pathValues[prefix][valueStr] = true
 		}
 	}
 }
