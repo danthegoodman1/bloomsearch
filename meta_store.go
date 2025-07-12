@@ -11,7 +11,9 @@ type MetaStore[FilePointer any] interface {
 	// but their bloom filters have not been tested yet.
 	GetMaybeFilesForQuery(ctx context.Context, query *QueryCondition) ([]MaybeFile[FilePointer], error)
 
-	// WriteFileMetadata writes the file metadata to the store
+	// WriteFileMetadata writes the file metadata to the store.
+	//
+	// This is called after the file has been written to the DataStore.
 	WriteFileMetadata(ctx context.Context, fileMetadata *FileMetadata) error
 }
 
