@@ -17,6 +17,11 @@ type ingestRequest struct {
 	doneChan chan error
 }
 
+func (r *ingestRequest) reset() {
+	r.rows = nil
+	r.doneChan = nil
+}
+
 type flushRequest struct {
 	partitionBuffers map[string]*partitionBuffer
 	doneChans        []chan error
@@ -27,11 +32,12 @@ type BloomSearchEngine struct {
 	metaStore MetaStore
 	dataStore DataStore
 
-	ingestChan chan ingestRequest
-	flushChan  chan flushRequest
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	ingestChan  chan *ingestRequest
+	flushChan   chan flushRequest
+	requestPool *sync.Pool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 type BloomSearchEngineConfig struct {
@@ -82,10 +88,15 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		metaStore: metaStore,
 		dataStore: dataStore,
 
-		ingestChan: make(chan ingestRequest, config.IngestBufferSize),
+		ingestChan: make(chan *ingestRequest, config.IngestBufferSize),
 		flushChan:  make(chan flushRequest, 1), // Buffered flush channel
-		ctx:        ctx,
-		cancel:     cancel,
+		requestPool: &sync.Pool{
+			New: func() interface{} {
+				return &ingestRequest{}
+			},
+		},
+		ctx:    ctx,
+		cancel: cancel,
 	}
 }
 
@@ -120,10 +131,9 @@ func (b *BloomSearchEngine) Stop(ctx context.Context) error {
 
 // IngestRows queues rows for ingestion by the actor
 func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]any, doneChan chan error) error {
-	req := ingestRequest{
-		rows:     rows,
-		doneChan: doneChan,
-	}
+	req := b.requestPool.Get().(*ingestRequest)
+	req.rows = rows
+	req.doneChan = doneChan
 
 	select {
 	case b.ingestChan <- req:
@@ -157,7 +167,13 @@ func (b *BloomSearchEngine) ingestWorker() {
 	}
 }
 
-func (b *BloomSearchEngine) processIngestRequest(req ingestRequest, partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
+func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
+	// Process the request and return to pool at the end
+	defer func() {
+		req.reset()
+		b.requestPool.Put(req)
+	}()
+
 	// Group rows by partition ID
 	partitionedRows := make(map[string][]map[string]any)
 	if b.config.PartitionFunc != nil {
@@ -287,7 +303,7 @@ func (b *BloomSearchEngine) processIngestRequest(req ingestRequest, partitionBuf
 		for k := range partitionBuffers {
 			delete(partitionBuffers, k)
 		}
-		*doneChans = (*doneChans)[:0] // Clear slice but keep capacity
+		*doneChans = make([]chan error, 0)
 		*bufferedRowCount = 0
 		*bufferedBytes = 0
 		*bufferStartTime = time.Time{}
