@@ -155,10 +155,10 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 						}
 
 						if existingIndex, exists := partitionReferences[partitionID].minMaxIndexes[index]; exists {
-							// Update existing min/max
+							// Update existing min/max with the new min/max values
 							partitionReferences[partitionID].minMaxIndexes[index] = UpdateMinMaxIndex(existingIndex, minVal, maxVal)
 						} else {
-							// Create new min/max index
+							// Create new min/max index with the converted min/max values
 							partitionReferences[partitionID].minMaxIndexes[index] = MinMaxIndex{
 								Min: minVal,
 								Max: maxVal,

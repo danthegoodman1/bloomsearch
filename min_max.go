@@ -15,46 +15,60 @@ type MinMaxIndex struct {
 // Returns false if the value is not a numeric type.
 func ConvertToMinMaxInt64(value any) (minVal int64, maxVal int64, ok bool) {
 	switch v := value.(type) {
-	case int:
-		minVal = int64(v)
-		maxVal = int64(v)
-	case int8:
-		minVal = int64(v)
-		maxVal = int64(v)
-	case int16:
-		minVal = int64(v)
-		maxVal = int64(v)
-	case int32:
-		minVal = int64(v)
-		maxVal = int64(v)
-	case int64:
-		minVal = v
-		maxVal = v
-	case uint:
-		minVal = int64(v)
-		maxVal = int64(v)
-	case uint8:
-		minVal = int64(v)
-		maxVal = int64(v)
-	case uint16:
-		minVal = int64(v)
-		maxVal = int64(v)
-	case uint32:
-		minVal = int64(v)
-		maxVal = int64(v)
-	case uint64:
-		minVal = int64(v)
-		maxVal = int64(v)
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		intVal, _ := toInt64(v)
+		return intVal, intVal, true
 	case float32:
-		minVal = int64(math.Floor(float64(v)))
-		maxVal = int64(math.Ceil(float64(v)))
+		return int64(math.Floor(float64(v))), int64(math.Ceil(float64(v))), true
 	case float64:
-		minVal = int64(math.Floor(v))
-		maxVal = int64(math.Ceil(v))
+		return int64(math.Floor(v)), int64(math.Ceil(v)), true
 	default:
 		return 0, 0, false
 	}
-	return minVal, maxVal, true
+}
+
+// ConvertToInt64 converts any numeric value to int64.
+// For floats, it rounds to the nearest integer.
+// Returns false if the value is not a numeric type.
+func ConvertToInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return toInt64(v)
+	case float32:
+		return int64(math.Round(float64(v))), true
+	case float64:
+		return int64(math.Round(v)), true
+	default:
+		return 0, false
+	}
+}
+
+// toInt64 converts any integer type to int64
+func toInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), true
+	case int8:
+		return int64(v), true
+	case int16:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case uint:
+		return int64(v), true
+	case uint8:
+		return int64(v), true
+	case uint16:
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
 }
 
 // UpdateMinMaxIndex updates an existing MinMaxIndex with new min/max values.
