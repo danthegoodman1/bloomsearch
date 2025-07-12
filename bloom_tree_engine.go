@@ -107,11 +107,12 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 		if b.partitionBuffers[partitionID] == nil {
 			// Doesn't exist, we need to create it
 			b.partitionBuffers[partitionID] = &partitionBuffer{
-				minMaxIndexes:         make(map[string]MinMaxIndex),
-				buffer:                make([][]byte, 0),
-				fieldBloomFilter:      bloom.NewWithEstimates(1000000, 0.01), // TODO: make configurable
-				tokenBloomFilter:      bloom.NewWithEstimates(1000000, 0.01), // TODO: make configurable
-				fieldTokenBloomFilter: bloom.NewWithEstimates(1000000, 0.01), // TODO: make configurable
+				minMaxIndexes: make(map[string]MinMaxIndex),
+				buffer:        make([][]byte, 0),
+				// TODO: make configurable
+				fieldBloomFilter:      bloom.NewWithEstimates(1000000, 0.01),
+				tokenBloomFilter:      bloom.NewWithEstimates(1000000, 0.01),
+				fieldTokenBloomFilter: bloom.NewWithEstimates(1000000, 0.01),
 			}
 		}
 		partitionReferences[partitionID] = b.partitionBuffers[partitionID]
