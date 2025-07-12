@@ -14,7 +14,7 @@ type MetaStore interface {
 	// WriteFileMetadata writes the file metadata to the store.
 	//
 	// This is called after the file has been written to the DataStore.
-	WriteFileMetadata(ctx context.Context, fileMetadata *FileMetadata) error
+	WriteFileMetadata(ctx context.Context, fileMetadata *FileMetadata, filePointerBytes []byte) error
 }
 
 // MaybeFile is a pointer to a file that may contain rows of interest based on pre-filtering conditions (partition IDs, minmax indexes). They have not had their bloom filters tested yet.

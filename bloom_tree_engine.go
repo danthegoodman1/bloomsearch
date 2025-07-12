@@ -3,7 +3,9 @@ package bloomsearch
 type PartitionFunc func(row map[string]any) string
 
 type BloomSearchEngine struct {
-	config BloomSearchEngineConfig
+	config    BloomSearchEngineConfig
+	metaStore MetaStore
+	dataStore DataStore
 }
 
 type BloomSearchEngineConfig struct {
@@ -11,8 +13,10 @@ type BloomSearchEngineConfig struct {
 	PartitionFunc PartitionFunc
 }
 
-func NewBloomSearchEngine(config BloomSearchEngineConfig) *BloomSearchEngine {
+func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, dataStore DataStore) *BloomSearchEngine {
 	return &BloomSearchEngine{
-		config: config,
+		config:    config,
+		metaStore: metaStore,
+		dataStore: dataStore,
 	}
 }
