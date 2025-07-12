@@ -79,5 +79,3 @@ type MinMaxIndex struct {
 	Min uint64
 	Max uint64
 }
-
-// TODO: stream write datablock and build hash and metadata
