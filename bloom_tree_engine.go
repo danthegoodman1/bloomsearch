@@ -69,9 +69,14 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 
 func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, dataStore DataStore) *BloomSearchEngine {
 	return &BloomSearchEngine{
-		config:    config,
-		metaStore: metaStore,
-		dataStore: dataStore,
+		config:               config,
+		metaStore:            metaStore,
+		dataStore:            dataStore,
+		bufferedRowCount:     &atomic.Int64{},
+		bufferedBytes:        &atomic.Int64{},
+		bufferStartTimeMilli: &atomic.Int64{},
+		partitionBuffers:     make(map[string]*partitionBuffer),
+		doneChans:            make([]chan error, 0),
 	}
 }
 
@@ -95,8 +100,6 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 	b.partitionBuffersMu.Lock()
 	// Manually unlocking below to avoid an extra function call with `go func()`` for defer use.
 	// Don't lose track of this lock!
-
-	b.doneChans = append(b.doneChans, doneChan)
 
 	if b.partitionBuffers == nil {
 		b.partitionBuffers = make(map[string]*partitionBuffer)
@@ -184,6 +187,11 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 		}()
 	}
 	wg.Wait()
+
+	// We need to take the lock again to store the doneChan
+	b.partitionBuffersMu.Lock()
+	defer b.partitionBuffersMu.Unlock()
+	b.doneChans = append(b.doneChans, doneChan)
 
 	return nil
 }
