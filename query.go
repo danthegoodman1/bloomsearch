@@ -35,10 +35,10 @@ type StringCondition struct {
 // NumericCondition represents a condition on numeric values (like MinMaxIndex)
 type NumericCondition struct {
 	Operator QueryOperator `json:",omitempty"` // for EQ, NE, GT, GTE, LT, LTE
-	Value    uint64        `json:",omitempty"` // for EQ, NE, GT, GTE, LT, LTE
-	Values   []uint64      `json:",omitempty"` // for IN, NOT_IN
-	Min      uint64        `json:",omitempty"` // for BETWEEN, NOT_BETWEEN
-	Max      uint64        `json:",omitempty"` // for BETWEEN, NOT_BETWEEN
+	Value    int64         `json:",omitempty"` // for EQ, NE, GT, GTE, LT, LTE
+	Values   []int64       `json:",omitempty"` // for IN, NOT_IN
+	Min      int64         `json:",omitempty"` // for BETWEEN, NOT_BETWEEN
+	Max      int64         `json:",omitempty"` // for BETWEEN, NOT_BETWEEN
 }
 
 // MinMaxFieldCombinator specifies how conditions across different MinMaxIndex fields should be combined
@@ -150,52 +150,52 @@ func PartitionNotBetween(min, max string) StringCondition {
 }
 
 // NumericEquals creates a numeric equality condition
-func NumericEquals(value uint64) NumericCondition {
+func NumericEquals(value int64) NumericCondition {
 	return NumericCondition{Operator: OpEqual, Value: value}
 }
 
 // NumericNotEquals creates a numeric not equal condition
-func NumericNotEquals(value uint64) NumericCondition {
+func NumericNotEquals(value int64) NumericCondition {
 	return NumericCondition{Operator: OpNotEqual, Value: value}
 }
 
 // NumericGreaterThan creates a numeric greater than condition
-func NumericGreaterThan(value uint64) NumericCondition {
+func NumericGreaterThan(value int64) NumericCondition {
 	return NumericCondition{Operator: OpGreaterThan, Value: value}
 }
 
 // NumericGreaterThanEqual creates a numeric greater than or equal condition
-func NumericGreaterThanEqual(value uint64) NumericCondition {
+func NumericGreaterThanEqual(value int64) NumericCondition {
 	return NumericCondition{Operator: OpGreaterThanEqual, Value: value}
 }
 
 // NumericLessThan creates a numeric less than condition
-func NumericLessThan(value uint64) NumericCondition {
+func NumericLessThan(value int64) NumericCondition {
 	return NumericCondition{Operator: OpLessThan, Value: value}
 }
 
 // NumericLessThanEqual creates a numeric less than or equal condition
-func NumericLessThanEqual(value uint64) NumericCondition {
+func NumericLessThanEqual(value int64) NumericCondition {
 	return NumericCondition{Operator: OpLessThanEqual, Value: value}
 }
 
 // NumericIn creates a numeric IN condition
-func NumericIn(values ...uint64) NumericCondition {
+func NumericIn(values ...int64) NumericCondition {
 	return NumericCondition{Operator: OpIn, Values: values}
 }
 
 // NumericNotIn creates a numeric NOT IN condition
-func NumericNotIn(values ...uint64) NumericCondition {
+func NumericNotIn(values ...int64) NumericCondition {
 	return NumericCondition{Operator: OpNotIn, Values: values}
 }
 
 // NumericBetween creates a numeric BETWEEN condition (inclusive)
-func NumericBetween(min, max uint64) NumericCondition {
+func NumericBetween(min, max int64) NumericCondition {
 	return NumericCondition{Operator: OpBetween, Min: min, Max: max}
 }
 
 // NumericNotBetween creates a numeric NOT BETWEEN condition (exclusive)
-func NumericNotBetween(min, max uint64) NumericCondition {
+func NumericNotBetween(min, max int64) NumericCondition {
 	return NumericCondition{Operator: OpNotBetween, Min: min, Max: max}
 }
 
@@ -240,7 +240,7 @@ func EvaluateStringCondition(value string, condition StringCondition) bool {
 }
 
 // EvaluateNumericCondition checks if a numeric value matches the given condition
-func EvaluateNumericCondition(value uint64, condition NumericCondition) bool {
+func EvaluateNumericCondition(value int64, condition NumericCondition) bool {
 	switch condition.Operator {
 	case OpEqual:
 		return value == condition.Value

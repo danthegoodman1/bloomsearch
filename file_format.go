@@ -75,8 +75,3 @@ type DataBlockMetadata struct {
 	MinMaxIndexes map[string]MinMaxIndex `json:",omitempty"`
 	PartitionID   string                 `json:",omitempty"`
 }
-
-type MinMaxIndex struct {
-	Min uint64
-	Max uint64
-}

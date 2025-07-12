@@ -133,9 +133,6 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 			partitionReferences[partitionID].partitionMu.Lock()
 			defer partitionReferences[partitionID].partitionMu.Unlock()
 
-			// Store the rows in the buffer
-			partitionReferences[partitionID].rowCount += len(rows)
-
 			// Process each row
 			for _, row := range rows {
 				// Add info to bloom filters
@@ -148,13 +145,40 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 					}
 				}
 
+				// Check for minmax indexes
+				for _, index := range b.config.MinMaxIndexes {
+					if value, ok := row[index]; ok {
+						minVal, maxVal, isNumeric := ConvertToMinMaxInt64(value)
+						if !isNumeric {
+							// Skip values that aren't numeric
+							continue
+						}
+
+						if existingIndex, exists := partitionReferences[partitionID].minMaxIndexes[index]; exists {
+							// Update existing min/max
+							partitionReferences[partitionID].minMaxIndexes[index] = UpdateMinMaxIndex(existingIndex, minVal, maxVal)
+						} else {
+							// Create new min/max index
+							partitionReferences[partitionID].minMaxIndexes[index] = MinMaxIndex{
+								Min: minVal,
+								Max: maxVal,
+							}
+						}
+					}
+				}
+
 				// Serialize and store the row
 				rowBytes, err := json.Marshal(row)
 				if err != nil {
 					doneChan <- fmt.Errorf("failed to serialize row: %w", err)
 					return
 				}
+
+				// Increment stats
+				b.bufferedBytes.Add(int64(len(rowBytes)))
 				partitionReferences[partitionID].buffer = append(partitionReferences[partitionID].buffer, rowBytes)
+				partitionReferences[partitionID].rowCount += 1
+				b.bufferedRowCount.Add(1)
 			}
 		}()
 	}
