@@ -63,9 +63,10 @@ func FileMetadataFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*Fil
 }
 
 type DataBlockMetadata struct {
+	// Absolute file offset
 	Offset uint64
 
-	// size includes the uint64 xxhash at the end of the byte slice
+	// Size includes the uint64 xxhash at the end of the byte slice
 	Size uint64
 
 	BloomFilter *bloom.BloomFilter // must exist
@@ -79,4 +80,4 @@ type MinMaxIndex struct {
 	Max uint64
 }
 
-// TODO: stream write datablock and build hash
+// TODO: stream write datablock and build hash and metadata

@@ -1,11 +1,10 @@
 package bloomsearch
 
-import "github.com/bits-and-blooms/bloom/v3"
+type PartitionFunc func(row map[string]any) string
 
-type bloomsearchEngine struct {
-	bloomFilterFactory func() *bloom.BloomFilter
+type BloomSearchEngine struct {
 }
 
-func Newbloomsearch() {
-
+func NewBloomSearchEngine() *BloomSearchEngine {
+	return &BloomSearchEngine{}
 }
