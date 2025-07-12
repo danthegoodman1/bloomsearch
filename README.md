@@ -1,6 +1,10 @@
 # bloomsearch <!-- omit in toc -->
 
-Keyword index with bloom filter trees. Pluggable interface for massive keyword search
+Keyword index with bloom filter trees. Pluggable interface for massive keyword search.
+
+Really good for logs, JSON path, and JSON value search.
+
+Search by `field`, `token`, or `field:token` with combinators (OR, AND, NOT, etc.).
 
 - [How it works](#how-it-works)
 - [Contributing](#contributing)
