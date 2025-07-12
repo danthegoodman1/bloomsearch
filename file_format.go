@@ -1,5 +1,9 @@
 package bloomsearch
 
+/**
+This package should probably make lowerJSON versions of structs to protect internal fields, but that's for a later optimization.
+*/
+
 import (
 	"encoding/binary"
 	"encoding/json"
@@ -15,17 +19,12 @@ var (
 )
 
 type FileMetadata struct {
-	bloomFilter *bloom.BloomFilter // must exist
-}
-
-// need to proxy with another struct to keep the properties of FileMetadata private but allow json marshalling
-type fileMetadataJSON struct {
-	BloomFilter *bloom.BloomFilter
+	BloomFilter *bloom.BloomFilter // must exist
 }
 
 func NewFileMetadata(bloomFilter *bloom.BloomFilter) *FileMetadata {
 	return &FileMetadata{
-		bloomFilter: bloomFilter,
+		BloomFilter: bloomFilter,
 	}
 }
 
@@ -54,21 +53,13 @@ func FileMetadataFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*Fil
 	}
 
 	// Unmarshal the JSON bytes into FileMetadata
-	var metadata fileMetadataJSON
+	var metadata FileMetadata
 	err := json.Unmarshal(bytes, &metadata)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
-	return &FileMetadata{
-		bloomFilter: metadata.BloomFilter,
-	}, nil
-}
-
-func (f *FileMetadata) MarshalJSON() ([]byte, error) {
-	return json.Marshal(fileMetadataJSON{
-		BloomFilter: f.bloomFilter,
-	})
+	return &metadata, nil
 }
 
 type DataBlockMetadata struct {
