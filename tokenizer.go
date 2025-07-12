@@ -1,5 +1,11 @@
 package bloomsearch
 
+import (
+	"fmt"
+	"strings"
+	"unicode"
+)
+
 // UniquePaths extracts all unique field paths from a nested map structure using the specified delimiter.
 // Arrays are traversed but indices are ignored, so duplicate paths from array elements are deduplicated.
 //
@@ -48,3 +54,31 @@ func collectPaths(obj any, prefix string, pathSet map[string]bool, delimiter str
 
 // ValueTokenizerFunc is a function that tokenizes a field value into a list of tokens
 type ValueTokenizerFunc func(value any) []string
+
+// BasicWhitespaceTokenizer tokenizes values by keeping alphanumeric characters, dashes, underscores, and emojis, splitting on spaces
+func BasicWhitespaceTokenizer(value any) []string {
+	// If the value is not a string, return the recursive call of its string representation
+	if str, ok := value.(string); ok {
+		// Remove non-alphanumerical characters (keeping dashes, underscores, and emojis)
+		var result strings.Builder
+		for _, r := range str {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || unicode.IsSymbol(r) {
+				result.WriteRune(r)
+			} else {
+				result.WriteRune(' ')
+			}
+		}
+
+		// Split on spaces and filter out empty strings
+		tokens := strings.Fields(result.String())
+		return tokens
+	}
+
+	// Convert value to string and recursively call BasicTokenizer
+	return BasicWhitespaceTokenizer(fmt.Sprintf("%v", value))
+}
+
+func init() {
+	// Test that BasicTokenizer implements ValueTokenizerFunc
+	var _ ValueTokenizerFunc = BasicWhitespaceTokenizer
+}
