@@ -10,8 +10,8 @@ The bloomsearch file format is designed for efficient, single-pass writing of un
 ...
 [Data Block N]
 [File Metadata]
-[uint32: File Metadata Length]
 [uint64: File Metadata xxhash]
+[uint32: File Metadata Length]
 [8 bytes: magic bytes "BLOMSRCH"]
 ```
 
