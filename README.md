@@ -1,4 +1,4 @@
-# bloomtree <!-- omit in toc -->
+# bloomsearch <!-- omit in toc -->
 
 Keyword index with bloom filter trees. Pluggable interface for massive keyword search
 

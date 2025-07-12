@@ -1,11 +1,11 @@
-package bloomtree
+package bloomsearch
 
 import "github.com/bits-and-blooms/bloom/v3"
 
-type BloomTreeEngine struct {
+type bloomsearchEngine struct {
 	bloomFilterFactory func() *bloom.BloomFilter
 }
 
-func NewBloomTree() {
+func Newbloomsearch() {
 
 }
