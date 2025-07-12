@@ -77,14 +77,15 @@ type DataBlockMetadata struct {
 	// size includes the uint64 xxhash at the end of the byte slice
 	size uint64
 
-	bloomFilter   *bloom.BloomFilter     // must exist
-	minMaxIndexes map[string]minMaxIndex `json:",omitempty"`
-	partitionID   string                 `json:",omitempty"`
+	bloomFilter *bloom.BloomFilter // must exist
+
+	MinMaxIndexes map[string]MinMaxIndex `json:",omitempty"`
+	PartitionID   string                 `json:",omitempty"`
 }
 
-type minMaxIndex struct {
-	min uint64
-	max uint64
+type MinMaxIndex struct {
+	Min uint64
+	Max uint64
 }
 
 // TODO: stream write datablock and build hash
