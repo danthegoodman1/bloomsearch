@@ -79,10 +79,4 @@ type DataBlockMetadata struct {
 	size uint64
 }
 
-// Returns the data block metadata as a byte slice and the xxhash of the data block metadata
-func (d *DataBlockMetadata) Bytes() ([]byte, []byte) {
-	// TODO: Implement
-	return nil, nil
-}
-
 // TODO: stream write datablock and build hash
