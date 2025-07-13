@@ -90,7 +90,7 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 		MaxBufferedBytes: 1 * 1024 * 1024,
 		MaxBufferedTime:  10 * time.Second, // this is designed for async writing
 
-		IngestBufferSize: 1000, // buffered channel size for ingestion requests
+		IngestBufferSize: 1_000,
 
 		BloomFilterExpectedElements:  100_000,
 		BloomFilterFalsePositiveRate: 0.001,
