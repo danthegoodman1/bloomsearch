@@ -861,6 +861,9 @@ func (b *BloomSearchEngine) processDataBlock(
 		}
 		bytesRead += int(rowLength)
 
+		// TODO: Primitive check before deserialization to check for field/token/fieldtoken matches
+		// TODO: If it matches, deserialize the row and do an exact match check
+
 		// Print the row as string to show it's working, then throw it away
 		fmt.Printf("Row data: %s\n", string(rowData))
 	}
