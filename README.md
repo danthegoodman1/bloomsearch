@@ -47,7 +47,7 @@ if err := <-doneChan; err != nil {
 // Query for rows where "level"="error"
 matchingRows := engine.Query(
   NewQueryWithGroupCombinator(CombinatorAND).
-    Field("level").Token("error").Build()
+    Field("level").Token("error").Build(),
 )
 ```
 
