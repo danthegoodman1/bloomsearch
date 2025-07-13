@@ -10,7 +10,7 @@ type MetaStore interface {
 	// The returned files have already been pre-filtered based on partition IDs and MinMaxIndex conditions,
 	// but their bloom filters have not been tested yet.
 	//
-	// The MaybeFile.FileMetadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
+	// The MaybeFile.Metadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
 	// if the query conditions are able to guarantee that some data blocks will not match the query conditions.
 	GetMaybeFilesForQuery(ctx context.Context, query *QueryCondition) ([]MaybeFile, error)
 
@@ -24,9 +24,8 @@ type MetaStore interface {
 type MaybeFile struct {
 	// The file pointer is serialized to bytes and passed to the DataStore to open the file for reading.
 	PointerBytes []byte
-	Metadata     FileMetadata
-	// DataBlocks that match the query conditions within this file. If the array is empty, it will assume any data block in the file matches the query conditions.
-	MatchingDataBlockIndexes []int
+	// The FileMetadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
+	Metadata FileMetadata
 }
 
 // TESTING

@@ -394,15 +394,16 @@ func EvaluateDataBlockMetadata(metadata *DataBlockMetadata, query *QueryConditio
 }
 
 // FilterDataBlocks filters a slice of DataBlockMetadata based on query conditions
-func FilterDataBlocks(blocks []DataBlockMetadata, query *QueryCondition) []int {
+func FilterDataBlocks(blocks []DataBlockMetadata, query *QueryCondition) []DataBlockMetadata {
 	if query == nil {
-		return nil
+		// If no query, return all blocks, as we can't prune any
+		return blocks
 	}
 
-	var filtered []int
-	for i, block := range blocks {
+	var filtered []DataBlockMetadata
+	for _, block := range blocks {
 		if EvaluateDataBlockMetadata(&block, query) {
-			filtered = append(filtered, i)
+			filtered = append(filtered, block)
 		}
 	}
 	return filtered

@@ -150,14 +150,13 @@ func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query 
 		}
 
 		// Filter data blocks based on query conditions
-		matchingBlockIndexes := FilterDataBlocks(fileMetadata.DataBlocks, query)
+		fileMetadata.DataBlocks = FilterDataBlocks(fileMetadata.DataBlocks, query)
 
 		// Only include files that have matching data blocks (or all files if no query conditions)
-		if query == nil || len(matchingBlockIndexes) > 0 {
+		if query == nil || len(fileMetadata.DataBlocks) > 0 {
 			maybeFiles = append(maybeFiles, MaybeFile{
-				PointerBytes:             []byte(filePath),
-				Metadata:                 *fileMetadata,
-				MatchingDataBlockIndexes: matchingBlockIndexes,
+				PointerBytes: []byte(filePath),
+				Metadata:     *fileMetadata,
 			})
 		}
 	}

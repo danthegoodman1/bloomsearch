@@ -473,50 +473,79 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 
 	// For each partition buffer, write the data block to the data store
 	for _, partitionBuffer := range flushReq.partitionBuffers {
-		partitionHash := xxhash.Sum64(partitionBuffer.buffer)
+		// Create data block bloom filters struct
+		dataBlockBloomFilters := &DataBlockBloomFilters{
+			FieldBloomFilter:      partitionBuffer.fieldBloomFilter,
+			TokenBloomFilter:      partitionBuffer.tokenBloomFilter,
+			FieldTokenBloomFilter: partitionBuffer.fieldTokenBloomFilter,
+		}
 
-		// Write the entire buffer + hash
+		// Serialize bloom filters and get hash
+		bloomFiltersBytes, bloomFiltersHashBytes := dataBlockBloomFilters.Bytes()
+
+		// Write bloom filters to data block
+		if _, err := writer.Write(bloomFiltersBytes); err != nil {
+			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write bloom filters: %w", err))
+			return
+		}
+
+		// Write bloom filters hash
+		if _, err := writer.Write(bloomFiltersHashBytes); err != nil {
+			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write bloom filters hash: %w", err))
+			return
+		}
+
+		// Write the row data buffer
 		if _, err := writer.Write(partitionBuffer.buffer); err != nil {
 			// Write error to all done channels
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write data block: %w", err))
 			return
 		}
 
-		// Write the partition hash as uint64 (8 bytes)
-		hashBytes := make([]byte, 8)
-		binary.LittleEndian.PutUint64(hashBytes, partitionHash)
-		if _, err := writer.Write(hashBytes); err != nil {
+		// Calculate hash of the entire data block (bloom filters + hash + row data)
+		dataBlockBytes := make([]byte, 0, len(bloomFiltersBytes)+8+len(partitionBuffer.buffer))
+		dataBlockBytes = append(dataBlockBytes, bloomFiltersBytes...)
+		dataBlockBytes = append(dataBlockBytes, bloomFiltersHashBytes...)
+		dataBlockBytes = append(dataBlockBytes, partitionBuffer.buffer...)
+		dataBlockHash := xxhash.Sum64(dataBlockBytes)
+
+		// Write the data block hash as uint64 (8 bytes)
+		dataBlockHashBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(dataBlockHashBytes, dataBlockHash)
+		if _, err := writer.Write(dataBlockHashBytes); err != nil {
 			// Write error to all done channels
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write data block hash: %w", err))
 			return
 		}
 
-		if _, err := fileHash.Write(partitionBuffer.buffer); err != nil {
+		// Include the entire data block in the file hash
+		if _, err := fileHash.Write(dataBlockBytes); err != nil {
 			// Write error to all done channels
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
 			return
 		}
 
-		// Also include the hash in the file hash
-		if _, err := fileHash.Write(hashBytes); err != nil {
+		// Also include the data block hash in the file hash
+		if _, err := fileHash.Write(dataBlockHashBytes); err != nil {
 			// Write error to all done channels
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
 			return
 		}
+
+		// Calculate bloom filters size (bloom filters + hash)
+		bloomFiltersSize := len(bloomFiltersBytes) + 8
 
 		fileMetadata.DataBlocks = append(fileMetadata.DataBlocks, DataBlockMetadata{
-			PartitionID:           partitionBuffer.partitionID,
-			FieldBloomFilter:      partitionBuffer.fieldBloomFilter,
-			TokenBloomFilter:      partitionBuffer.tokenBloomFilter,
-			FieldTokenBloomFilter: partitionBuffer.fieldTokenBloomFilter,
-			Rows:                  partitionBuffer.rowCount,
-			Offset:                currentOffset,
-			Size:                  len(partitionBuffer.buffer) + 8, // +8 for the uint64 hash
-			MinMaxIndexes:         partitionBuffer.minMaxIndexes,
+			PartitionID:      partitionBuffer.partitionID,
+			Rows:             partitionBuffer.rowCount,
+			Offset:           currentOffset,
+			Size:             bloomFiltersSize + len(partitionBuffer.buffer) + 8, // bloom filters + hash + row data + data block hash
+			BloomFiltersSize: bloomFiltersSize,
+			MinMaxIndexes:    partitionBuffer.minMaxIndexes,
 		})
 
-		// Update offset for next data block (buffer + hash)
-		currentOffset += len(partitionBuffer.buffer) + 8
+		// Update offset for next data block
+		currentOffset += bloomFiltersSize + len(partitionBuffer.buffer) + 8
 	}
 
 	// Write final metadata to data store and footer

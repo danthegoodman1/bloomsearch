@@ -110,7 +110,7 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	fmt.Printf("    Token Filter: %v\n", maybeFile.Metadata.TokenBloomFilter != nil)
 	fmt.Printf("    Field+Token Filter: %v\n", maybeFile.Metadata.FieldTokenBloomFilter != nil)
 
-	fmt.Printf("  Matching Data Blocks: %d\n", len(maybeFile.MatchingDataBlockIndexes))
+	fmt.Printf("  Matching Data Blocks: %d\n", len(maybeFile.Metadata.DataBlocks))
 
 	// === Read back the actual row data ===
 	fmt.Println("\n--- Reading back row data ---")
@@ -124,14 +124,34 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	_, err = file.Seek(int64(block.Offset), 0)
 	assert.NoError(t, err)
 
-	// Read rows until we've read all rows in this block
-	// (block.Size includes the hash at the end, so subtract 8 bytes)
-	dataSize := block.Size - 8
+	// First, read the bloom filters from the beginning of the data block
+	bloomFiltersSize := block.BloomFiltersSize
+	bloomFiltersBytes := make([]byte, bloomFiltersSize-8) // -8 for the hash
+	_, err = file.Read(bloomFiltersBytes)
+	assert.NoError(t, err)
+
+	// Read the bloom filters hash
+	bloomFiltersHashBytes := make([]byte, 8)
+	_, err = file.Read(bloomFiltersHashBytes)
+	assert.NoError(t, err)
+
+	// Verify and parse bloom filters
+	bloomFilters, err := DataBlockBloomFiltersFromBytesWithHash(bloomFiltersBytes, bloomFiltersHashBytes)
+	assert.NoError(t, err)
+	assert.NotNil(t, bloomFilters.FieldBloomFilter, "Field bloom filter should exist")
+	assert.NotNil(t, bloomFilters.TokenBloomFilter, "Token bloom filter should exist")
+	assert.NotNil(t, bloomFilters.FieldTokenBloomFilter, "Field+Token bloom filter should exist")
+
+	fmt.Printf("  Bloom filters loaded successfully from data block\n")
+
+	// Now read the row data
+	// (block.Size - BloomFiltersSize - 8) gives us the row data size (excluding final hash)
+	rowDataSize := block.Size - block.BloomFiltersSize - 8
 	bytesRead := 0
 	rowCount := 0
 	readRows := make([]map[string]any, 0, block.Rows)
 
-	for bytesRead < dataSize && rowCount < block.Rows {
+	for bytesRead < rowDataSize && rowCount < block.Rows {
 		// Read row length (uint32)
 		lengthBytes := make([]byte, 4)
 		_, err := file.Read(lengthBytes)
