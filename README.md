@@ -44,7 +44,7 @@ if err := <-doneChan; err != nil {
     log.Fatal(err)
 }
 
-// Query for rows where "level"="error"
+// Query for rows where `.level: "error"`
 matchingRows := engine.Query(
   NewQueryWithGroupCombinator(CombinatorAND).
     Field("level").Token("error").Build(),
@@ -100,7 +100,7 @@ query := NewQueryWithGroupCombinator(CombinatorAND).Token("error").Build()
 
 **Field:token search** - Find records with a specific value in a specific field:
 ```go
-// Find all records where "service"="payment"
+// Find all records where `.service: "payment"`
 query := NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "payment").Build()
 ```
 
@@ -114,7 +114,7 @@ query := NewQueryWithGroupCombinator(CombinatorAND).
 
 // (field AND token) OR fieldtoken (groups combined with OR)
 query := NewQueryWithGroupCombinator(CombinatorOR).
-    And().Field("retry_count").Token("error").  // group1: AND within group  
+    And().Field("retry_count").Token("error").  // group1: AND within group
     And().FieldToken("service", "payment").     // group2
     Build()
 ```
