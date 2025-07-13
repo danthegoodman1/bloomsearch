@@ -63,6 +63,10 @@ type BloomSearchEngineConfig struct {
 	MaxBufferedTime  time.Duration
 
 	IngestBufferSize int // size of the ingestion channel buffer
+
+	// Bloom filter parameters
+	BloomFilterExpectedElements  uint
+	BloomFilterFalsePositiveRate float64
 }
 
 type partitionBuffer struct {
@@ -87,6 +91,9 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 		MaxBufferedTime:  10 * time.Second, // this is designed for async writing
 
 		IngestBufferSize: 1000, // buffered channel size for ingestion requests
+
+		BloomFilterExpectedElements:  100_000,
+		BloomFilterFalsePositiveRate: 0.001,
 	}
 }
 
@@ -96,6 +103,16 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 	if config.Tokenizer == nil {
 		cancel() // make the linter happy
 		return nil, fmt.Errorf("%w: tokenizer is required", ErrInvalidConfig)
+	}
+
+	if config.BloomFilterExpectedElements == 0 {
+		cancel() // make the linter happy
+		return nil, fmt.Errorf("%w: BloomFilterExpectedElements must be greater than 0", ErrInvalidConfig)
+	}
+
+	if config.BloomFilterFalsePositiveRate <= 0 || config.BloomFilterFalsePositiveRate >= 1 {
+		cancel() // make the linter happy
+		return nil, fmt.Errorf("%w: BloomFilterFalsePositiveRate must be between 0 and 1", ErrInvalidConfig)
 	}
 
 	return &BloomSearchEngine{
@@ -271,9 +288,9 @@ func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBu
 				partitionID:           partitionID,
 				minMaxIndexes:         make(map[string]MinMaxIndex),
 				buffer:                make([]byte, 0),
-				fieldBloomFilter:      bloom.NewWithEstimates(1000000, 0.01),
-				tokenBloomFilter:      bloom.NewWithEstimates(1000000, 0.01),
-				fieldTokenBloomFilter: bloom.NewWithEstimates(1000000, 0.01),
+				fieldBloomFilter:      bloom.NewWithEstimates(b.config.BloomFilterExpectedElements, b.config.BloomFilterFalsePositiveRate),
+				tokenBloomFilter:      bloom.NewWithEstimates(b.config.BloomFilterExpectedElements, b.config.BloomFilterFalsePositiveRate),
+				fieldTokenBloomFilter: bloom.NewWithEstimates(b.config.BloomFilterExpectedElements, b.config.BloomFilterFalsePositiveRate),
 			}
 		}
 	}
@@ -416,9 +433,9 @@ func (b *BloomSearchEngine) flushWorker() {
 
 func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 	// Merge bloom filters for file-level bloom filters
-	fileFieldBloomFilter := bloom.NewWithEstimates(1000000, 0.01)
-	fileTokenBloomFilter := bloom.NewWithEstimates(1000000, 0.01)
-	fileFieldTokenBloomFilter := bloom.NewWithEstimates(1000000, 0.01)
+	fileFieldBloomFilter := bloom.NewWithEstimates(b.config.BloomFilterExpectedElements, b.config.BloomFilterFalsePositiveRate)
+	fileTokenBloomFilter := bloom.NewWithEstimates(b.config.BloomFilterExpectedElements, b.config.BloomFilterFalsePositiveRate)
+	fileFieldTokenBloomFilter := bloom.NewWithEstimates(b.config.BloomFilterExpectedElements, b.config.BloomFilterFalsePositiveRate)
 	for _, partitionBuffer := range flushReq.partitionBuffers {
 		fileFieldBloomFilter.Merge(partitionBuffer.fieldBloomFilter)
 		fileTokenBloomFilter.Merge(partitionBuffer.tokenBloomFilter)
