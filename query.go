@@ -41,14 +41,12 @@ type NumericCondition struct {
 	Max      int64         `json:",omitempty"` // for BETWEEN, NOT_BETWEEN
 }
 
-// MinMaxFieldCombinator specifies how conditions across different MinMaxIndex fields should be combined
-type MinMaxFieldCombinator string
+// Combinator specifies how conditions should be combined
+type Combinator string
 
 const (
-	// MinMaxCombineWithAND requires all MinMaxIndex field conditions to match
-	MinMaxCombineWithAND MinMaxFieldCombinator = "AND"
-	// MinMaxCombineWithOR requires any MinMaxIndex field condition to match
-	MinMaxCombineWithOR MinMaxFieldCombinator = "OR"
+	CombinatorAND Combinator = "AND"
+	CombinatorOR  Combinator = "OR"
 )
 
 // QueryPrefilter represents a complete query with conditions on partitions and MinMaxIndexes.
@@ -64,7 +62,7 @@ type QueryPrefilter struct {
 
 	// How to combine conditions across different MinMaxIndex fields (AND or OR)
 	// Default is AND if not specified
-	MinMaxFieldCombinator MinMaxFieldCombinator `json:",omitempty"`
+	MinMaxFieldCombinator Combinator `json:",omitempty"`
 }
 
 // NewQueryPrefilter creates a new empty query condition with AND MinMaxIndex field combinator
@@ -72,7 +70,7 @@ func NewQueryPrefilter() *QueryPrefilter {
 	return &QueryPrefilter{
 		PartitionConditions:   make([]StringCondition, 0),
 		MinMaxConditions:      make(map[string][]NumericCondition),
-		MinMaxFieldCombinator: MinMaxCombineWithAND,
+		MinMaxFieldCombinator: CombinatorAND,
 	}
 }
 
@@ -92,7 +90,7 @@ func (q *QueryPrefilter) AddMinMaxCondition(fieldName string, condition NumericC
 }
 
 // WithMinMaxFieldCombinator sets how conditions across different MinMaxIndex fields should be combined
-func (q *QueryPrefilter) WithMinMaxFieldCombinator(combinator MinMaxFieldCombinator) *QueryPrefilter {
+func (q *QueryPrefilter) WithMinMaxFieldCombinator(combinator Combinator) *QueryPrefilter {
 	q.MinMaxFieldCombinator = combinator
 	return q
 }
@@ -345,7 +343,7 @@ func EvaluateDataBlockMetadata(metadata *DataBlockMetadata, query *QueryPrefilte
 	}
 
 	// Handle OR case first, then fall through to AND (default)
-	if query.MinMaxFieldCombinator == MinMaxCombineWithOR {
+	if query.MinMaxFieldCombinator == CombinatorOR {
 		// Any field can match (within each field conditions are OR-ed)
 		for fieldName, conditions := range query.MinMaxConditions {
 			minMaxIndex, exists := metadata.MinMaxIndexes[fieldName]
@@ -408,3 +406,167 @@ func FilterDataBlocks(blocks []DataBlockMetadata, query *QueryPrefilter) []DataB
 	}
 	return filtered
 }
+
+// =============================================================================
+// Bloom Query API (for field, token, fieldtoken searches)
+// =============================================================================
+
+type BloomConditionType string
+
+const (
+	BloomField      BloomConditionType = "FIELD"
+	BloomToken      BloomConditionType = "TOKEN"
+	BloomFieldToken BloomConditionType = "FIELD_TOKEN"
+)
+
+type BloomCondition struct {
+	Type  BloomConditionType
+	Field string // for FIELD and FIELD_TOKEN
+	Token string // for TOKEN and FIELD_TOKEN
+}
+
+type BloomGroup struct {
+	Conditions []BloomCondition
+	Combinator Combinator // how to combine conditions within this group
+}
+
+type BloomQuery struct {
+	Groups     []BloomGroup
+	Combinator Combinator // how to combine groups (default AND)
+}
+
+// Query combines prefiltering (partitions/minmax) with bloom filtering
+type Query struct {
+	Prefilter *QueryPrefilter // for partitions and minmax indexes
+	Bloom     *BloomQuery     // for field/token/fieldtoken searches
+}
+
+func NewQueryWithGroupCombinator(queryCombinator Combinator) *QueryBuilder {
+	return &QueryBuilder{
+		query: &Query{
+			Prefilter: NewQueryPrefilter(),
+			Bloom:     &BloomQuery{Groups: []BloomGroup{}, Combinator: queryCombinator},
+		},
+		currentGroup: &BloomGroup{Conditions: []BloomCondition{}, Combinator: CombinatorAND},
+	}
+}
+
+type QueryBuilder struct {
+	query        *Query
+	currentGroup *BloomGroup
+}
+
+// Bloom filter methods
+func (b *QueryBuilder) Field(field string) *QueryBuilder {
+	b.ensureGroupStarted()
+	b.currentGroup.Conditions = append(b.currentGroup.Conditions, BloomCondition{
+		Type:  BloomField,
+		Field: field,
+	})
+	return b
+}
+
+func (b *QueryBuilder) Token(token string) *QueryBuilder {
+	b.ensureGroupStarted()
+	b.currentGroup.Conditions = append(b.currentGroup.Conditions, BloomCondition{
+		Type:  BloomToken,
+		Token: token,
+	})
+	return b
+}
+
+func (b *QueryBuilder) FieldToken(field, token string) *QueryBuilder {
+	b.ensureGroupStarted()
+	b.currentGroup.Conditions = append(b.currentGroup.Conditions, BloomCondition{
+		Type:  BloomFieldToken,
+		Field: field,
+		Token: token,
+	})
+	return b
+}
+
+// ensureGroupStarted starts a default AND group if no group has been started
+func (b *QueryBuilder) ensureGroupStarted() {
+	// If we haven't started any groups and currentGroup is empty, this is the first group
+	if len(b.query.Bloom.Groups) == 0 && len(b.currentGroup.Conditions) == 0 {
+		// Set default group combinator to AND (query combinator is set at creation)
+		b.currentGroup.Combinator = CombinatorAND
+	}
+}
+
+// Group management - starts a new group with the specified combinator
+func (b *QueryBuilder) And() *QueryBuilder {
+	b.finishCurrentGroup()
+	b.currentGroup = &BloomGroup{Conditions: []BloomCondition{}, Combinator: CombinatorAND}
+	return b
+}
+
+func (b *QueryBuilder) Or() *QueryBuilder {
+	b.finishCurrentGroup()
+	b.currentGroup = &BloomGroup{Conditions: []BloomCondition{}, Combinator: CombinatorOR}
+	return b
+}
+
+// Prefilter methods (delegate to existing API)
+func (b *QueryBuilder) AddPartitionCondition(condition StringCondition) *QueryBuilder {
+	b.query.Prefilter.AddPartitionCondition(condition)
+	return b
+}
+
+func (b *QueryBuilder) AddMinMaxCondition(fieldName string, condition NumericCondition) *QueryBuilder {
+	b.query.Prefilter.AddMinMaxCondition(fieldName, condition)
+	return b
+}
+
+func (b *QueryBuilder) WithMinMaxFieldCombinator(combinator Combinator) *QueryBuilder {
+	b.query.Prefilter.WithMinMaxFieldCombinator(combinator)
+	return b
+}
+
+func (b *QueryBuilder) finishCurrentGroup() {
+	if len(b.currentGroup.Conditions) > 0 {
+		b.query.Bloom.Groups = append(b.query.Bloom.Groups, *b.currentGroup)
+	}
+}
+
+func (b *QueryBuilder) Build() *Query {
+	b.finishCurrentGroup()
+	return b.query
+}
+
+// =============================================================================
+// Usage Examples:
+// =============================================================================
+
+// Simple field search:
+// query := NewQueryWithGroupCombinator(CombinatorAND).Field("retry_count").Build()
+
+// Multiple conditions (defaults to AND within group):
+// query := NewQueryWithGroupCombinator(CombinatorAND).Field("retry_count").Token("error").Build()
+
+// Token search with prefiltering:
+// query := NewQueryWithGroupCombinator(CombinatorAND).
+//     AddPartitionCondition(PartitionEquals("202301")).
+//     Token("error").
+//     Build()
+
+// Groups combined with AND (default):
+// query := NewQueryWithGroupCombinator(CombinatorAND).
+//     Field("retry_count").Token("error").        // group1: (field AND token)
+//     And().FieldToken("service", "payment").     // group2: (fieldtoken)
+//     Build()
+// Result: group1 AND group2
+
+// Groups combined with OR:
+// query := NewQueryWithGroupCombinator(BloomOR).
+//     And().Field("retry_count").Token("error").  // group1: (field AND token)
+//     And().FieldToken("service", "payment").     // group2: (fieldtoken)
+//     Build()
+// Result: group1 OR group2
+
+// Mixed group combinators:
+// query := NewQueryWithGroupCombinator(BloomAND).
+//     Or().Field("user_id").Field("session_id").  // group1: (field OR field)
+//     And().Token("error").Token("timeout").      // group2: (token AND token)
+//     Build()
+// Result: group1 AND group2
