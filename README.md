@@ -276,6 +276,8 @@ maybeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 
 Memory usage scales with concurrent file reads, not dataset size.
 
+This flow is a bit simplified, see `BloomSearchEngine.Query` for more detail.
+
 ## Contributing
 
 Do not submit random PRs, they will be closed.

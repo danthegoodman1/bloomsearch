@@ -17,6 +17,11 @@ var (
 	ErrInvalidConfig = errors.New("invalid configuration")
 )
 
+// makeFieldTokenKey creates a key for field-token bloom filter entries
+func makeFieldTokenKey(field, token string) string {
+	return field + "::" + token
+}
+
 type PartitionFunc func(row map[string]any) string
 
 type ingestRequest struct {
@@ -326,7 +331,7 @@ func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBu
 					tokens := b.config.Tokenizer(value)
 					for _, token := range tokens {
 						partitionBuffer.tokenBloomFilter.AddString(token)
-						partitionBuffer.fieldTokenBloomFilter.AddString(field.Path + "::" + token)
+						partitionBuffer.fieldTokenBloomFilter.AddString(makeFieldTokenKey(field.Path, token))
 					}
 				}
 			}
@@ -599,4 +604,109 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 
 	// Signal completion
 	TryWriteToChannels(flushReq.doneChans, nil)
+}
+
+// evaluateFileBloomFilters tests if a file's bloom filters match the bloom query
+func (b *BloomSearchEngine) evaluateFileBloomFilters(fileMetadata *FileMetadata, bloomQuery *BloomQuery) bool {
+	if bloomQuery == nil || len(bloomQuery.Groups) == 0 {
+		return true // No bloom filtering needed, since it's only used to DISQUALIFY files
+	}
+
+	// Evaluate each group
+	groupResults := make([]bool, len(bloomQuery.Groups))
+	for i, group := range bloomQuery.Groups {
+		groupResults[i] = b.evaluateBloomGroup(fileMetadata, &group)
+	}
+
+	// Combine group results based on query combinator
+	if bloomQuery.Combinator == CombinatorOR {
+		// Any group can match
+		for _, result := range groupResults {
+			if result {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Default AND behavior: all groups must match
+	for _, result := range groupResults {
+		if !result {
+			return false
+		}
+	}
+	return true
+}
+
+// evaluateBloomGroup tests if a file's bloom filters match a single bloom group
+func (b *BloomSearchEngine) evaluateBloomGroup(fileMetadata *FileMetadata, group *BloomGroup) bool {
+	if len(group.Conditions) == 0 {
+		return true // Empty group matches everything, since we can't disqualify it
+	}
+
+	// Evaluate each condition in the group
+	conditionResults := make([]bool, len(group.Conditions))
+	for i, condition := range group.Conditions {
+		conditionResults[i] = b.evaluateBloomCondition(fileMetadata, &condition)
+	}
+
+	// Combine condition results based on group combinator
+	if group.Combinator == CombinatorOR {
+		// Any condition can match
+		for _, result := range conditionResults {
+			if result {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Default AND behavior: all conditions must match
+	for _, result := range conditionResults {
+		if !result {
+			return false
+		}
+	}
+	return true
+}
+
+// evaluateBloomCondition tests if a file's bloom filters match a single bloom condition
+func (b *BloomSearchEngine) evaluateBloomCondition(fileMetadata *FileMetadata, condition *BloomCondition) bool {
+	switch condition.Type {
+	case BloomField:
+		return fileMetadata.FieldBloomFilter.TestString(condition.Field)
+	case BloomToken:
+		return fileMetadata.TokenBloomFilter.TestString(condition.Token)
+	case BloomFieldToken:
+		return fileMetadata.FieldTokenBloomFilter.TestString(makeFieldTokenKey(condition.Field, condition.Token))
+	default:
+		return false // We don't know what this is, so it's invalid
+	}
+}
+
+func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) ([]map[string]any, error) {
+	// Get maybe files from meta store
+	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
+	if err != nil {
+		return nil, err
+	}
+
+	// For each maybe file, test the file-level bloom filters
+	matchingFiles := make([]MaybeFile, 0, len(maybeFiles))
+	for _, maybeFile := range maybeFiles {
+		// Test the file-level bloom filters
+		if b.evaluateFileBloomFilters(&maybeFile.Metadata, query.Bloom) {
+			matchingFiles = append(matchingFiles, maybeFile)
+		}
+	}
+
+	// For each passing file, read:
+	//  1. if they maybe file specified matching data blocks, just read those bloom filters
+	//  2. if they did not specify matching data blocks, read all bloom filters
+
+	// We read the above by opening the file and seeking/streaming in to read the bloom filters
+	// If the bloom filter passes, we keep reading the data block and scan each row to see if it contains any of the fields or tokens (even if field:token)
+	// if the row contains it, then we deserialize and check for an exact batch
+
+	panic("not implemented")
 }

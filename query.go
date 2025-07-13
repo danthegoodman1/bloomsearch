@@ -489,8 +489,10 @@ func (b *QueryBuilder) FieldToken(field, token string) *QueryBuilder {
 func (b *QueryBuilder) ensureGroupStarted() {
 	// If we haven't started any groups and currentGroup is empty, this is the first group
 	if len(b.query.Bloom.Groups) == 0 && len(b.currentGroup.Conditions) == 0 {
-		// Set default group combinator to AND (query combinator is set at creation)
-		b.currentGroup.Combinator = CombinatorAND
+		// Set default group combinator to AND only if it hasn't been explicitly set
+		if b.currentGroup.Combinator == "" {
+			b.currentGroup.Combinator = CombinatorAND
+		}
 	}
 }
 

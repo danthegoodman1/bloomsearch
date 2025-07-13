@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bits-and-blooms/bloom/v3"
 )
 
 func TestBloomTreeEngineFlushMaxRows(t *testing.T) {
@@ -180,5 +182,85 @@ func TestBloomTreeEngineFlushMaxTime(t *testing.T) {
 
 	case <-time.After(3 * time.Second):
 		t.Fatalf("Flush did not complete within timeout")
+	}
+}
+
+func TestEvaluateFileBloomFilters(t *testing.T) {
+	// Create a simple engine for testing
+	config := DefaultBloomSearchEngineConfig()
+	engine, err := NewBloomSearchEngine(config, &NullMetaStore{}, NewFileSystemDataStore("./test_data/bloom_test"))
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	// Create file metadata with populated bloom filters
+	fileMetadata := &FileMetadata{
+		FieldBloomFilter:      bloom.NewWithEstimates(100, 0.01),
+		TokenBloomFilter:      bloom.NewWithEstimates(100, 0.01),
+		FieldTokenBloomFilter: bloom.NewWithEstimates(100, 0.01),
+	}
+
+	// Add some test data to the bloom filters
+	fileMetadata.FieldBloomFilter.AddString("user.name")
+	fileMetadata.FieldBloomFilter.AddString("user.age")
+	fileMetadata.TokenBloomFilter.AddString("alice")
+	fileMetadata.TokenBloomFilter.AddString("30")
+	fileMetadata.FieldTokenBloomFilter.AddString(makeFieldTokenKey("user.name", "alice"))
+	fileMetadata.FieldTokenBloomFilter.AddString(makeFieldTokenKey("user.age", "30"))
+
+	tests := []struct {
+		name     string
+		query    *BloomQuery
+		expected bool
+	}{
+		{
+			name:     "nil query should return true",
+			query:    nil,
+			expected: true,
+		},
+		{
+			name:     "field exists should return true",
+			query:    NewQueryWithGroupCombinator(CombinatorAND).Field("user.name").Build().Bloom,
+			expected: true,
+		},
+		{
+			name:     "field does not exist should return false",
+			query:    NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent.field").Build().Bloom,
+			expected: false,
+		},
+		{
+			name:     "token exists should return true",
+			query:    NewQueryWithGroupCombinator(CombinatorAND).Token("alice").Build().Bloom,
+			expected: true,
+		},
+		{
+			name:     "field-token exists should return true",
+			query:    NewQueryWithGroupCombinator(CombinatorAND).FieldToken("user.name", "alice").Build().Bloom,
+			expected: true,
+		},
+		{
+			name:     "OR condition with one match should return true",
+			query:    NewQueryWithGroupCombinator(CombinatorAND).Or().Field("nonexistent.field").Field("user.name").Build().Bloom,
+			expected: true,
+		},
+		{
+			name:     "AND condition with one mismatch should return false",
+			query:    NewQueryWithGroupCombinator(CombinatorAND).And().Field("nonexistent.field").Field("user.name").Build().Bloom,
+			expected: false,
+		},
+		{
+			name:     "multiple groups with OR combinator should return true",
+			query:    NewQueryWithGroupCombinator(CombinatorOR).And().Field("nonexistent.field").And().Field("user.name").Build().Bloom,
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := engine.evaluateFileBloomFilters(fileMetadata, tt.query)
+			if result != tt.expected {
+				t.Errorf("evaluateFileBloomFilters() = %v, want %v", result, tt.expected)
+			}
+		})
 	}
 }
