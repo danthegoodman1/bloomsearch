@@ -235,7 +235,7 @@ func (b *BloomSearchEngine) ingestWorker() {
 			return
 		case req := <-b.ingestChan:
 			// Process the batch of rows
-			b.processIngestRequest(req, partitionBuffers, &doneChans, &bufferedRowCount, &bufferedBytes, &bufferStartTime)
+			b.processIngestRequest(b.ctx, req, partitionBuffers, &doneChans, &bufferedRowCount, &bufferedBytes, &bufferStartTime)
 		case <-ticker.C:
 			// Check for time-based flush
 			if bufferedRowCount > 0 && !bufferStartTime.IsZero() && time.Since(bufferStartTime) >= b.config.MaxBufferedTime {
@@ -271,7 +271,7 @@ func (b *BloomSearchEngine) flushBufferedData(partitionBuffers map[string]*parti
 	*bufferStartTime = time.Time{}
 }
 
-func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
+func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *ingestRequest, partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
 	// Process the request and return to pool at the end
 	defer func() {
 		req.reset()
@@ -365,13 +365,13 @@ func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBu
 			// Serialize and store the row
 			rowBytes, err := json.Marshal(row)
 			if err != nil {
-				req.doneChan <- fmt.Errorf("failed to serialize row: %w", err)
+				SendWithContext(ctx, req.doneChan, fmt.Errorf("failed to serialize row: %w", err))
 				return
 			}
 
 			// Check if row is too large for uint32 length prefix
 			if len(rowBytes) > 0xFFFFFFFF {
-				req.doneChan <- fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF)
+				SendWithContext(ctx, req.doneChan, fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF))
 				return
 			}
 
@@ -706,13 +706,18 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 	}
 }
 
-// Query executes a query and returns channels for streaming results.
+// Query executes a query and sends results to the provided channels.
 // The result channel feeds individual matching rows. Canceling the context
 // will stop all workers. When the result channel closes, no more work is happening.
 //
+// The error channel is written to for any errors that occur per-worker. If a worker writes to this channel,
+// it has stopped processing.
+//
 // Example usage:
 //
-//	resultChan, errorChan, err := engine.Query(ctx, query)
+//	resultChan := make(chan map[string]any, 1000)
+//	errorChan := make(chan error, 100)
+//	err := engine.Query(ctx, query, resultChan, errorChan)
 //	if err != nil { return err }
 //	for {
 //	  select {
@@ -725,11 +730,11 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 //	    return err
 //	  }
 //	}
-func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (<-chan map[string]any, <-chan error, error) {
+func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan chan<- map[string]any, errorChan chan<- error) error {
 	// Get maybe files from meta store
 	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 
 	// For each maybe file, test the file-level bloom filters
@@ -760,10 +765,6 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (<-chan map
 		}
 	}
 
-	// Channel for individual results
-	resultChan := make(chan map[string]any, 1000) // Buffered channel for individual results
-	errorChan := make(chan error, len(allJobs))
-
 	// Create a semaphore to limit concurrency
 	semaphore := make(chan struct{}, maxConcurrency)
 
@@ -776,7 +777,9 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (<-chan map
 			defer wg.Done()
 
 			// Acquire semaphore
-			semaphore <- struct{}{}
+			if err := SendWithContext(workerCtx, semaphore, struct{}{}); err != nil {
+				return // Context cancelled while waiting for semaphore
+			}
 			defer func() { <-semaphore }()
 
 			b.processDataBlock(workerCtx, job, resultChan, errorChan, query.Bloom)
@@ -790,7 +793,7 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (<-chan map
 		close(resultChan) // closing this indicates that all workers are done, and no more errors can come either
 	}()
 
-	return resultChan, errorChan, nil
+	return nil
 }
 
 // processDataBlock processes a specific data block job
@@ -804,7 +807,7 @@ func (b *BloomSearchEngine) processDataBlock(
 	// Open the file for reading
 	file, err := b.dataStore.OpenFile(ctx, job.filePointer)
 	if err != nil {
-		errorChan <- fmt.Errorf("failed to open file: %w", err)
+		SendWithContext(ctx, errorChan, fmt.Errorf("failed to open file: %w", err))
 		return
 	}
 	defer file.Close()
@@ -812,7 +815,7 @@ func (b *BloomSearchEngine) processDataBlock(
 	// Read the data block bloom filters
 	blockBloomFilters, err := ReadDataBlockBloomFilters(file, job.blockMetadata)
 	if err != nil {
-		errorChan <- fmt.Errorf("failed to read data block bloom filters: %w", err)
+		SendWithContext(ctx, errorChan, fmt.Errorf("failed to read data block bloom filters: %w", err))
 		return
 	}
 
@@ -827,12 +830,43 @@ func (b *BloomSearchEngine) processDataBlock(
 		return
 	}
 
-	// TODO: Read rows from this data block and scan each row for exact matches
-	// TODO: This is where row scanning will happen and individual results will be sent
-	// For now, don't send anything since we're not actually processing rows yet
+	// Read rows from this data block as raw bytes
+	// Seek to the start of row data (after bloom filters)
+	rowDataOffset := int64(job.blockMetadata.Offset + job.blockMetadata.BloomFiltersSize)
+	if _, err := file.Seek(rowDataOffset, 0); err != nil {
+		SendWithContext(ctx, errorChan, fmt.Errorf("failed to seek to row data: %w", err))
+		return
+	}
+
+	// Calculate the size of row data (excluding the final data block hash)
+	rowGroupSize := job.blockMetadata.Size - job.blockMetadata.BloomFiltersSize - 8 // -8 for final hash
+
+	for bytesRead := 0; bytesRead < rowGroupSize; {
+		// Read the row length prefix (uint32)
+		lengthBytes := make([]byte, 4)
+		if _, err := file.Read(lengthBytes); err != nil {
+			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row length: %w", err))
+			return
+		}
+		bytesRead += 4
+
+		// Extract the row length
+		rowLength := binary.LittleEndian.Uint32(lengthBytes)
+
+		// Read the row data as raw bytes
+		rowData := make([]byte, rowLength)
+		if _, err := file.Read(rowData); err != nil {
+			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row data: %w", err))
+			return
+		}
+		bytesRead += int(rowLength)
+
+		// Print the row as string to show it's working, then throw it away
+		fmt.Printf("Row data: %s\n", string(rowData))
+	}
 
 	// TODO: dummy return indicating that this passed (for testing, when removed the test needs to be changed)
-	resultChan <- map[string]any{"dummy": "result"}
+	SendWithContext(ctx, resultChan, map[string]any{"dummy": "result"})
 }
 
 // readRowsFromDataBlock reads all rows from a data block after the bloom filters

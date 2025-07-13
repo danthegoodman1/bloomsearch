@@ -44,11 +44,38 @@ if err := <-doneChan; err != nil {
     log.Fatal(err)
 }
 
-// Query for rows where `.level: "error"`
-matchingRows := engine.Query(
-  NewQueryWithGroupCombinator(CombinatorAND).
-    Field("level").Token("error").Build(),
+// Collect the resulting rows that match
+resultChan := make(chan map[string]any, 100)
+// If any of the workers error, they report it here
+errorChan := make(chan error, 10)
+
+err := engine.Query(
+    ctx,
+    // Query for rows where `.level: "error"`
+    NewQueryWithGroupCombinator(CombinatorAND).Field("level").Token("error").Build(),
+    resultChan,
+    errorChan,
 )
+if err != nil {
+    log.Fatal(err)
+}
+
+// Process results
+for {
+    select {
+    case <-ctx.Done():
+        return
+    case row, activeWorkers := <-resultChan:
+        if !activeWorkers {
+            return
+        }
+        // Process matching row
+        fmt.Printf("Found row: %+v\n", row)
+    case err := <-errorChan:
+        log.Printf("Query error: %v", err)
+        // Continue processing other results, or cancel context
+    }
+}
 ```
 
 See tests for complete working examples, including partitioning and minmax index filtering.
@@ -277,6 +304,13 @@ maybeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 Memory usage scales with concurrent file reads, not dataset size.
 
 This flow is a bit simplified, see `BloomSearchEngine.Query` for more detail.
+
+As you notice, `BloomSearchEngine.Query` takes in a `resultChan` and `errorChan`. This is because each row group
+processor reads the row group one row at a time, allowing to stream matches back to the caller.
+
+This enables processing of arbitrarily large results as well.
+
+When the `resultChan` closes, there are no more active row group processors, and the caller can exit.
 
 ## Contributing
 

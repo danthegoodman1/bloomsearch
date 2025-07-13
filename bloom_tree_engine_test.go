@@ -357,7 +357,9 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Execute query
-			resultChan, errorChan, err := engine.Query(ctx, tc.query)
+			resultChan := make(chan map[string]any, 100)
+			errorChan := make(chan error, 10)
+			err := engine.Query(ctx, tc.query, resultChan, errorChan)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}

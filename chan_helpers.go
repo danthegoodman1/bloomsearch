@@ -1,5 +1,7 @@
 package bloomsearch
 
+import "context"
+
 // TryWriteChannel attempts to write a value to a channel without blocking.
 // Returns true if the write was successful, false if the channel is full or nobody is listening.
 func TryWriteChannel[T any](ch chan<- T, value T) bool {
@@ -17,5 +19,16 @@ func TryWriteToChannels[T any](channels []chan T, value T) {
 		if ch != nil {
 			TryWriteChannel(ch, value)
 		}
+	}
+}
+
+// SendWithContext attempts to send a value to a channel while respecting context cancellation.
+// Returns an error if the context is done before the send completes.
+func SendWithContext[T any](ctx context.Context, ch chan<- T, value T) error {
+	select {
+	case ch <- value:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
