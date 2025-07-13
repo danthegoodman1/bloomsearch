@@ -15,7 +15,7 @@ type MetaStore interface {
 	//
 	// The MaybeFile.Metadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
 	// if the query conditions are able to guarantee that some data blocks will not match the query conditions.
-	GetMaybeFilesForQuery(ctx context.Context, query *QueryCondition) ([]MaybeFile, error)
+	GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error)
 
 	// WriteFileMetadata writes the file metadata to the store.
 	//
@@ -35,7 +35,7 @@ type MaybeFile struct {
 
 type NullMetaStore struct{}
 
-func (n *NullMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryCondition) ([]MaybeFile, error) {
+func (n *NullMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
 	return nil, nil
 }
 

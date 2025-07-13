@@ -51,11 +51,11 @@ const (
 	MinMaxCombineWithOR MinMaxFieldCombinator = "OR"
 )
 
-// QueryCondition represents a complete query with conditions on partitions and MinMaxIndexes.
+// QueryPrefilter represents a complete query with conditions on partitions and MinMaxIndexes.
 //
 // Partition conditions are OR-ed together (since a block can only belong to one partition)
 // MinMaxIndex conditions are OR-ed within a field, and either AND or OR-ed across fields (Default is AND).
-type QueryCondition struct {
+type QueryPrefilter struct {
 	// Partition conditions - these are OR-ed together (since a block can only belong to one partition)
 	PartitionConditions []StringCondition `json:",omitempty"`
 
@@ -67,9 +67,9 @@ type QueryCondition struct {
 	MinMaxFieldCombinator MinMaxFieldCombinator `json:",omitempty"`
 }
 
-// NewQueryCondition creates a new empty query condition with AND MinMaxIndex field combinator
-func NewQueryCondition() *QueryCondition {
-	return &QueryCondition{
+// NewQueryPrefilter creates a new empty query condition with AND MinMaxIndex field combinator
+func NewQueryPrefilter() *QueryPrefilter {
+	return &QueryPrefilter{
 		PartitionConditions:   make([]StringCondition, 0),
 		MinMaxConditions:      make(map[string][]NumericCondition),
 		MinMaxFieldCombinator: MinMaxCombineWithAND,
@@ -77,13 +77,13 @@ func NewQueryCondition() *QueryCondition {
 }
 
 // AddPartitionCondition adds a partition condition
-func (q *QueryCondition) AddPartitionCondition(condition StringCondition) *QueryCondition {
+func (q *QueryPrefilter) AddPartitionCondition(condition StringCondition) *QueryPrefilter {
 	q.PartitionConditions = append(q.PartitionConditions, condition)
 	return q
 }
 
 // AddMinMaxCondition adds a MinMaxIndex condition for a specific field
-func (q *QueryCondition) AddMinMaxCondition(fieldName string, condition NumericCondition) *QueryCondition {
+func (q *QueryPrefilter) AddMinMaxCondition(fieldName string, condition NumericCondition) *QueryPrefilter {
 	if q.MinMaxConditions == nil {
 		q.MinMaxConditions = make(map[string][]NumericCondition)
 	}
@@ -92,7 +92,7 @@ func (q *QueryCondition) AddMinMaxCondition(fieldName string, condition NumericC
 }
 
 // WithMinMaxFieldCombinator sets how conditions across different MinMaxIndex fields should be combined
-func (q *QueryCondition) WithMinMaxFieldCombinator(combinator MinMaxFieldCombinator) *QueryCondition {
+func (q *QueryPrefilter) WithMinMaxFieldCombinator(combinator MinMaxFieldCombinator) *QueryPrefilter {
 	q.MinMaxFieldCombinator = combinator
 	return q
 }
@@ -323,7 +323,7 @@ func EvaluateMinMaxCondition(minMaxIndex MinMaxIndex, condition NumericCondition
 }
 
 // EvaluateDataBlockMetadata checks if a DataBlockMetadata matches the query conditions
-func EvaluateDataBlockMetadata(metadata *DataBlockMetadata, query *QueryCondition) bool {
+func EvaluateDataBlockMetadata(metadata *DataBlockMetadata, query *QueryPrefilter) bool {
 	// Check partition conditions (any can match, since a block can only belong to one partition)
 	if len(query.PartitionConditions) > 0 {
 		partitionMatches := false
@@ -394,7 +394,7 @@ func EvaluateDataBlockMetadata(metadata *DataBlockMetadata, query *QueryConditio
 }
 
 // FilterDataBlocks filters a slice of DataBlockMetadata based on query conditions
-func FilterDataBlocks(blocks []DataBlockMetadata, query *QueryCondition) []DataBlockMetadata {
+func FilterDataBlocks(blocks []DataBlockMetadata, query *QueryPrefilter) []DataBlockMetadata {
 	if query == nil {
 		// If no query, return all blocks, as we can't prune any
 		return blocks

@@ -127,7 +127,7 @@ func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata,
 	return metadata, nil
 }
 
-func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryCondition) ([]MaybeFile, error) {
+func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
 	files, err := os.ReadDir(fs.rootDir)
 	if err != nil {
 		return nil, err
