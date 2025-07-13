@@ -58,6 +58,8 @@ type BloomSearchEngine struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
+
+	querySemaphore chan struct{} // Global semaphore for query concurrency
 }
 
 type BloomSearchEngineConfig struct {
@@ -73,7 +75,10 @@ type BloomSearchEngineConfig struct {
 	MaxBufferedBytes int
 	MaxBufferedTime  time.Duration
 
-	IngestBufferSize int // size of the ingestion channel buffer
+	IngestBufferSize int
+
+	// The maximum number of total data blocks that can be processed concurrently across all queries
+	MaxQueryConcurrency int
 
 	// Bloom filter parameters
 	BloomExpectedItems     uint
@@ -103,6 +108,8 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 
 		IngestBufferSize: 1_000,
 
+		MaxQueryConcurrency: 1_000,
+
 		BloomExpectedItems:     100_000,
 		BloomFalsePositiveRate: 0.001,
 	}
@@ -126,6 +133,11 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		return nil, fmt.Errorf("%w: BloomFalsePositiveRate must be between 0 and 1", ErrInvalidConfig)
 	}
 
+	if config.MaxQueryConcurrency <= 0 {
+		cancel() // make the linter happy
+		return nil, fmt.Errorf("%w: MaxQueryConcurrency must be greater than 0", ErrInvalidConfig)
+	}
+
 	return &BloomSearchEngine{
 		config:    config,
 		metaStore: metaStore,
@@ -140,6 +152,8 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		},
 		ctx:    ctx,
 		cancel: cancel,
+
+		querySemaphore: make(chan struct{}, config.MaxQueryConcurrency),
 	}, nil
 }
 
@@ -750,10 +764,7 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 		}
 	}
 
-	// Process data blocks concurrently with bounded concurrency
-	const maxConcurrency = 10 // TODO: make this configurable, even a global pool
-
-	// Collect all data blocks from all files
+	// Collect all data blocks from all files to process concurrently
 	var allJobs []dataBlockJob
 	for _, matchingFile := range matchingFiles {
 		for _, blockMetadata := range matchingFile.Metadata.DataBlocks {
@@ -764,9 +775,6 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 		}
 	}
 
-	// Create a semaphore to limit concurrency
-	semaphore := make(chan struct{}, maxConcurrency)
-
 	// Start worker goroutines - one for each data block
 	var wg sync.WaitGroup
 	workerCtx, workerCancel := context.WithCancel(ctx)
@@ -775,11 +783,11 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 		go func(job dataBlockJob) {
 			defer wg.Done()
 
-			// Acquire semaphore
-			if err := SendWithContext(workerCtx, semaphore, struct{}{}); err != nil {
+			// Acquire global semaphore
+			if err := SendWithContext(workerCtx, b.querySemaphore, struct{}{}); err != nil {
 				return // Context cancelled while waiting for semaphore
 			}
-			defer func() { <-semaphore }()
+			defer func() { <-b.querySemaphore }()
 
 			b.processDataBlock(workerCtx, job, resultChan, errorChan, query.Bloom)
 		}(job)
