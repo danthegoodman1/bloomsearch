@@ -1,4 +1,4 @@
-#  <img src="https://media.tenor.com/_xAGKS8S3zEAAAAi/flower-sam-smith.gif" width="36px" /> BloomSearch <img src="https://media.tenor.com/_xAGKS8S3zEAAAAi/flower-sam-smith.gif" width="36px" /> <!-- omit in toc -->
+#  <img src="https://media.tenor.com/oarbV8g0O0gAAAAi/smiling-flower-kids%27-choice-awards.gif" width="36px" /> BloomSearch <img src="https://media.tenor.com/oarbV8g0O0gAAAAi/smiling-flower-kids%27-choice-awards.gif" width="36px" /> <!-- omit in toc -->
 
 **Keyword search engine with hierarchical bloom filters for massive datasets**
 
@@ -11,26 +11,7 @@ BloomSearch provides extremely low memory usage and low cold-start searches thro
 
 Perfect for logs, JSON documents, and high-cardinality keyword search.
 
-- [Usage](#usage)
-  - [Quick start](#quick-start)
-- [Concepts](#concepts)
-  - [Bloom filters](#bloom-filters)
-  - [Search types](#search-types)
-  - [Data files](#data-files)
-    - [Partitions](#partitions)
-    - [MinMax Indexes](#minmax-indexes)
-  - [Merging](#merging)
-    - [Coordinated Merges](#coordinated-merges)
-    - [TTLs](#ttls)
-  - [DataStore](#datastore)
-  - [MetaStore](#metastore)
-  - [Write path](#write-path)
-  - [Query path](#query-path)
-- [Contributing](#contributing)
-
-## Usage
-
-### Quick start
+## Quick start
 
 ```bash
 go get github.com/danthegoodman1/bloomsearch
@@ -68,6 +49,22 @@ matchingRows := engine.Query(NewQueryWithGroupCombinator(CombinatorAND).Field("l
 ```
 
 See tests for complete working examples, including partitioning and minmax index filtering.
+
+- [Quick start](#quick-start)
+- [Concepts](#concepts)
+  - [Bloom filters](#bloom-filters)
+  - [Search types](#search-types)
+  - [Data files](#data-files)
+    - [Partitions](#partitions)
+    - [MinMax Indexes](#minmax-indexes)
+  - [Merging](#merging)
+    - [Coordinated Merges](#coordinated-merges)
+    - [TTLs](#ttls)
+  - [DataStore](#datastore)
+  - [MetaStore](#metastore)
+  - [Write path](#write-path)
+  - [Query path](#query-path)
+- [Contributing](#contributing)
 
 ## Concepts
 
