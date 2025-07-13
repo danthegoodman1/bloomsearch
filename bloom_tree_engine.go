@@ -107,12 +107,12 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 
 	if config.BloomExpectedItems == 0 {
 		cancel() // make the linter happy
-		return nil, fmt.Errorf("%w: BloomFilterExpectedElements must be greater than 0", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: BloomExpectedItems must be greater than 0", ErrInvalidConfig)
 	}
 
 	if config.BloomFalsePositiveRate <= 0 || config.BloomFalsePositiveRate >= 1 {
 		cancel() // make the linter happy
-		return nil, fmt.Errorf("%w: BloomFilterFalsePositiveRate must be between 0 and 1", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: BloomFalsePositiveRate must be between 0 and 1", ErrInvalidConfig)
 	}
 
 	return &BloomSearchEngine{
@@ -208,6 +208,10 @@ func (b *BloomSearchEngine) ingestWorker() {
 	bufferedBytes := 0
 	var bufferStartTime time.Time
 
+	// Create a ticker for periodic time-based flush checks
+	ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-b.ctx.Done():
@@ -220,6 +224,11 @@ func (b *BloomSearchEngine) ingestWorker() {
 		case req := <-b.ingestChan:
 			// Process the batch of rows
 			b.processIngestRequest(req, partitionBuffers, &doneChans, &bufferedRowCount, &bufferedBytes, &bufferStartTime)
+		case <-ticker.C:
+			// Check for time-based flush
+			if bufferedRowCount > 0 && !bufferStartTime.IsZero() && time.Since(bufferStartTime) >= b.config.MaxBufferedTime {
+				b.flushBufferedData(partitionBuffers, &doneChans, &bufferedRowCount, &bufferedBytes, &bufferStartTime)
+			}
 		}
 	}
 }

@@ -25,3 +25,15 @@ type MaybeFile struct {
 	// DataBlocks that match the query conditions within this file
 	MatchingDataBlocks []DataBlockMetadata
 }
+
+// TESTING
+
+type NullMetaStore struct{}
+
+func (n *NullMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryCondition) ([]MaybeFile, error) {
+	return nil, nil
+}
+
+func (n *NullMetaStore) WriteFileMetadata(ctx context.Context, fileMetadata *FileMetadata, filePointerBytes []byte) error {
+	return nil
+}

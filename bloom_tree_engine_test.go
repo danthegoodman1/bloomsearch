@@ -1,0 +1,228 @@
+/*
+I am manually inspecting these files, they look good
+*/
+
+package bloomsearch
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+type FileSystemDataStore struct {
+	rootDir string
+}
+
+type FileSystemDataStoreFilePointer struct {
+	ID string
+}
+
+func NewFileSystemDataStore(rootDir string) *FileSystemDataStore {
+	// Make dir if not exists
+	if _, err := os.Stat(rootDir); os.IsNotExist(err) {
+		os.MkdirAll(rootDir, 0755)
+	}
+
+	return &FileSystemDataStore{
+		rootDir: rootDir,
+	}
+}
+
+func (fs *FileSystemDataStore) OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error) {
+	filePath := string(filePointerBytes)
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	return file, nil
+}
+
+func (fs *FileSystemDataStore) CreateFile(ctx context.Context) (io.WriteCloser, []byte, error) {
+	file, err := os.CreateTemp(fs.rootDir, "bloom-*.dat")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	filePath := file.Name()
+	return file, []byte(filePath), nil
+}
+
+func init() {
+	var _ DataStore = &FileSystemDataStore{}
+}
+
+func TestBloomTreeEngineFlushMaxRows(t *testing.T) {
+	// Create test directory for file system data store
+	dataStore := NewFileSystemDataStore("./test_data/max_rows")
+	metaStore := &NullMetaStore{}
+
+	// Create config with small row limit to trigger flush quickly
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 3                // Flush after 3 rows
+	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit (won't trigger)
+	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
+	config.BloomExpectedItems = 100           // Much smaller bloom filter
+	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
+
+	// Create and start engine
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	// Create test data - exactly 3 rows to trigger flush
+	testRows := []map[string]any{
+		{"id": 1, "name": "Alice", "age": 30},
+		{"id": 2, "name": "Bob", "age": 25},
+		{"id": 3, "name": "Charlie", "age": 35},
+	}
+
+	// Channel to wait for flush completion
+	doneChan := make(chan error, 1)
+
+	// Ingest rows - this should trigger automatic flush due to MaxBufferedRows=3
+	ctx := context.Background()
+	err = engine.IngestRows(ctx, testRows, doneChan)
+	if err != nil {
+		t.Fatalf("Failed to ingest rows: %v", err)
+	}
+
+	// Wait for flush to complete
+	fmt.Println("Waiting for flush triggered by max rows...")
+	select {
+	case err := <-doneChan:
+		if err != nil {
+			t.Fatalf("Flush failed: %v", err)
+		}
+		fmt.Println("Flush completed successfully! (triggered by max rows)")
+
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Flush did not complete within timeout")
+	}
+}
+
+func TestBloomTreeEngineFlushMaxBytes(t *testing.T) {
+	// Create test directory for file system data store
+	dataStore := NewFileSystemDataStore("./test_data/max_bytes")
+	metaStore := &NullMetaStore{}
+
+	// Create config with small byte limit to trigger flush quickly
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 100              // Large row limit (won't trigger)
+	config.MaxBufferedBytes = 200             // Small byte limit (will trigger)
+	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
+	config.BloomExpectedItems = 100           // Much smaller bloom filter
+	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
+
+	// Create and start engine
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	// Create test data with large values to trigger byte limit
+	largeValue := strings.Repeat("X", 50) // 50 character string
+	testRows := []map[string]any{
+		{"id": 1, "name": "Alice", "data": largeValue},
+		{"id": 2, "name": "Bob", "data": largeValue},
+		{"id": 3, "name": "Charlie", "data": largeValue},
+	}
+
+	// Channel to wait for flush completion
+	doneChan := make(chan error, 1)
+
+	// Ingest rows - this should trigger automatic flush due to MaxBufferedBytes=200
+	ctx := context.Background()
+	err = engine.IngestRows(ctx, testRows, doneChan)
+	if err != nil {
+		t.Fatalf("Failed to ingest rows: %v", err)
+	}
+
+	// Wait for flush to complete
+	fmt.Println("Waiting for flush triggered by max bytes...")
+	select {
+	case err := <-doneChan:
+		if err != nil {
+			t.Fatalf("Flush failed: %v", err)
+		}
+		fmt.Println("Flush completed successfully! (triggered by max bytes)")
+
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Flush did not complete within timeout")
+	}
+}
+
+func TestBloomTreeEngineFlushMaxTime(t *testing.T) {
+	// Create test directory for file system data store
+	dataStore := NewFileSystemDataStore("./test_data/max_time")
+	metaStore := &NullMetaStore{}
+
+	// Create config with small time limit to trigger flush quickly
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 100             // Large row limit (won't trigger)
+	config.MaxBufferedBytes = 1024 * 1024    // Large byte limit (won't trigger)
+	config.MaxBufferedTime = 1 * time.Second // Small time limit (will trigger)
+	config.BloomExpectedItems = 100          // Much smaller bloom filter
+	config.BloomFalsePositiveRate = 0.01     // Slightly higher false positive rate
+
+	// Create and start engine
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	// Create small test data that won't trigger row/byte limits
+	testRows := []map[string]any{
+		{"id": 1, "name": "Alice"},
+		{"id": 2, "name": "Bob"},
+	}
+
+	// Channel to wait for flush completion
+	doneChan := make(chan error, 1)
+
+	// Ingest rows - this should trigger automatic flush due to MaxBufferedTime=1s
+	ctx := context.Background()
+	err = engine.IngestRows(ctx, testRows, doneChan)
+	if err != nil {
+		t.Fatalf("Failed to ingest rows: %v", err)
+	}
+
+	// Wait for flush to complete (should happen after ~1 second)
+	fmt.Println("Waiting for flush triggered by max time...")
+	select {
+	case err := <-doneChan:
+		if err != nil {
+			t.Fatalf("Flush failed: %v", err)
+		}
+		fmt.Println("Flush completed successfully! (triggered by max time)")
+
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Flush did not complete within timeout")
+	}
+}
