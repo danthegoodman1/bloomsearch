@@ -94,6 +94,7 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 	ctx, cancel := context.WithCancel(context.Background())
 
 	if config.Tokenizer == nil {
+		cancel() // make the linter happy
 		return nil, fmt.Errorf("%w: tokenizer is required", ErrInvalidConfig)
 	}
 
