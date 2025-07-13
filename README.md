@@ -45,7 +45,10 @@ if err := <-doneChan; err != nil {
 }
 
 // Query for rows where "level"="error"
-matchingRows := engine.Query(NewQueryWithGroupCombinator(CombinatorAND).Field("level").Token("error").Build())
+matchingRows := engine.Query(
+  NewQueryWithGroupCombinator(CombinatorAND).
+    Field("level").Token("error").Build()
+)
 ```
 
 See tests for complete working examples, including partitioning and minmax index filtering.
