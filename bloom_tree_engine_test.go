@@ -250,7 +250,7 @@ func TestEvaluateFileBloomFilters(t *testing.T) {
 		},
 		{
 			name:     "multiple groups with OR combinator should return true",
-			query:    NewQueryWithGroupCombinator(CombinatorOR).And().Field("nonexistent.field").And().Field("user.name").Build().Bloom,
+			query:    NewQueryWithGroupCombinator(CombinatorOR).And().Field("nonexistent.field").And().FieldToken("user.name", "alice").Build().Bloom,
 			expected: true,
 		},
 	}
