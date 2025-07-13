@@ -20,13 +20,15 @@ var (
 type PartitionFunc func(row map[string]any) string
 
 type ingestRequest struct {
-	rows     []map[string]any
-	doneChan chan error
+	rows       []map[string]any
+	doneChan   chan error
+	forceFlush bool // if true, this is a force flush request
 }
 
 func (r *ingestRequest) reset() {
 	r.rows = nil
 	r.doneChan = nil
+	r.forceFlush = false
 }
 
 type flushRequest struct {
@@ -157,6 +159,27 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 	}
 }
 
+// Flush forces a flush of any buffered data
+func (b *BloomSearchEngine) Flush(ctx context.Context) error {
+	req := b.requestPool.Get().(*ingestRequest)
+	req.rows = nil
+	req.forceFlush = true
+	doneChan := make(chan error, 1)
+	req.doneChan = doneChan
+
+	select {
+	case b.ingestChan <- req:
+		// Wait for flush to complete (once committed, let it finish)
+		return <-doneChan
+	case <-ctx.Done():
+		b.requestPool.Put(req)
+		return ctx.Err()
+	case <-b.ctx.Done():
+		b.requestPool.Put(req)
+		return context.Canceled
+	}
+}
+
 func (b *BloomSearchEngine) ingestWorker() {
 	defer b.wg.Done()
 
@@ -171,6 +194,10 @@ func (b *BloomSearchEngine) ingestWorker() {
 		select {
 		case <-b.ctx.Done():
 			fmt.Println("ingestWorker context done")
+			// Flush any remaining buffered data before exiting
+			if bufferedRowCount > 0 {
+				b.flushBufferedData(partitionBuffers, &doneChans, &bufferedRowCount, &bufferedBytes, &bufferStartTime)
+			}
 			return
 		case req := <-b.ingestChan:
 			// Process the batch of rows
@@ -179,12 +206,51 @@ func (b *BloomSearchEngine) ingestWorker() {
 	}
 }
 
+// flushBufferedData flushes the current buffered data and resets the buffer state
+func (b *BloomSearchEngine) flushBufferedData(partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
+	if len(partitionBuffers) == 0 {
+		return
+	}
+
+	// Copy data before sending to flush worker
+	partitionBuffersCopy := make(map[string]*partitionBuffer)
+	for k, v := range partitionBuffers {
+		partitionBuffersCopy[k] = v
+	}
+	doneChannsCopy := make([]chan error, len(*doneChans))
+	copy(doneChannsCopy, *doneChans)
+
+	b.triggerFlush(partitionBuffersCopy, doneChannsCopy)
+
+	// Reset local state
+	for k := range partitionBuffers {
+		delete(partitionBuffers, k)
+	}
+	*doneChans = make([]chan error, 0)
+	*bufferedRowCount = 0
+	*bufferedBytes = 0
+	*bufferStartTime = time.Time{}
+}
+
 func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
 	// Process the request and return to pool at the end
 	defer func() {
 		req.reset()
 		b.requestPool.Put(req)
 	}()
+
+	// If this is a force flush request, immediately trigger a flush
+	if req.forceFlush {
+		if *bufferedRowCount > 0 {
+			// Add the force flush doneChan to the list before flushing
+			*doneChans = append(*doneChans, req.doneChan)
+			b.flushBufferedData(partitionBuffers, doneChans, bufferedRowCount, bufferedBytes, bufferStartTime)
+		} else {
+			// No buffered data, signal completion immediately
+			TryWriteToChannels([]chan error{req.doneChan}, nil)
+		}
+		return
+	}
 
 	// Group rows by partition ID
 	partitionedRows := make(map[string][]map[string]any)
@@ -313,24 +379,7 @@ func (b *BloomSearchEngine) processIngestRequest(req *ingestRequest, partitionBu
 
 	// Trigger flush if needed
 	if shouldFlush {
-		// Copy data before sending to flush worker
-		partitionBuffersCopy := make(map[string]*partitionBuffer)
-		for k, v := range partitionBuffers {
-			partitionBuffersCopy[k] = v
-		}
-		doneChannsCopy := make([]chan error, len(*doneChans))
-		copy(doneChannsCopy, *doneChans)
-
-		b.triggerFlush(partitionBuffersCopy, doneChannsCopy)
-
-		// Reset local state
-		for k := range partitionBuffers {
-			delete(partitionBuffers, k)
-		}
-		*doneChans = make([]chan error, 0)
-		*bufferedRowCount = 0
-		*bufferedBytes = 0
-		*bufferStartTime = time.Time{}
+		b.flushBufferedData(partitionBuffers, doneChans, bufferedRowCount, bufferedBytes, bufferStartTime)
 	}
 }
 
