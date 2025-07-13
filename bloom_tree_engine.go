@@ -505,12 +505,14 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		}
 
 		fileMetadata.DataBlocks = append(fileMetadata.DataBlocks, DataBlockMetadata{
-			PartitionID:   partitionBuffer.partitionID,
-			BloomFilter:   partitionBuffer.fieldBloomFilter,
-			Rows:          partitionBuffer.rowCount,
-			Offset:        currentOffset,
-			Size:          len(partitionBuffer.buffer) + 8, // +8 for the uint64 hash
-			MinMaxIndexes: partitionBuffer.minMaxIndexes,
+			PartitionID:           partitionBuffer.partitionID,
+			FieldBloomFilter:      partitionBuffer.fieldBloomFilter,
+			TokenBloomFilter:      partitionBuffer.tokenBloomFilter,
+			FieldTokenBloomFilter: partitionBuffer.fieldTokenBloomFilter,
+			Rows:                  partitionBuffer.rowCount,
+			Offset:                currentOffset,
+			Size:                  len(partitionBuffer.buffer) + 8, // +8 for the uint64 hash
+			MinMaxIndexes:         partitionBuffer.minMaxIndexes,
 		})
 
 		// Update offset for next data block (buffer + hash)

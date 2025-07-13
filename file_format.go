@@ -74,7 +74,9 @@ type DataBlockMetadata struct {
 	Size int
 	Rows int
 
-	BloomFilter *bloom.BloomFilter // must exist
+	FieldBloomFilter      *bloom.BloomFilter // must exist
+	TokenBloomFilter      *bloom.BloomFilter // must exist
+	FieldTokenBloomFilter *bloom.BloomFilter // must exist
 
 	MinMaxIndexes map[string]MinMaxIndex `json:",omitempty"`
 	PartitionID   string                 `json:",omitempty"`
