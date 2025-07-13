@@ -100,7 +100,7 @@ query := NewQueryWithGroupCombinator(CombinatorAND).Token("error").Build()
 
 **Field:token search** - Find records with a specific value in a specific field:
 ```go
-// Find all records where service is "payment"
+// Find all records where "service"="payment"
 query := NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "payment").Build()
 ```
 
