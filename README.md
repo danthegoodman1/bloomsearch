@@ -1,4 +1,4 @@
-# BloomSearch <!-- omit in toc -->
+#  <img src="https://media.tenor.com/_xAGKS8S3zEAAAAi/flower-sam-smith.gif" width="36px" /> BloomSearch <img src="https://media.tenor.com/_xAGKS8S3zEAAAAi/flower-sam-smith.gif" width="36px" /> <!-- omit in toc -->
 
 **Keyword search engine with hierarchical bloom filters for massive datasets**
 
