@@ -170,3 +170,107 @@ func TestBasicWhitespaceTokenizer(t *testing.T) {
 		})
 	}
 }
+
+func TestJSONMatching(t *testing.T) {
+	t.Run("Field", func(t *testing.T) {
+		// Basic fields
+		jsonStr := `{"user": {"name": "John", "age": 30}}`
+		assert.True(t, TestJSONForField(jsonStr, "user.name", "."))
+		assert.True(t, TestJSONForField(jsonStr, "user.age", "."))
+		assert.True(t, TestJSONForField(jsonStr, "user", "."))
+		assert.False(t, TestJSONForField(jsonStr, "user.email", "."))
+		assert.False(t, TestJSONForField(jsonStr, "nothere", "."))
+
+		// Fields in arrays (information loss scenario)
+		jsonStr2 := `{"items": [{"name": "Item1", "price": 10}, {"name": "Item2", "price": 20}]}`
+		assert.True(t, TestJSONForField(jsonStr2, "items.name", "."))
+		assert.True(t, TestJSONForField(jsonStr2, "items.price", "."))
+		assert.False(t, TestJSONForField(jsonStr2, "items.category", "."))
+
+		// Nested arrays
+		jsonStr3 := `{"orders": [{"items": [{"name": "A"}, {"name": "B"}]}, {"items": [{"name": "C"}]}]}`
+		assert.True(t, TestJSONForField(jsonStr3, "orders.items.name", "."))
+	})
+
+	t.Run("Token", func(t *testing.T) {
+		// Basic tokens
+		jsonStr := `{"user": {"name": "John Doe", "age": 30}}`
+		assert.True(t, TestJSONForToken(jsonStr, "John", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForToken(jsonStr, "Doe", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForToken(jsonStr, "30", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForToken(jsonStr, "Jane", BasicWhitespaceTokenizer))
+
+		// Tokens in arrays (information loss scenario)
+		jsonStr = `{"items": [{"name": "Item1"}, {"name": "Item2"}, {"name": "Item3"}]}`
+		assert.True(t, TestJSONForToken(jsonStr, "Item1", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForToken(jsonStr, "Item2", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForToken(jsonStr, "Item3", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForToken(jsonStr, "Item4", BasicWhitespaceTokenizer))
+	})
+
+	t.Run("FieldToken", func(t *testing.T) {
+		// Basic field+token
+		jsonStr := `{"user": {"name": "John Doe", "role": "admin"}}`
+		assert.True(t, TestJSONForFieldToken(jsonStr, "user.name", ".", "John", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "user.name", ".", "Doe", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "user.role", ".", "admin", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "user.name", ".", "admin", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "user.role", ".", "John", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "user.email", ".", "test", BasicWhitespaceTokenizer))
+
+		// Arrays with field+token
+		jsonStr = `{"users": [{"name": "John"}, {"name": "Jane"}], "tags": ["admin", "user"]}`
+		assert.True(t, TestJSONForFieldToken(jsonStr, "users.name", ".", "John", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "users.name", ".", "Jane", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "tags", ".", "admin", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "users.name", ".", "Bob", BasicWhitespaceTokenizer))
+
+		// Deeply nested arrays
+		jsonStr = `{"groups": [{"users": [{"name": "John"}, {"name": "Jane"}]}, {"users": [{"name": "Bob"}]}]}`
+		assert.True(t, TestJSONForFieldToken(jsonStr, "groups.users.name", ".", "John", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "groups.users.name", ".", "Jane", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "groups.users.name", ".", "Bob", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "groups.users.name", ".", "Alice", BasicWhitespaceTokenizer))
+	})
+
+	t.Run("InformationLoss", func(t *testing.T) {
+		// Core information loss test: same field path with different values across array elements
+		jsonStr := `{"items": [{"name": "Item1", "category": "electronics"}, {"name": "Item2", "category": "books"}]}`
+
+		// Should find ANY value that exists in the specific field path
+		assert.True(t, TestJSONForFieldToken(jsonStr, "items.name", ".", "Item1", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "items.name", ".", "Item2", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "items.category", ".", "electronics", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "items.category", ".", "books", BasicWhitespaceTokenizer))
+
+		// Should not find values that don't exist in that field path
+		assert.False(t, TestJSONForFieldToken(jsonStr, "items.name", ".", "Item3", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "items.category", ".", "furniture", BasicWhitespaceTokenizer))
+
+		// Key test: we've "lost" the connection between Item1 and electronics
+		// But we should still find both values independently
+		assert.True(t, TestJSONForFieldToken(jsonStr, "items.name", ".", "Item1", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "items.category", ".", "books", BasicWhitespaceTokenizer))
+
+		// Test duplicate values across array elements (like bloom filter deduplication)
+		jsonStr = `{"tags": [{"type": "admin"}, {"type": "user"}, {"type": "admin"}]}`
+		assert.True(t, TestJSONForFieldToken(jsonStr, "tags.type", ".", "admin", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "tags.type", ".", "user", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "tags.type", ".", "guest", BasicWhitespaceTokenizer))
+
+		// Mixed data types
+		jsonStr = `{"records": [{"id": 1, "active": true}, {"id": 2, "active": false}]}`
+		assert.True(t, TestJSONForFieldToken(jsonStr, "records.id", ".", "1", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "records.id", ".", "2", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "records.active", ".", "true", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "records.active", ".", "false", BasicWhitespaceTokenizer))
+
+		// UniqueFields example - should not find cross-contamination
+		jsonStr = `{"user": {"name": "John", "tags": [{"type": "admin"}, {"role": "user"}]}}`
+		assert.True(t, TestJSONForFieldToken(jsonStr, "user.name", ".", "John", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "user.tags.type", ".", "admin", BasicWhitespaceTokenizer))
+		assert.True(t, TestJSONForFieldToken(jsonStr, "user.tags.role", ".", "user", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "user.tags.type", ".", "user", BasicWhitespaceTokenizer))
+		assert.False(t, TestJSONForFieldToken(jsonStr, "user.tags.role", ".", "admin", BasicWhitespaceTokenizer))
+	})
+}

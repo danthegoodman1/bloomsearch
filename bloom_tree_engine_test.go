@@ -7,6 +7,7 @@ package bloomsearch
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -271,9 +272,14 @@ func TestEvaluateBloomFilters(t *testing.T) {
 }
 
 func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
-	// NOTE: this test only works while the `resultChan <- map[string]any{"dummy": "result"}` dummy test exists in the `processDataBlock` function
+	// Clean up test directory before starting
+	testDir := "./test_data/query_test"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
 	// Create test directory for file system data store
-	dataStore := NewFileSystemDataStore("./test_data/query_test")
+	dataStore := NewFileSystemDataStore(testDir)
 	metaStore := dataStore
 
 	// Create config
@@ -297,10 +303,10 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 		engine.Stop(ctx)
 	}()
 
-	// Create test data
+	// Create test data - use float64 for numeric values since JSON unmarshaling converts to float64
 	testRows := []map[string]any{
-		{"id": 1, "name": "Alice", "level": "error", "service": "auth"},
-		{"id": 2, "name": "Bob", "level": "info", "service": "payment"},
+		{"id": 1.0, "name": "Alice", "level": "error", "service": "auth"},
+		{"id": 2.0, "name": "Bob", "level": "info", "service": "payment"},
 	}
 
 	// Ingest rows and wait for flush
@@ -323,34 +329,40 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 
 	// Test queries that should match
 	testCases := []struct {
-		name        string
-		query       *Query
-		shouldMatch bool
+		name                string
+		query               *Query
+		expectedResultCount int
+		expectedRows        []map[string]any
 	}{
 		{
-			name:        "field search for 'level' should match",
-			query:       NewQueryWithGroupCombinator(CombinatorAND).Field("level").Build(),
-			shouldMatch: true,
+			name:                "field search for 'level' should match both rows",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("level").Build(),
+			expectedResultCount: 2,
+			expectedRows:        testRows, // Both rows have 'level' field
 		},
 		{
-			name:        "token search for 'Alice' should match",
-			query:       NewQueryWithGroupCombinator(CombinatorAND).Token("Alice").Build(),
-			shouldMatch: true,
+			name:                "token search for 'Alice' should match first row",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("Alice").Build(),
+			expectedResultCount: 1,
+			expectedRows:        []map[string]any{testRows[0]}, // Only first row has 'Alice'
 		},
 		{
-			name:        "field-token search for 'level:error' should match",
-			query:       NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error").Build(),
-			shouldMatch: true,
+			name:                "field-token search for 'level:error' should match first row",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error").Build(),
+			expectedResultCount: 1,
+			expectedRows:        []map[string]any{testRows[0]}, // Only first row has level=error
 		},
 		{
-			name:        "field search for nonexistent field should not match",
-			query:       NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent").Build(),
-			shouldMatch: false,
+			name:                "field search for nonexistent field should not match",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent").Build(),
+			expectedResultCount: 0,
+			expectedRows:        []map[string]any{},
 		},
 		{
-			name:        "token search for nonexistent token should not match",
-			query:       NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent").Build(),
-			shouldMatch: false,
+			name:                "token search for nonexistent token should not match",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent").Build(),
+			expectedResultCount: 0,
+			expectedRows:        []map[string]any{},
 		},
 	}
 
@@ -388,18 +400,35 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 				t.Fatalf("Query error: %v", queryErr)
 			}
 
-			if tc.shouldMatch {
-				if len(results) == 0 {
-					t.Errorf("Expected results but got none")
-				} else {
-					// Check that we got the dummy result
-					if results[0]["dummy"] != "result" {
-						t.Errorf("Expected dummy result, got: %+v", results[0])
+			// Check result count
+			if len(results) != tc.expectedResultCount {
+				t.Errorf("Expected %d results but got %d", tc.expectedResultCount, len(results))
+			}
+
+			// Check that we got the expected rows
+			if tc.expectedResultCount > 0 {
+				// Convert results to a map for easy lookup
+				resultMap := make(map[any]map[string]any)
+				for _, result := range results {
+					if id, ok := result["id"]; ok {
+						resultMap[id] = result
 					}
 				}
-			} else {
-				if len(results) > 0 {
-					t.Errorf("Expected no results but got: %+v", results)
+
+				// Check each expected row
+				for _, expectedRow := range tc.expectedRows {
+					if id, ok := expectedRow["id"]; ok {
+						if actualRow, found := resultMap[id]; found {
+							// Check each field in the expected row
+							for key, expectedValue := range expectedRow {
+								if actualValue, exists := actualRow[key]; !exists || actualValue != expectedValue {
+									t.Errorf("Expected row %v to have %s=%v, but got %v", id, key, expectedValue, actualValue)
+								}
+							}
+						} else {
+							t.Errorf("Expected row with id=%v not found in results", id)
+						}
+					}
 				}
 			}
 		})

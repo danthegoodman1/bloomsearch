@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sync"
 	"time"
 
@@ -861,172 +860,16 @@ func (b *BloomSearchEngine) processDataBlock(
 		}
 		bytesRead += int(rowLength)
 
-		// TODO: Primitive check before deserialization to check for field/token/fieldtoken matches
-		// TODO: If it matches, deserialize the row and do an exact match check
-		// Maybe we even make this optional no-deserialize check an option?
-
-		// Print the row as string to show it's working, then throw it away
-		fmt.Printf("Row data: %s\n", string(rowData))
-	}
-
-	// TODO: dummy return indicating that this passed (for testing, when removed the test needs to be changed)
-	SendWithContext(ctx, resultChan, map[string]any{"dummy": "result"})
-}
-
-// readRowsFromDataBlock reads all rows from a data block after the bloom filters
-func (b *BloomSearchEngine) readRowsFromDataBlock(file io.ReadSeeker, blockMetadata DataBlockMetadata) ([]map[string]any, error) {
-	// Seek to the start of row data (after bloom filters)
-	rowDataOffset := int64(blockMetadata.Offset + blockMetadata.BloomFiltersSize)
-	if _, err := file.Seek(rowDataOffset, 0); err != nil {
-		return nil, fmt.Errorf("failed to seek to row data: %w", err)
-	}
-
-	// Calculate the size of row data (excluding the final data block hash)
-	rowDataSize := blockMetadata.Size - blockMetadata.BloomFiltersSize - 8 // -8 for final hash
-
-	rows := make([]map[string]any, 0, blockMetadata.Rows)
-	bytesRead := 0
-
-	for bytesRead < rowDataSize {
-		// Read the row length prefix (uint32)
-		lengthBytes := make([]byte, 4)
-		if _, err := file.Read(lengthBytes); err != nil {
-			return nil, fmt.Errorf("failed to read row length: %w", err)
-		}
-		bytesRead += 4
-
-		// Extract the row length
-		rowLength := binary.LittleEndian.Uint32(lengthBytes)
-
-		// Read the row data
-		rowBytes := make([]byte, rowLength)
-		if _, err := file.Read(rowBytes); err != nil {
-			return nil, fmt.Errorf("failed to read row data: %w", err)
-		}
-		bytesRead += int(rowLength)
-
-		// Deserialize the row
-		var row map[string]any
-		if err := json.Unmarshal(rowBytes, &row); err != nil {
-			return nil, fmt.Errorf("failed to deserialize row: %w", err)
+		if !TestJSONForBloomQuery(rowData, bloomQuery, ".", b.config.Tokenizer) {
+			continue
 		}
 
-		rows = append(rows, row)
-	}
-
-	return rows, nil
-}
-
-// evaluateRowAgainstQuery performs exact matching of a row against the bloom query
-func (b *BloomSearchEngine) evaluateRowAgainstQuery(row map[string]any, bloomQuery *BloomQuery) bool {
-	if bloomQuery == nil || len(bloomQuery.Groups) == 0 {
-		return true // No bloom filtering needed
-	}
-
-	// Get unique fields from the row
-	uniqueFields := UniqueFields(row, ".")
-
-	// Evaluate each group
-	groupResults := make([]bool, len(bloomQuery.Groups))
-	for i, group := range bloomQuery.Groups {
-		groupResults[i] = b.evaluateRowAgainstBloomGroup(uniqueFields, &group)
-	}
-
-	// Combine group results based on query combinator
-	if bloomQuery.Combinator == CombinatorOR {
-		// Any group can match
-		for _, result := range groupResults {
-			if result {
-				return true
-			}
+		row := make(map[string]any)
+		if err := json.Unmarshal(rowData, &row); err != nil {
+			SendWithContext(ctx, errorChan, fmt.Errorf("failed to unmarshal row: %w", err))
+			return
 		}
-		return false
-	}
 
-	// Default AND behavior: all groups must match
-	for _, result := range groupResults {
-		if !result {
-			return false
-		}
-	}
-	return true
-}
-
-// evaluateRowAgainstBloomGroup evaluates a row against a single bloom group
-func (b *BloomSearchEngine) evaluateRowAgainstBloomGroup(uniqueFields []FieldValues, group *BloomGroup) bool {
-	if len(group.Conditions) == 0 {
-		return true // Empty group matches everything
-	}
-
-	// Evaluate each condition in the group
-	conditionResults := make([]bool, len(group.Conditions))
-	for i, condition := range group.Conditions {
-		conditionResults[i] = b.evaluateRowAgainstBloomCondition(uniqueFields, &condition)
-	}
-
-	// Combine condition results based on group combinator
-	if group.Combinator == CombinatorOR {
-		// Any condition can match
-		for _, result := range conditionResults {
-			if result {
-				return true
-			}
-		}
-		return false
-	}
-
-	// Default AND behavior: all conditions must match
-	for _, result := range conditionResults {
-		if !result {
-			return false
-		}
-	}
-	return true
-}
-
-// evaluateRowAgainstBloomCondition evaluates a row against a single bloom condition
-func (b *BloomSearchEngine) evaluateRowAgainstBloomCondition(uniqueFields []FieldValues, condition *BloomCondition) bool {
-	switch condition.Type {
-	case BloomField:
-		// Check if the field path exists in the row
-		for _, field := range uniqueFields {
-			if field.Path == condition.Field {
-				return true
-			}
-		}
-		return false
-
-	case BloomToken:
-		// Check if the token exists in any field value
-		for _, field := range uniqueFields {
-			for _, value := range field.Values {
-				tokens := b.config.Tokenizer(value)
-				for _, token := range tokens {
-					if token == condition.Token {
-						return true
-					}
-				}
-			}
-		}
-		return false
-
-	case BloomFieldToken:
-		// Check if the specific field contains the specific token
-		for _, field := range uniqueFields {
-			if field.Path == condition.Field {
-				for _, value := range field.Values {
-					tokens := b.config.Tokenizer(value)
-					for _, token := range tokens {
-						if token == condition.Token {
-							return true
-						}
-					}
-				}
-			}
-		}
-		return false
-
-	default:
-		return false
+		SendWithContext(ctx, resultChan, row)
 	}
 }
