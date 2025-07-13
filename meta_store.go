@@ -10,6 +10,9 @@ type MetaStore interface {
 	// The returned files have already been pre-filtered based on partition IDs and MinMaxIndex conditions,
 	// but their bloom filters have not been tested yet.
 	//
+	// If the query specifies partition ID or MinMax index conditions, but the file does not have them,
+	// the file must be included in the result set, as it may have rows of interest.
+	//
 	// The MaybeFile.Metadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
 	// if the query conditions are able to guarantee that some data blocks will not match the query conditions.
 	GetMaybeFilesForQuery(ctx context.Context, query *QueryCondition) ([]MaybeFile, error)
