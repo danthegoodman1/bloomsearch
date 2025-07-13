@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -16,6 +17,12 @@ import (
 var (
 	ErrInvalidConfig = errors.New("invalid configuration")
 )
+
+// dataBlockJob represents a job to process a data block
+type dataBlockJob struct {
+	filePointer   []byte
+	blockMetadata DataBlockMetadata
+}
 
 // makeFieldTokenKey creates a key for field-token bloom filter entries
 func makeFieldTokenKey(field, token string) string {
@@ -606,8 +613,13 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 	TryWriteToChannels(flushReq.doneChans, nil)
 }
 
-// evaluateFileBloomFilters tests if a file's bloom filters match the bloom query
-func (b *BloomSearchEngine) evaluateFileBloomFilters(fileMetadata *FileMetadata, bloomQuery *BloomQuery) bool {
+// evaluateBloomFilters tests if bloom filters match the bloom query
+func (b *BloomSearchEngine) evaluateBloomFilters(
+	fieldFilter *bloom.BloomFilter,
+	tokenFilter *bloom.BloomFilter,
+	fieldTokenFilter *bloom.BloomFilter,
+	bloomQuery *BloomQuery,
+) bool {
 	if bloomQuery == nil || len(bloomQuery.Groups) == 0 {
 		return true // No bloom filtering needed, since it's only used to DISQUALIFY files
 	}
@@ -615,7 +627,7 @@ func (b *BloomSearchEngine) evaluateFileBloomFilters(fileMetadata *FileMetadata,
 	// Evaluate each group
 	groupResults := make([]bool, len(bloomQuery.Groups))
 	for i, group := range bloomQuery.Groups {
-		groupResults[i] = b.evaluateBloomGroup(fileMetadata, &group)
+		groupResults[i] = b.evaluateBloomGroup(fieldFilter, tokenFilter, fieldTokenFilter, &group)
 	}
 
 	// Combine group results based on query combinator
@@ -638,8 +650,13 @@ func (b *BloomSearchEngine) evaluateFileBloomFilters(fileMetadata *FileMetadata,
 	return true
 }
 
-// evaluateBloomGroup tests if a file's bloom filters match a single bloom group
-func (b *BloomSearchEngine) evaluateBloomGroup(fileMetadata *FileMetadata, group *BloomGroup) bool {
+// evaluateBloomGroup tests if bloom filters match a single bloom group
+func (b *BloomSearchEngine) evaluateBloomGroup(
+	fieldFilter *bloom.BloomFilter,
+	tokenFilter *bloom.BloomFilter,
+	fieldTokenFilter *bloom.BloomFilter,
+	group *BloomGroup,
+) bool {
 	if len(group.Conditions) == 0 {
 		return true // Empty group matches everything, since we can't disqualify it
 	}
@@ -647,7 +664,7 @@ func (b *BloomSearchEngine) evaluateBloomGroup(fileMetadata *FileMetadata, group
 	// Evaluate each condition in the group
 	conditionResults := make([]bool, len(group.Conditions))
 	for i, condition := range group.Conditions {
-		conditionResults[i] = b.evaluateBloomCondition(fileMetadata, &condition)
+		conditionResults[i] = b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, &condition)
 	}
 
 	// Combine condition results based on group combinator
@@ -670,43 +687,308 @@ func (b *BloomSearchEngine) evaluateBloomGroup(fileMetadata *FileMetadata, group
 	return true
 }
 
-// evaluateBloomCondition tests if a file's bloom filters match a single bloom condition
-func (b *BloomSearchEngine) evaluateBloomCondition(fileMetadata *FileMetadata, condition *BloomCondition) bool {
+// evaluateBloomCondition tests if bloom filters match a single bloom condition
+func (b *BloomSearchEngine) evaluateBloomCondition(
+	fieldFilter *bloom.BloomFilter,
+	tokenFilter *bloom.BloomFilter,
+	fieldTokenFilter *bloom.BloomFilter,
+	condition *BloomCondition,
+) bool {
 	switch condition.Type {
 	case BloomField:
-		return fileMetadata.FieldBloomFilter.TestString(condition.Field)
+		return fieldFilter.TestString(condition.Field)
 	case BloomToken:
-		return fileMetadata.TokenBloomFilter.TestString(condition.Token)
+		return tokenFilter.TestString(condition.Token)
 	case BloomFieldToken:
-		return fileMetadata.FieldTokenBloomFilter.TestString(makeFieldTokenKey(condition.Field, condition.Token))
+		return fieldTokenFilter.TestString(makeFieldTokenKey(condition.Field, condition.Token))
 	default:
 		return false // We don't know what this is, so it's invalid
 	}
 }
 
-func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) ([]map[string]any, error) {
+// Query executes a query and returns channels for streaming results.
+// The result channel feeds individual matching rows. Canceling the context
+// will stop all workers. When the result channel closes, no more work is happening.
+//
+// Example usage:
+//
+//	resultChan, errorChan, err := engine.Query(ctx, query)
+//	if err != nil { return err }
+//	for {
+//	  select {
+//	  case <-ctx.Done():
+//	    return ctx.Err()
+//	  case row, ok := <-resultChan:
+//	    if !ok { return nil } // done
+//	    // process row
+//	  case err := <-errorChan:
+//	    return err
+//	  }
+//	}
+func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (<-chan map[string]any, <-chan error, error) {
 	// Get maybe files from meta store
 	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// For each maybe file, test the file-level bloom filters
 	matchingFiles := make([]MaybeFile, 0, len(maybeFiles))
 	for _, maybeFile := range maybeFiles {
 		// Test the file-level bloom filters
-		if b.evaluateFileBloomFilters(&maybeFile.Metadata, query.Bloom) {
+		if b.evaluateBloomFilters(
+			maybeFile.Metadata.FieldBloomFilter,
+			maybeFile.Metadata.TokenBloomFilter,
+			maybeFile.Metadata.FieldTokenBloomFilter,
+			query.Bloom,
+		) {
 			matchingFiles = append(matchingFiles, maybeFile)
 		}
 	}
 
-	// For each passing file, read:
-	//  1. if they maybe file specified matching data blocks, just read those bloom filters
-	//  2. if they did not specify matching data blocks, read all bloom filters
+	// Process data blocks concurrently with bounded concurrency
+	const maxConcurrency = 10 // TODO: make this configurable, even a global pool
 
-	// We read the above by opening the file and seeking/streaming in to read the bloom filters
-	// If the bloom filter passes, we keep reading the data block and scan each row to see if it contains any of the fields or tokens (even if field:token)
-	// if the row contains it, then we deserialize and check for an exact batch
+	// Collect all data blocks from all files
+	var allJobs []dataBlockJob
+	for _, matchingFile := range matchingFiles {
+		for _, blockMetadata := range matchingFile.Metadata.DataBlocks {
+			allJobs = append(allJobs, dataBlockJob{
+				filePointer:   matchingFile.PointerBytes,
+				blockMetadata: blockMetadata,
+			})
+		}
+	}
 
-	panic("not implemented")
+	// Channel for individual results
+	resultChan := make(chan map[string]any, 1000) // Buffered channel for individual results
+	errorChan := make(chan error, len(allJobs))
+
+	// Create a semaphore to limit concurrency
+	semaphore := make(chan struct{}, maxConcurrency)
+
+	// Start worker goroutines - one for each data block
+	var wg sync.WaitGroup
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	for _, job := range allJobs {
+		wg.Add(1)
+		go func(job dataBlockJob) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			b.processDataBlock(workerCtx, job, resultChan, errorChan, query.Bloom)
+		}(job)
+	}
+
+	// Close result channel when all workers are done
+	go func() {
+		defer workerCancel() // Cancel worker context when done
+		wg.Wait()
+		close(resultChan) // closing this indicates that all workers are done, and no more errors can come either
+	}()
+
+	return resultChan, errorChan, nil
+}
+
+// processDataBlock processes a specific data block job
+func (b *BloomSearchEngine) processDataBlock(
+	ctx context.Context,
+	job dataBlockJob,
+	resultChan chan<- map[string]any,
+	errorChan chan<- error,
+	bloomQuery *BloomQuery,
+) {
+	// Open the file for reading
+	file, err := b.dataStore.OpenFile(ctx, job.filePointer)
+	if err != nil {
+		errorChan <- fmt.Errorf("failed to open file: %w", err)
+		return
+	}
+	defer file.Close()
+
+	// Read the data block bloom filters
+	blockBloomFilters, err := ReadDataBlockBloomFilters(file, job.blockMetadata)
+	if err != nil {
+		errorChan <- fmt.Errorf("failed to read data block bloom filters: %w", err)
+		return
+	}
+
+	// Test the data block bloom filters against the query
+	if !b.evaluateBloomFilters(
+		blockBloomFilters.FieldBloomFilter,
+		blockBloomFilters.TokenBloomFilter,
+		blockBloomFilters.FieldTokenBloomFilter,
+		bloomQuery,
+	) {
+		// Don't send anything to result channel when bloom filters don't match
+		return
+	}
+
+	// TODO: Read rows from this data block and scan each row for exact matches
+	// TODO: This is where row scanning will happen and individual results will be sent
+	// For now, don't send anything since we're not actually processing rows yet
+
+	// TODO: dummy return indicating that this passed (for testing, when removed the test needs to be changed)
+	resultChan <- map[string]any{"dummy": "result"}
+}
+
+// readRowsFromDataBlock reads all rows from a data block after the bloom filters
+func (b *BloomSearchEngine) readRowsFromDataBlock(file io.ReadSeeker, blockMetadata DataBlockMetadata) ([]map[string]any, error) {
+	// Seek to the start of row data (after bloom filters)
+	rowDataOffset := int64(blockMetadata.Offset + blockMetadata.BloomFiltersSize)
+	if _, err := file.Seek(rowDataOffset, 0); err != nil {
+		return nil, fmt.Errorf("failed to seek to row data: %w", err)
+	}
+
+	// Calculate the size of row data (excluding the final data block hash)
+	rowDataSize := blockMetadata.Size - blockMetadata.BloomFiltersSize - 8 // -8 for final hash
+
+	rows := make([]map[string]any, 0, blockMetadata.Rows)
+	bytesRead := 0
+
+	for bytesRead < rowDataSize {
+		// Read the row length prefix (uint32)
+		lengthBytes := make([]byte, 4)
+		if _, err := file.Read(lengthBytes); err != nil {
+			return nil, fmt.Errorf("failed to read row length: %w", err)
+		}
+		bytesRead += 4
+
+		// Extract the row length
+		rowLength := binary.LittleEndian.Uint32(lengthBytes)
+
+		// Read the row data
+		rowBytes := make([]byte, rowLength)
+		if _, err := file.Read(rowBytes); err != nil {
+			return nil, fmt.Errorf("failed to read row data: %w", err)
+		}
+		bytesRead += int(rowLength)
+
+		// Deserialize the row
+		var row map[string]any
+		if err := json.Unmarshal(rowBytes, &row); err != nil {
+			return nil, fmt.Errorf("failed to deserialize row: %w", err)
+		}
+
+		rows = append(rows, row)
+	}
+
+	return rows, nil
+}
+
+// evaluateRowAgainstQuery performs exact matching of a row against the bloom query
+func (b *BloomSearchEngine) evaluateRowAgainstQuery(row map[string]any, bloomQuery *BloomQuery) bool {
+	if bloomQuery == nil || len(bloomQuery.Groups) == 0 {
+		return true // No bloom filtering needed
+	}
+
+	// Get unique fields from the row
+	uniqueFields := UniqueFields(row, ".")
+
+	// Evaluate each group
+	groupResults := make([]bool, len(bloomQuery.Groups))
+	for i, group := range bloomQuery.Groups {
+		groupResults[i] = b.evaluateRowAgainstBloomGroup(uniqueFields, &group)
+	}
+
+	// Combine group results based on query combinator
+	if bloomQuery.Combinator == CombinatorOR {
+		// Any group can match
+		for _, result := range groupResults {
+			if result {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Default AND behavior: all groups must match
+	for _, result := range groupResults {
+		if !result {
+			return false
+		}
+	}
+	return true
+}
+
+// evaluateRowAgainstBloomGroup evaluates a row against a single bloom group
+func (b *BloomSearchEngine) evaluateRowAgainstBloomGroup(uniqueFields []FieldValues, group *BloomGroup) bool {
+	if len(group.Conditions) == 0 {
+		return true // Empty group matches everything
+	}
+
+	// Evaluate each condition in the group
+	conditionResults := make([]bool, len(group.Conditions))
+	for i, condition := range group.Conditions {
+		conditionResults[i] = b.evaluateRowAgainstBloomCondition(uniqueFields, &condition)
+	}
+
+	// Combine condition results based on group combinator
+	if group.Combinator == CombinatorOR {
+		// Any condition can match
+		for _, result := range conditionResults {
+			if result {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Default AND behavior: all conditions must match
+	for _, result := range conditionResults {
+		if !result {
+			return false
+		}
+	}
+	return true
+}
+
+// evaluateRowAgainstBloomCondition evaluates a row against a single bloom condition
+func (b *BloomSearchEngine) evaluateRowAgainstBloomCondition(uniqueFields []FieldValues, condition *BloomCondition) bool {
+	switch condition.Type {
+	case BloomField:
+		// Check if the field path exists in the row
+		for _, field := range uniqueFields {
+			if field.Path == condition.Field {
+				return true
+			}
+		}
+		return false
+
+	case BloomToken:
+		// Check if the token exists in any field value
+		for _, field := range uniqueFields {
+			for _, value := range field.Values {
+				tokens := b.config.Tokenizer(value)
+				for _, token := range tokens {
+					if token == condition.Token {
+						return true
+					}
+				}
+			}
+		}
+		return false
+
+	case BloomFieldToken:
+		// Check if the specific field contains the specific token
+		for _, field := range uniqueFields {
+			if field.Path == condition.Field {
+				for _, value := range field.Values {
+					tokens := b.config.Tokenizer(value)
+					for _, token := range tokens {
+						if token == condition.Token {
+							return true
+						}
+					}
+				}
+			}
+		}
+		return false
+
+	default:
+		return false
+	}
 }

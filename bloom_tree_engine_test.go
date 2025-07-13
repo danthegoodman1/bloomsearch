@@ -185,7 +185,7 @@ func TestBloomTreeEngineFlushMaxTime(t *testing.T) {
 	}
 }
 
-func TestEvaluateFileBloomFilters(t *testing.T) {
+func TestEvaluateBloomFilters(t *testing.T) {
 	// Create a simple engine for testing
 	config := DefaultBloomSearchEngineConfig()
 	engine, err := NewBloomSearchEngine(config, &NullMetaStore{}, NewFileSystemDataStore("./test_data/bloom_test"))
@@ -257,9 +257,148 @@ func TestEvaluateFileBloomFilters(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := engine.evaluateFileBloomFilters(fileMetadata, tt.query)
+			result := engine.evaluateBloomFilters(
+				fileMetadata.FieldBloomFilter,
+				fileMetadata.TokenBloomFilter,
+				fileMetadata.FieldTokenBloomFilter,
+				tt.query,
+			)
 			if result != tt.expected {
-				t.Errorf("evaluateFileBloomFilters() = %v, want %v", result, tt.expected)
+				t.Errorf("evaluateBloomFilters() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
+	// NOTE: this test only works while the `resultChan <- map[string]any{"dummy": "result"}` dummy test exists in the `processDataBlock` function
+	// Create test directory for file system data store
+	dataStore := NewFileSystemDataStore("./test_data/query_test")
+	metaStore := dataStore
+
+	// Create config
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 2                // Flush after 2 rows
+	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
+	config.MaxBufferedTime = 10 * time.Second // Large time limit
+	config.BloomExpectedItems = 100           // Smaller bloom filter
+	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
+
+	// Create and start engine
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	// Create test data
+	testRows := []map[string]any{
+		{"id": 1, "name": "Alice", "level": "error", "service": "auth"},
+		{"id": 2, "name": "Bob", "level": "info", "service": "payment"},
+	}
+
+	// Ingest rows and wait for flush
+	ctx := context.Background()
+	doneChan := make(chan error, 1)
+	err = engine.IngestRows(ctx, testRows, doneChan)
+	if err != nil {
+		t.Fatalf("Failed to ingest rows: %v", err)
+	}
+
+	// Wait for flush to complete
+	select {
+	case err := <-doneChan:
+		if err != nil {
+			t.Fatalf("Flush failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Flush did not complete within timeout")
+	}
+
+	// Test queries that should match
+	testCases := []struct {
+		name        string
+		query       *Query
+		shouldMatch bool
+	}{
+		{
+			name:        "field search for 'level' should match",
+			query:       NewQueryWithGroupCombinator(CombinatorAND).Field("level").Build(),
+			shouldMatch: true,
+		},
+		{
+			name:        "token search for 'Alice' should match",
+			query:       NewQueryWithGroupCombinator(CombinatorAND).Token("Alice").Build(),
+			shouldMatch: true,
+		},
+		{
+			name:        "field-token search for 'level:error' should match",
+			query:       NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error").Build(),
+			shouldMatch: true,
+		},
+		{
+			name:        "field search for nonexistent field should not match",
+			query:       NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent").Build(),
+			shouldMatch: false,
+		},
+		{
+			name:        "token search for nonexistent token should not match",
+			query:       NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent").Build(),
+			shouldMatch: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Execute query
+			resultChan, errorChan, err := engine.Query(ctx, tc.query)
+			if err != nil {
+				t.Fatalf("Query failed: %v", err)
+			}
+
+			// Collect results - rely on channel closing, not timeouts
+			var results []map[string]any
+			var queryErr error
+
+			// Collect all results until channel closes
+			for result := range resultChan {
+				results = append(results, result)
+			}
+
+			// Check for any errors (non-blocking)
+			select {
+			case err := <-errorChan:
+				if err != nil {
+					queryErr = err
+				}
+			default:
+				// No error waiting
+			}
+
+			// Verify results
+			if queryErr != nil {
+				t.Fatalf("Query error: %v", queryErr)
+			}
+
+			if tc.shouldMatch {
+				if len(results) == 0 {
+					t.Errorf("Expected results but got none")
+				} else {
+					// Check that we got the dummy result
+					if results[0]["dummy"] != "result" {
+						t.Errorf("Expected dummy result, got: %+v", results[0])
+					}
+				}
+			} else {
+				if len(results) > 0 {
+					t.Errorf("Expected no results but got: %+v", results)
+				}
 			}
 		})
 	}
