@@ -7,54 +7,10 @@ package bloomsearch
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
 	"strings"
 	"testing"
 	"time"
 )
-
-type FileSystemDataStore struct {
-	rootDir string
-}
-
-type FileSystemDataStoreFilePointer struct {
-	ID string
-}
-
-func NewFileSystemDataStore(rootDir string) *FileSystemDataStore {
-	// Make dir if not exists
-	if _, err := os.Stat(rootDir); os.IsNotExist(err) {
-		os.MkdirAll(rootDir, 0755)
-	}
-
-	return &FileSystemDataStore{
-		rootDir: rootDir,
-	}
-}
-
-func (fs *FileSystemDataStore) OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error) {
-	filePath := string(filePointerBytes)
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	return file, nil
-}
-
-func (fs *FileSystemDataStore) CreateFile(ctx context.Context) (io.WriteCloser, []byte, error) {
-	file, err := os.CreateTemp(fs.rootDir, "bloom-*.dat")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	filePath := file.Name()
-	return file, []byte(filePath), nil
-}
-
-func init() {
-	var _ DataStore = &FileSystemDataStore{}
-}
 
 func TestBloomTreeEngineFlushMaxRows(t *testing.T) {
 	// Create test directory for file system data store
