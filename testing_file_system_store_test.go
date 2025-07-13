@@ -110,7 +110,7 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	fmt.Printf("    Token Filter: %v\n", maybeFile.Metadata.TokenBloomFilter != nil)
 	fmt.Printf("    Field+Token Filter: %v\n", maybeFile.Metadata.FieldTokenBloomFilter != nil)
 
-	fmt.Printf("  Matching Data Blocks: %d\n", len(maybeFile.MatchingDataBlocks))
+	fmt.Printf("  Matching Data Blocks: %d\n", len(maybeFile.MatchingDataBlockIndexes))
 
 	// === Read back the actual row data ===
 	fmt.Println("\n--- Reading back row data ---")
