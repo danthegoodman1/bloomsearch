@@ -62,6 +62,17 @@ type BloomSearchEngine struct {
 	querySemaphore chan struct{} // Global semaphore for query concurrency
 }
 
+type BlockStats struct {
+	FilePointer        []byte
+	BlockOffset        int
+	RowsProcessed      int64
+	BytesProcessed     int64
+	TotalRows          int64
+	TotalBytes         int64
+	Duration           time.Duration
+	BloomFilterSkipped bool
+}
+
 type BloomSearchEngineConfig struct {
 	Tokenizer     ValueTokenizerFunc
 	PartitionFunc PartitionFunc
@@ -534,43 +545,36 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		dataBlockBytes = append(dataBlockBytes, partitionBuffer.buffer...)
 		dataBlockHash := xxhash.Sum64(dataBlockBytes)
 
-		// Write the data block hash as uint64 (8 bytes)
-		dataBlockHashBytes := make([]byte, 8)
+		dataBlockHashBytes := make([]byte, HashSize)
 		binary.LittleEndian.PutUint64(dataBlockHashBytes, dataBlockHash)
 		if _, err := writer.Write(dataBlockHashBytes); err != nil {
-			// Write error to all done channels
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write data block hash: %w", err))
 			return
 		}
 
-		// Include the entire data block in the file hash
 		if _, err := fileHash.Write(dataBlockBytes); err != nil {
-			// Write error to all done channels
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
 			return
 		}
 
-		// Also include the data block hash in the file hash
 		if _, err := fileHash.Write(dataBlockHashBytes); err != nil {
-			// Write error to all done channels
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
 			return
 		}
 
-		// Calculate bloom filters size (bloom filters + hash)
-		bloomFiltersSize := len(bloomFiltersBytes) + 8
+		bloomFiltersSize := len(bloomFiltersBytes) + HashSize
+		dataBlockSize := bloomFiltersSize + len(partitionBuffer.buffer) + HashSize
 
 		fileMetadata.DataBlocks = append(fileMetadata.DataBlocks, DataBlockMetadata{
 			PartitionID:      partitionBuffer.partitionID,
 			Rows:             partitionBuffer.rowCount,
 			Offset:           currentOffset,
-			Size:             bloomFiltersSize + len(partitionBuffer.buffer) + 8, // bloom filters + hash + row data + data block hash
+			Size:             dataBlockSize,
 			BloomFiltersSize: bloomFiltersSize,
 			MinMaxIndexes:    partitionBuffer.minMaxIndexes,
 		})
 
-		// Update offset for next data block
-		currentOffset += bloomFiltersSize + len(partitionBuffer.buffer) + 8
+		currentOffset += dataBlockSize
 	}
 
 	// Write final metadata to data store and footer
@@ -582,47 +586,40 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		return
 	}
 
-	// Write file metadata hash (uint64)
 	if _, err := writer.Write(metadataHashBytes); err != nil {
 		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata hash: %w", err))
 		return
 	}
 
-	// Write file metadata length (uint32)
-	metadataLengthBytes := make([]byte, 4)
+	metadataLengthBytes := make([]byte, LengthPrefixSize)
 	binary.LittleEndian.PutUint32(metadataLengthBytes, uint32(len(metadataBytes)))
 	if _, err := writer.Write(metadataLengthBytes); err != nil {
 		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata length: %w", err))
 		return
 	}
 
-	// Write file version (uint32)
-	versionBytes := make([]byte, 4)
+	versionBytes := make([]byte, VersionPrefixSize)
 	binary.LittleEndian.PutUint32(versionBytes, FileVersion)
 	if _, err := writer.Write(versionBytes); err != nil {
 		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file version: %w", err))
 		return
 	}
 
-	// Write magic bytes (8 bytes)
 	if _, err := writer.Write([]byte(MagicBytes)); err != nil {
 		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write magic bytes: %w", err))
 		return
 	}
 
-	// Close the writer to finalize the file
 	if err := writer.Close(); err != nil {
 		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to close file writer: %w", err))
 		return
 	}
 
-	// Write to meta store
 	if err := b.metaStore.WriteFileMetadata(b.ctx, &fileMetadata, filePointerBytes); err != nil {
 		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to store file metadata: %w", err))
 		return
 	}
 
-	// Signal completion
 	TryWriteToChannels(flushReq.doneChans, nil)
 }
 
@@ -730,7 +727,7 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 //
 //	resultChan := make(chan map[string]any, 1000)
 //	errorChan := make(chan error, 100)
-//	err := engine.Query(ctx, query, resultChan, errorChan)
+//	err := engine.Query(ctx, query, resultChan, errorChan, nil)
 //	if err != nil { return err }
 //	for {
 //	  select {
@@ -743,7 +740,7 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 //	    return err
 //	  }
 //	}
-func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan chan<- map[string]any, errorChan chan<- error) error {
+func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan chan<- map[string]any, errorChan chan<- error, statsChan chan<- BlockStats) error {
 	// Get maybe files from meta store
 	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 	if err != nil {
@@ -831,7 +828,7 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 			}
 			defer func() { <-b.querySemaphore }()
 
-			b.processDataBlock(workerCtx, job, resultChan, errorChan, query.Bloom)
+			b.processDataBlock(workerCtx, job, resultChan, errorChan, query.Bloom, statsChan)
 		}(job)
 	}
 
@@ -852,7 +849,29 @@ func (b *BloomSearchEngine) processDataBlock(
 	resultChan chan<- map[string]any,
 	errorChan chan<- error,
 	bloomQuery *BloomQuery,
+	statsChan chan<- BlockStats,
 ) {
+	blockStartTime := time.Now()
+	var rowsProcessed, bytesProcessed int64
+	var bloomFilterSkipped bool
+
+	// Always send stats when we exit, regardless of success/failure
+	defer func() {
+		duration := time.Since(blockStartTime)
+
+		blockStats := BlockStats{
+			FilePointer:        job.filePointer,
+			BlockOffset:        job.blockMetadata.Offset,
+			RowsProcessed:      rowsProcessed,
+			BytesProcessed:     bytesProcessed,
+			TotalRows:          int64(job.blockMetadata.Rows),
+			TotalBytes:         int64(job.blockMetadata.Size),
+			Duration:           duration,
+			BloomFilterSkipped: bloomFilterSkipped,
+		}
+
+		TryWriteChannel(statsChan, blockStats)
+	}()
 	// Open the file for reading
 	file, err := b.dataStore.OpenFile(ctx, job.filePointer)
 	if err != nil {
@@ -875,7 +894,7 @@ func (b *BloomSearchEngine) processDataBlock(
 		blockBloomFilters.FieldTokenBloomFilter,
 		bloomQuery,
 	) {
-		// Don't send anything to result channel when bloom filters don't match
+		bloomFilterSkipped = true
 		return
 	}
 
@@ -888,16 +907,16 @@ func (b *BloomSearchEngine) processDataBlock(
 	}
 
 	// Calculate the size of row data (excluding the final data block hash)
-	rowGroupSize := job.blockMetadata.Size - job.blockMetadata.BloomFiltersSize - 8 // -8 for final hash
+	rowGroupSize := job.blockMetadata.Size - job.blockMetadata.BloomFiltersSize - HashSize
 
 	for bytesRead := 0; bytesRead < rowGroupSize; {
 		// Read the row length prefix (uint32)
-		lengthBytes := make([]byte, 4)
+		lengthBytes := make([]byte, LengthPrefixSize)
 		if _, err := file.Read(lengthBytes); err != nil {
 			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row length: %w", err))
 			return
 		}
-		bytesRead += 4
+		bytesRead += LengthPrefixSize
 
 		// Extract the row length
 		rowLength := binary.LittleEndian.Uint32(lengthBytes)
@@ -909,6 +928,10 @@ func (b *BloomSearchEngine) processDataBlock(
 			return
 		}
 		bytesRead += int(rowLength)
+
+		// Track bytes processed for all rows, whether they match the query or not
+		bytesProcessed += int64(LengthPrefixSize + rowLength)
+		rowsProcessed++
 
 		if !TestJSONForBloomQuery(rowData, bloomQuery, ".", b.config.Tokenizer) {
 			continue

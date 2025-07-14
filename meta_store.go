@@ -29,6 +29,8 @@ type MaybeFile struct {
 	PointerBytes []byte
 	// The FileMetadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
 	Metadata FileMetadata
+	// The size of the file in bytes
+	Size int
 }
 
 // TESTING

@@ -3,8 +3,11 @@ package bloomsearch
 import "context"
 
 // TryWriteChannel attempts to write a value to a channel without blocking.
-// Returns true if the write was successful, false if the channel is full or nobody is listening.
+// Returns true if the write was successful, false if the channel is full, nobody is listening, or the channel is nil.
 func TryWriteChannel[T any](ch chan<- T, value T) bool {
+	if ch == nil {
+		return false
+	}
 	select {
 	case ch <- value:
 		return true

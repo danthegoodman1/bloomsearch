@@ -146,17 +146,24 @@ func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query 
 		fileMetadata, err := fs.readFileMetadata(filePath)
 		if err != nil {
 			// Skip files with read errors (they might not be valid bloom files)
-			continue
+			return nil, fmt.Errorf("failed to read file metadata from %s: %w", filePath, err)
 		}
 
 		// Filter data blocks based on query conditions
 		fileMetadata.DataBlocks = FilterDataBlocks(fileMetadata.DataBlocks, query)
+
+		stat, err := os.Stat(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to stat file %s: %w", filePath, err)
+		}
+		fileSize := stat.Size()
 
 		// Only include files that have matching data blocks (or all files if no query conditions)
 		if query == nil || len(fileMetadata.DataBlocks) > 0 {
 			maybeFiles = append(maybeFiles, MaybeFile{
 				PointerBytes: []byte(filePath),
 				Metadata:     *fileMetadata,
+				Size:         int(fileSize),
 			})
 		}
 	}

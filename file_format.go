@@ -23,6 +23,10 @@ var (
 const (
 	FileVersion = uint32(1)
 	MagicBytes  = "BLOMSRCH"
+
+	LengthPrefixSize  = 4
+	VersionPrefixSize = 4
+	HashSize          = 8
 )
 
 type FileMetadata struct {

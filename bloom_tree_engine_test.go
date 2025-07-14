@@ -371,28 +371,35 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 			// Execute query
 			resultChan := make(chan map[string]any, 100)
 			errorChan := make(chan error, 10)
-			err := engine.Query(ctx, tc.query, resultChan, errorChan)
+			statsChan := make(chan BlockStats, 100)
+			err := engine.Query(ctx, tc.query, resultChan, errorChan, statsChan)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
 
-			// Collect results - rely on channel closing, not timeouts
 			var results []map[string]any
 			var queryErr error
 
-			// Collect all results until channel closes
+			// Print stats as they come in
+			go func() {
+				for stat := range statsChan {
+					t.Logf("Block %s[%d]: %s rows/s, %s",
+						string(stat.FilePointer), stat.BlockOffset,
+						FormatRate(stat.RowsProcessed, stat.Duration),
+						FormatBytesPerSecond(stat.BytesProcessed, stat.Duration))
+				}
+			}()
+
 			for result := range resultChan {
 				results = append(results, result)
 			}
 
-			// Check for any errors (non-blocking)
 			select {
 			case err := <-errorChan:
 				if err != nil {
 					queryErr = err
 				}
 			default:
-				// No error waiting
 			}
 
 			// Verify results
