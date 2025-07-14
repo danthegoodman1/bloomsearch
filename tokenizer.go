@@ -3,7 +3,6 @@ package bloomsearch
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/tidwall/gjson"
 )
@@ -72,22 +71,12 @@ func collectPathsAndValues(obj any, prefix string, pathValues map[string]map[str
 // ValueTokenizerFunc is a function that tokenizes a field value into a list of tokens
 type ValueTokenizerFunc func(value any) []string
 
-// BasicWhitespaceTokenizer tokenizes values by keeping alphanumeric characters, dashes, underscores, and emojis, splitting on spaces
+// BasicWhitespaceTokenizer tokenizes values by splitting on whitespace
 func BasicWhitespaceTokenizer(value any) []string {
 	// If the value is not a string, return the recursive call of its string representation
 	if str, ok := value.(string); ok {
-		// Remove non-alphanumerical characters (keeping dashes, underscores, and emojis)
-		var result strings.Builder
-		for _, r := range str {
-			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || unicode.IsSymbol(r) {
-				result.WriteRune(r)
-			} else {
-				result.WriteRune(' ')
-			}
-		}
-
-		// Split on spaces and filter out empty strings
-		tokens := strings.Fields(result.String())
+		// Split on whitespace and filter out empty strings
+		tokens := strings.Fields(str)
 		return tokens
 	}
 

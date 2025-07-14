@@ -109,7 +109,7 @@ func TestBasicWhitespaceTokenizer(t *testing.T) {
 		{
 			name:     "string with special characters",
 			input:    "hello@world.com!test",
-			expected: []string{"hello", "world", "com", "test"},
+			expected: []string{"hello@world.com!test"},
 		},
 		{
 			name:     "string with dashes and underscores",
@@ -124,7 +124,7 @@ func TestBasicWhitespaceTokenizer(t *testing.T) {
 		{
 			name:     "mixed alphanumeric with punctuation",
 			input:    "user@domain.com, password123!",
-			expected: []string{"user", "domain", "com", "password123"},
+			expected: []string{"user@domain.com,", "password123!"},
 		},
 		{
 			name:     "number input",
@@ -149,7 +149,7 @@ func TestBasicWhitespaceTokenizer(t *testing.T) {
 		{
 			name:     "string with only special characters",
 			input:    "!@#$%^&*()",
-			expected: []string{"$", "^"},
+			expected: []string{"!@#$%^&*()"},
 		},
 		{
 			name:     "string with tabs and newlines",
@@ -159,7 +159,7 @@ func TestBasicWhitespaceTokenizer(t *testing.T) {
 		{
 			name:     "complex mixed content",
 			input:    "user-name_123@example.com (active)",
-			expected: []string{"user-name_123", "example", "com", "active"},
+			expected: []string{"user-name_123@example.com", "(active)"},
 		},
 	}
 
