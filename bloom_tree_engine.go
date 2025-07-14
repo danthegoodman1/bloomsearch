@@ -750,17 +750,60 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 		return err
 	}
 
-	// For each maybe file, test the file-level bloom filters
-	matchingFiles := make([]MaybeFile, 0, len(maybeFiles))
-	for _, maybeFile := range maybeFiles {
-		// Test the file-level bloom filters
-		if b.evaluateBloomFilters(
-			maybeFile.Metadata.FieldBloomFilter,
-			maybeFile.Metadata.TokenBloomFilter,
-			maybeFile.Metadata.FieldTokenBloomFilter,
-			query.Bloom,
-		) {
-			matchingFiles = append(matchingFiles, maybeFile)
+	// Test file-level bloom filters - use concurrency only when beneficial
+	const concurrencyThreshold = 20 // Minimum files to justify concurrency overhead
+
+	var matchingFiles []MaybeFile
+	if len(maybeFiles) < concurrencyThreshold {
+		// Sequential evaluation for small numbers of files
+		matchingFiles = make([]MaybeFile, 0, len(maybeFiles))
+		for _, maybeFile := range maybeFiles {
+			if b.evaluateBloomFilters(
+				maybeFile.Metadata.FieldBloomFilter,
+				maybeFile.Metadata.TokenBloomFilter,
+				maybeFile.Metadata.FieldTokenBloomFilter,
+				query.Bloom,
+			) {
+				matchingFiles = append(matchingFiles, maybeFile)
+			}
+		}
+	} else {
+		// Concurrent evaluation for larger numbers of files
+		var fileWg sync.WaitGroup
+		matchingFilesChan := make(chan MaybeFile, len(maybeFiles))
+
+		for _, maybeFile := range maybeFiles {
+			fileWg.Add(1)
+			go func(maybeFile MaybeFile) {
+				defer fileWg.Done()
+
+				// Acquire global semaphore
+				if err := SendWithContext(ctx, b.querySemaphore, struct{}{}); err != nil {
+					return // Context cancelled while waiting for semaphore
+				}
+				defer func() { <-b.querySemaphore }()
+
+				// Test the file-level bloom filters
+				if b.evaluateBloomFilters(
+					maybeFile.Metadata.FieldBloomFilter,
+					maybeFile.Metadata.TokenBloomFilter,
+					maybeFile.Metadata.FieldTokenBloomFilter,
+					query.Bloom,
+				) {
+					SendWithContext(ctx, matchingFilesChan, maybeFile)
+				}
+			}(maybeFile)
+		}
+
+		// Close the channel when all file evaluations are done
+		go func() {
+			fileWg.Wait()
+			close(matchingFilesChan)
+		}()
+
+		// Collect matching files
+		for matchingFile := range matchingFilesChan {
+			matchingFiles = append(matchingFiles, matchingFile)
 		}
 	}
 

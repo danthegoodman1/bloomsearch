@@ -302,6 +302,8 @@ query := NewQueryWithGroupCombinator(CombinatorAND).
 maybeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 ```
 
+Query processing is done highly-concurrently: A goroutine is spawned for every file (if the result is over 20 files), and for every row group. This allows it to maximimze multi-core machines.
+
 Memory usage scales with concurrent file reads, not dataset size.
 
 This flow is a bit simplified, see `BloomSearchEngine.Query` for more detail.
