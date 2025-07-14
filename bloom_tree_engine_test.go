@@ -371,14 +371,11 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 			// Execute query
 			resultChan := make(chan map[string]any, 100)
 			errorChan := make(chan error, 10)
-			statsChan := make(chan BlockStats, 100)
+			statsChan := make(chan BlockStats, 10)
 			err := engine.Query(ctx, tc.query, resultChan, errorChan, statsChan)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
-
-			var results []map[string]any
-			var queryErr error
 
 			// Print stats as they come in
 			go func() {
@@ -389,6 +386,9 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 						FormatBytesPerSecond(stat.BytesProcessed, stat.Duration))
 				}
 			}()
+
+			var results []map[string]any
+			var queryErr error
 
 			for result := range resultChan {
 				results = append(results, result)
