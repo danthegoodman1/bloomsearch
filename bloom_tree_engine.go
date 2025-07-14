@@ -795,10 +795,9 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 			}(maybeFile)
 		}
 
-		// Close the channel when all file evaluations are done
 		go func() {
 			fileWg.Wait()
-			close(matchingFilesChan)
+			close(matchingFilesChan) // close to tell the range below to stop
 		}()
 
 		// Collect matching files
