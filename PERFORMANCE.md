@@ -62,6 +62,8 @@ Result 1: {
 
 ### Field:Token search
 
+Search for `"b9DVOMloi": "aPplE"` field:token
+
 ```
 === Query Results: field_token_match ===
 Total query time: 667.9685ms
