@@ -2,6 +2,8 @@
 
 ## Primitive test (Query Concurrency: 100)
 
+M3 Max 128GB, 1.6GB dataset (~167MB per file * 10)
+
 ### Token search
 
 Search for `apple` as a token in any field:
