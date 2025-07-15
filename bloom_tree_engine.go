@@ -437,8 +437,13 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 		if !shouldFlush {
 			partitionBytes := len(partitionBuffer.buffer)
 
-			if partitionBuffer.rowCount >= b.config.MaxRowGroupRows ||
-				partitionBytes >= b.config.MaxRowGroupBytes {
+			if partitionBuffer.rowCount >= b.config.MaxRowGroupRows {
+				fmt.Printf("FLUSH TRIGGER: Partition '%s' hit max rows (%d >= %d)\n",
+					partitionBuffer.partitionID, partitionBuffer.rowCount, b.config.MaxRowGroupRows)
+				shouldFlush = true
+			} else if partitionBytes >= b.config.MaxRowGroupBytes {
+				fmt.Printf("FLUSH TRIGGER: Partition '%s' hit max bytes (%d >= %d)\n",
+					partitionBuffer.partitionID, partitionBytes, b.config.MaxRowGroupBytes)
 				shouldFlush = true
 			}
 		}
@@ -447,14 +452,20 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 	// If we haven't decided to flush based on partition limits, check buffer-level limits
 	if !shouldFlush {
 		if *bufferedRowCount >= b.config.MaxBufferedRows {
+			fmt.Printf("FLUSH TRIGGER: Buffer hit max rows (%d >= %d)\n",
+				*bufferedRowCount, b.config.MaxBufferedRows)
 			shouldFlush = true
 		}
 
 		if !shouldFlush && *bufferedBytes >= b.config.MaxBufferedBytes {
+			fmt.Printf("FLUSH TRIGGER: Buffer hit max bytes (%d >= %d)\n",
+				*bufferedBytes, b.config.MaxBufferedBytes)
 			shouldFlush = true
 		}
 
 		if !shouldFlush && time.Since(*bufferStartTime) >= b.config.MaxBufferedTime {
+			fmt.Printf("FLUSH TRIGGER: Buffer hit max time (%v >= %v)\n",
+				time.Since(*bufferStartTime), b.config.MaxBufferedTime)
 			shouldFlush = true
 		}
 	}
@@ -464,6 +475,13 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 
 	// Trigger flush if needed
 	if shouldFlush {
+		// Log flush details
+		fmt.Printf("FLUSH STARTING: %d partitions, %d total rows, %d total bytes\n",
+			len(partitionBuffers), *bufferedRowCount, *bufferedBytes)
+		for partitionID, partition := range partitionBuffers {
+			fmt.Printf("  Partition '%s': %d rows, %d bytes\n",
+				partitionID, partition.rowCount, len(partition.buffer))
+		}
 		b.flushBufferedData(partitionBuffers, doneChans, bufferedRowCount, bufferedBytes, bufferStartTime)
 	}
 }
@@ -868,7 +886,6 @@ func (b *BloomSearchEngine) processDataBlock(
 	statsChan chan<- BlockStats,
 ) {
 	blockStartTime := time.Now()
-	var rowsProcessed, bytesProcessed int64
 	var bloomFilterSkipped bool
 
 	// Always send stats when we exit, regardless of success/failure
@@ -878,8 +895,8 @@ func (b *BloomSearchEngine) processDataBlock(
 		blockStats := BlockStats{
 			FilePointer:        job.filePointer,
 			BlockOffset:        job.blockMetadata.Offset,
-			RowsProcessed:      rowsProcessed,
-			BytesProcessed:     bytesProcessed,
+			RowsProcessed:      int64(job.blockMetadata.Rows), // Full block rows
+			BytesProcessed:     int64(job.blockMetadata.Size), // Full block size
 			TotalRows:          int64(job.blockMetadata.Rows),
 			TotalBytes:         int64(job.blockMetadata.Size),
 			Duration:           duration,
@@ -935,9 +952,6 @@ func (b *BloomSearchEngine) processDataBlock(
 			return
 		}
 		bytesRead += int(rowLength)
-
-		bytesProcessed += int64(LengthPrefixSize + rowLength)
-		rowsProcessed++
 
 		if !TestJSONForBloomQuery(rowData, bloomQuery, ".", b.config.Tokenizer) {
 			continue

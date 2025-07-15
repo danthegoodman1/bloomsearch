@@ -2,6 +2,7 @@ package bloomsearch
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -41,19 +42,31 @@ func UniqueFields(row map[string]any, delimiter string) []FieldValues {
 }
 
 func collectPathsAndValues(obj any, prefix string, pathValues map[string]map[string]bool, delimiter string) {
-	switch v := obj.(type) {
-	case map[string]any:
-		// Handle map type
-		for key, value := range v {
-			newPath := key
+	if obj == nil {
+		return
+	}
+
+	// Use reflection to handle any type generically
+	val := reflect.ValueOf(obj)
+	typ := val.Type()
+
+	switch typ.Kind() {
+	case reflect.Map:
+		// Handle any map type generically
+		for _, key := range val.MapKeys() {
+			keyStr := fmt.Sprintf("%v", key.Interface())
+			value := val.MapIndex(key).Interface()
+
+			newPath := keyStr
 			if prefix != "" {
-				newPath = prefix + delimiter + key
+				newPath = prefix + delimiter + keyStr
 			}
 			collectPathsAndValues(value, newPath, pathValues, delimiter)
 		}
-	case []any:
-		// Handle slice of any
-		for _, item := range v {
+	case reflect.Slice, reflect.Array:
+		// Handle any slice/array type generically
+		for i := 0; i < val.Len(); i++ {
+			item := val.Index(i).Interface()
 			collectPathsAndValues(item, prefix, pathValues, delimiter)
 		}
 	default:
@@ -62,7 +75,7 @@ func collectPathsAndValues(obj any, prefix string, pathValues map[string]map[str
 			if pathValues[prefix] == nil {
 				pathValues[prefix] = make(map[string]bool)
 			}
-			valueStr := fmt.Sprintf("%v", v)
+			valueStr := fmt.Sprintf("%v", obj)
 			pathValues[prefix][valueStr] = true
 		}
 	}
