@@ -615,7 +615,12 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		return
 	}
 
-	if err := b.metaStore.WriteFileMetadata(b.ctx, &fileMetadata, filePointerBytes); err != nil {
+	if err := b.metaStore.Update(b.ctx, []WriteOperation{
+		{
+			FileMetadata:     &fileMetadata,
+			FilePointerBytes: filePointerBytes,
+		},
+	}, nil); err != nil {
 		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to store file metadata: %w", err))
 		return
 	}

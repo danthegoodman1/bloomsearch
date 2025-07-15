@@ -171,7 +171,7 @@ func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query 
 	return maybeFiles, nil
 }
 
-func (fs *FileSystemDataStore) WriteFileMetadata(ctx context.Context, fileMetadata *FileMetadata, filePointerBytes []byte) error {
+func (fs *FileSystemDataStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {
 	// no-op, it's stored in the files
 	return nil
 }

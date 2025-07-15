@@ -17,10 +17,17 @@ type MetaStore interface {
 	// if the query conditions are able to guarantee that some data blocks will not match the query conditions.
 	GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error)
 
-	// WriteFileMetadata writes the file metadata to the store.
-	//
-	// This is called after the file has been written to the DataStore.
-	WriteFileMetadata(ctx context.Context, fileMetadata *FileMetadata, filePointerBytes []byte) error
+	// Update atomically performes a set of operations on the MetaStore.
+	Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error
+}
+
+type WriteOperation struct {
+	FileMetadata     *FileMetadata
+	FilePointerBytes []byte
+}
+
+type DeleteOperation struct {
+	FilePointerBytes []byte
 }
 
 // MaybeFile is a pointer to a file that may contain rows of interest based on pre-filtering conditions (partition IDs, minmax indexes). They have not had their bloom filters tested yet.
@@ -41,6 +48,6 @@ func (n *NullMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryP
 	return nil, nil
 }
 
-func (n *NullMetaStore) WriteFileMetadata(ctx context.Context, fileMetadata *FileMetadata, filePointerBytes []byte) error {
+func (n *NullMetaStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {
 	return nil
 }
