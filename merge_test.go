@@ -337,7 +337,7 @@ func TestMergeWithRealEngine(t *testing.T) {
 	config := DefaultBloomSearchEngineConfig()
 	config.MinMaxIndexes = []string{"timestamp", "user_id"}
 	config.MaxRowGroupBytes = 4500 // Small merge group size to force splitting
-	config.MaxFileSize = 3000      // File size limit to force partition splitting across files
+	config.MaxFileSize = 12000     // File size limit to force partition splitting across files
 
 	engine, err := NewBloomSearchEngine(config, metaStore, &NullDataStore{})
 	if err != nil {

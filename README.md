@@ -213,6 +213,16 @@ Merging files reduces metadata operations (file opens, bloom filter tests) and i
 
 Bloom filters of the same size can be trivially merged by OR-ing their bits. If bloom filter parameters change, the system rebuilds filters from raw data during merge.
 
+**Two-Level Bloom Filter Strategy:**
+
+Two merge strategies were considered:
+1. **File-level merging** (chosen): Smaller bloom filters for row groups, larger for files. Must merge whole files together.
+2. **Block-level fragmentation**: Standard bloom filter sizes for both levels, can fragment blocks across files.
+
+We chose file-level merging because it's more I/O efficient for poorly-organized data. With suboptimal partitioning or MinMax indexes, block-level fragmentation forces reading many large bloom filters, while file-level merging reads fewer, more targeted filters. This approach provides better general-purpose performance without requiring users to optimize their data organization.
+
+This does mean that we do have to build file-level bloom filters at ingest time, rather than merging all of the partitions at flush time, which is ok because that optimizes for query speed at the cost of ingest speed.
+
 The current merge algorithm is not designed to be perfectly optimal, it's designed to be pretty good, and very fast.
 
 #### Coordinated Merges

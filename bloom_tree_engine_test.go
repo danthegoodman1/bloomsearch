@@ -25,7 +25,7 @@ func TestBloomTreeEngineFlushMaxRows(t *testing.T) {
 	config.MaxBufferedRows = 3                // Flush after 3 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit (won't trigger)
 	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
-	config.BloomExpectedItems = 100           // Much smaller bloom filter
+	config.FileBloomExpectedItems = 100       // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
 
 	// Create and start engine
@@ -82,7 +82,7 @@ func TestBloomTreeEngineFlushMaxBytes(t *testing.T) {
 	config.MaxBufferedRows = 100              // Large row limit (won't trigger)
 	config.MaxBufferedBytes = 200             // Small byte limit (will trigger)
 	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
-	config.BloomExpectedItems = 100           // Much smaller bloom filter
+	config.FileBloomExpectedItems = 100       // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
 
 	// Create and start engine
@@ -140,7 +140,7 @@ func TestBloomTreeEngineFlushMaxTime(t *testing.T) {
 	config.MaxBufferedRows = 100             // Large row limit (won't trigger)
 	config.MaxBufferedBytes = 1024 * 1024    // Large byte limit (won't trigger)
 	config.MaxBufferedTime = 1 * time.Second // Small time limit (will trigger)
-	config.BloomExpectedItems = 100          // Much smaller bloom filter
+	config.FileBloomExpectedItems = 100      // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01     // Slightly higher false positive rate
 
 	// Create and start engine
@@ -287,7 +287,7 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 	config.MaxBufferedRows = 2                // Flush after 2 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
 	config.MaxBufferedTime = 10 * time.Second // Large time limit
-	config.BloomExpectedItems = 100           // Smaller bloom filter
+	config.FileBloomExpectedItems = 100       // Smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
 
 	// Create and start engine

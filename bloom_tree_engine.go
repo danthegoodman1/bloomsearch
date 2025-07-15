@@ -60,7 +60,11 @@ type BloomSearchEngine struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 
-	querySemaphore chan struct{} // Global semaphore for query concurrency
+	querySemaphore chan struct{}
+
+	fileFieldBloomFilter      *bloom.BloomFilter
+	fileTokenBloomFilter      *bloom.BloomFilter
+	fileFieldTokenBloomFilter *bloom.BloomFilter
 }
 
 type BlockStats struct {
@@ -94,7 +98,7 @@ type BloomSearchEngineConfig struct {
 	MaxQueryConcurrency int
 
 	// Bloom filter parameters
-	BloomExpectedItems     uint
+	FileBloomExpectedItems uint
 	BloomFalsePositiveRate float64
 }
 
@@ -124,7 +128,7 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 
 		MaxQueryConcurrency: 1_000,
 
-		BloomExpectedItems:     100_000,
+		FileBloomExpectedItems: 100_000,
 		BloomFalsePositiveRate: 0.001,
 	}
 }
@@ -137,7 +141,7 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		return nil, fmt.Errorf("%w: tokenizer is required", ErrInvalidConfig)
 	}
 
-	if config.BloomExpectedItems == 0 {
+	if config.FileBloomExpectedItems == 0 {
 		cancel() // make the linter happy
 		return nil, fmt.Errorf("%w: BloomExpectedItems must be greater than 0", ErrInvalidConfig)
 	}
@@ -168,6 +172,10 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		cancel: cancel,
 
 		querySemaphore: make(chan struct{}, config.MaxQueryConcurrency),
+
+		fileFieldBloomFilter:      bloom.NewWithEstimates(config.FileBloomExpectedItems, config.BloomFalsePositiveRate),
+		fileTokenBloomFilter:      bloom.NewWithEstimates(config.FileBloomExpectedItems, config.BloomFalsePositiveRate),
+		fileFieldTokenBloomFilter: bloom.NewWithEstimates(config.FileBloomExpectedItems, config.BloomFalsePositiveRate),
 	}, nil
 }
 
@@ -296,6 +304,9 @@ func (b *BloomSearchEngine) flushBufferedData(partitionBuffers map[string]*parti
 	*bufferedRowCount = 0
 	*bufferedBytes = 0
 	*bufferStartTime = time.Time{}
+
+	// Note: Don't reset file-level bloom filters here since the flush worker needs them
+	// They will be reset in handleFlush after the flush completes
 }
 
 func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *ingestRequest, partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
@@ -336,9 +347,9 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 				partitionID:           partitionID,
 				minMaxIndexes:         make(map[string]MinMaxIndex),
 				buffer:                make([]byte, 0),
-				fieldBloomFilter:      bloom.NewWithEstimates(b.config.BloomExpectedItems, b.config.BloomFalsePositiveRate),
-				tokenBloomFilter:      bloom.NewWithEstimates(b.config.BloomExpectedItems, b.config.BloomFalsePositiveRate),
-				fieldTokenBloomFilter: bloom.NewWithEstimates(b.config.BloomExpectedItems, b.config.BloomFalsePositiveRate),
+				fieldBloomFilter:      bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
+				tokenBloomFilter:      bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
+				fieldTokenBloomFilter: bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
 			}
 		}
 	}
@@ -361,11 +372,17 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 			uniqueFields := UniqueFields(row, ".")
 			for _, field := range uniqueFields {
 				partitionBuffer.fieldBloomFilter.AddString(field.Path)
+				// Also add to file-level bloom filters
+				b.fileFieldBloomFilter.AddString(field.Path)
+
 				for _, value := range field.Values {
 					tokens := b.config.Tokenizer(value)
 					for _, token := range tokens {
 						partitionBuffer.tokenBloomFilter.AddString(token)
 						partitionBuffer.fieldTokenBloomFilter.AddString(makeFieldTokenKey(field.Path, token))
+						// Also add to file-level bloom filters
+						b.fileTokenBloomFilter.AddString(token)
+						b.fileFieldTokenBloomFilter.AddString(makeFieldTokenKey(field.Path, token))
 					}
 				}
 			}
@@ -480,21 +497,10 @@ func (b *BloomSearchEngine) flushWorker() {
 }
 
 func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
-	// Merge bloom filters for file-level bloom filters
-	fileFieldBloomFilter := bloom.NewWithEstimates(b.config.BloomExpectedItems, b.config.BloomFalsePositiveRate)
-	fileTokenBloomFilter := bloom.NewWithEstimates(b.config.BloomExpectedItems, b.config.BloomFalsePositiveRate)
-	fileFieldTokenBloomFilter := bloom.NewWithEstimates(b.config.BloomExpectedItems, b.config.BloomFalsePositiveRate)
-	for _, partitionBuffer := range flushReq.partitionBuffers {
-		fileFieldBloomFilter.Merge(partitionBuffer.fieldBloomFilter)
-		fileTokenBloomFilter.Merge(partitionBuffer.tokenBloomFilter)
-		fileFieldTokenBloomFilter.Merge(partitionBuffer.fieldTokenBloomFilter)
-	}
-
-	// Calculate final metadata
 	fileMetadata := FileMetadata{
-		FieldBloomFilter:      fileFieldBloomFilter,
-		TokenBloomFilter:      fileTokenBloomFilter,
-		FieldTokenBloomFilter: fileFieldTokenBloomFilter,
+		FieldBloomFilter:      b.fileFieldBloomFilter,
+		TokenBloomFilter:      b.fileTokenBloomFilter,
+		FieldTokenBloomFilter: b.fileFieldTokenBloomFilter,
 		DataBlocks:            make([]DataBlockMetadata, 0),
 	}
 
@@ -628,6 +634,11 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		return
 	}
 
+	// Reset file-level bloom filters for the next file (now that flush is complete)
+	b.fileFieldBloomFilter = bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
+	b.fileTokenBloomFilter = bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
+	b.fileFieldTokenBloomFilter = bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
+
 	TryWriteToChannels(flushReq.doneChans, nil)
 }
 
@@ -711,17 +722,19 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 	tokenFilter *bloom.BloomFilter,
 	fieldTokenFilter *bloom.BloomFilter,
 	condition *BloomCondition,
-) bool {
+) (result bool) {
 	switch condition.Type {
 	case BloomField:
-		return fieldFilter.TestString(condition.Field)
+		result = fieldFilter.TestString(condition.Field)
 	case BloomToken:
-		return tokenFilter.TestString(condition.Token)
+		result = tokenFilter.TestString(condition.Token)
 	case BloomFieldToken:
-		return fieldTokenFilter.TestString(makeFieldTokenKey(condition.Field, condition.Token))
+		key := makeFieldTokenKey(condition.Field, condition.Token)
+		result = fieldTokenFilter.TestString(key)
 	default:
-		return false // We don't know what this is, so it's invalid
+		result = false // We don't know what this is, so it's invalid
 	}
+	return
 }
 
 // Query executes a query and sends results to the provided channels.
@@ -940,250 +953,198 @@ func (b *BloomSearchEngine) processDataBlock(
 
 // merge will evaluate and merge data files to optimize query performance.
 func (b *BloomSearchEngine) merge(ctx context.Context) error {
-	// We want to get all files so we can evaluate them for merges
+	// Get all files for evaluation
 	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, nil)
 	if err != nil {
 		return err
 	}
 
-	var allDataBlocks []DataBlockMetadata
+	fmt.Printf("Found %d files for merge evaluation\n", len(maybeFiles))
+
+	// Convert to merge candidates with file-level statistics
+	var mergeCandidates []fileMergeCandidate
 	for _, maybeFile := range maybeFiles {
-		allDataBlocks = append(allDataBlocks, maybeFile.Metadata.DataBlocks...)
+		candidate := fileMergeCandidate{
+			filePointer: maybeFile.PointerBytes,
+			metadata:    maybeFile.Metadata,
+			statistics:  b.calculateFileStatistics(maybeFile.Metadata),
+		}
+		mergeCandidates = append(mergeCandidates, candidate)
 	}
 
-	fmt.Println("BEFORE SORTING:")
-	for i, block := range allDataBlocks {
-		fmt.Printf("  [%d] Partition: %s, Size: %d, Rows: %d, HasMinMax: %v",
-			i, block.PartitionID, block.Size, block.Rows, len(block.MinMaxIndexes) > 0)
-		if len(block.MinMaxIndexes) > 0 {
-			fmt.Printf(", MinMax: %v", block.MinMaxIndexes)
-		}
-		fmt.Println()
-	}
+	// Group files into merge groups (this handles sorting internally)
+	mergeGroups := b.identifyFileMergeGroups(mergeCandidates)
 
-	// Sort them for good merge groupings
-	sort.Slice(allDataBlocks, func(i, j int) bool {
-		blockA, blockB := allDataBlocks[i], allDataBlocks[j]
+	fmt.Println("\nFILE MERGE GROUPS:")
+	mergeGroupCount := 0
+	totalMergeFiles := 0
 
-		// First sort by partition ID - cannot mix partitions
-		if blockA.PartitionID != blockB.PartitionID {
-			return blockA.PartitionID < blockB.PartitionID
-		}
-
-		// Within same partition, prefer blocks with MinMax indexes
-		// This allows blocks with indexes to be grouped together for better range optimization
-		aHasMinMax := len(blockA.MinMaxIndexes) > 0
-		bHasMinMax := len(blockB.MinMaxIndexes) > 0
-
-		if aHasMinMax && !bHasMinMax {
-			return true
-		}
-		if !aHasMinMax && bHasMinMax {
-			return false
-		}
-
-		// If both have MinMax indexes, sort by configured MinMax fields in order
-		// This groups blocks with similar/overlapping ranges together for tighter merged ranges
-		if aHasMinMax && bHasMinMax {
-			for _, field := range b.config.MinMaxIndexes {
-				aIndex, aExists := blockA.MinMaxIndexes[field]
-				bIndex, bExists := blockB.MinMaxIndexes[field]
-
-				if aExists && bExists {
-					// Sort by min value first to group overlapping ranges
-					if aIndex.Min != bIndex.Min {
-						return aIndex.Min < bIndex.Min
-					}
-					// If min values are equal, sort by max value
-					if aIndex.Max != bIndex.Max {
-						return aIndex.Max < bIndex.Max
-					}
-				}
-			}
-		}
-
-		// If everything else is equal, sort by size (smaller first for better packing)
-		// This helps when scanning for merge groups that fit within size limits
-		return blockA.Size < blockB.Size
-	})
-
-	fmt.Println("\nAFTER SORTING:")
-	for i, block := range allDataBlocks {
-		fmt.Printf("  [%d] Partition: %s, Size: %d, Rows: %d, HasMinMax: %v",
-			i, block.PartitionID, block.Size, block.Rows, len(block.MinMaxIndexes) > 0)
-		if len(block.MinMaxIndexes) > 0 {
-			fmt.Printf(", MinMax: %v", block.MinMaxIndexes)
-		}
-		fmt.Println()
-	}
-
-	fmt.Println("\nMERGE GROUPING:")
-
-	// Group blocks into merge groups
-	mergeGroups := b.identifyMergeGroups(allDataBlocks)
-
-	for i, group := range mergeGroups {
-		fmt.Printf("  Group %d: %d blocks, Partition: %s, TotalSize: %d, TotalRows: %d\n",
-			i, len(group), group[0].PartitionID,
-			sumBlocksSize(group), sumBlocksRows(group))
-
-		for j, block := range group {
-			fmt.Printf("    Block %d: Size=%d, Rows=%d", j, block.Size, block.Rows)
-			if len(block.MinMaxIndexes) > 0 {
-				fmt.Printf(", MinMax=%v", block.MinMaxIndexes)
-			}
-			fmt.Println()
-		}
-	}
-
-	fmt.Println("\nFILE GROUPING:")
-
-	// Group merge groups into files
-	fileGroups := b.identifyFileGroups(mergeGroups)
-
-	for i, fileGroup := range fileGroups {
+	// Show actual merge groups (multiple files)
+	for _, group := range mergeGroups {
 		totalSize := 0
 		totalRows := 0
 		totalBlocks := 0
-		for _, group := range fileGroup {
-			totalSize += sumBlocksSize(group)
-			totalRows += sumBlocksRows(group)
-			totalBlocks += len(group)
+		allPartitions := make(map[string]bool)
+
+		for _, candidate := range group {
+			totalSize += candidate.statistics.totalSize
+			totalRows += candidate.statistics.totalRows
+			totalBlocks += candidate.statistics.blockCount
+			for _, partitionID := range candidate.statistics.partitionIDs {
+				allPartitions[partitionID] = true
+			}
 		}
 
-		fmt.Printf("  File %d: %d merge groups, %d total blocks, TotalSize: %d, TotalRows: %d\n",
-			i, len(fileGroup), totalBlocks, totalSize, totalRows)
+		partitionList := make([]string, 0, len(allPartitions))
+		for partitionID := range allPartitions {
+			partitionList = append(partitionList, partitionID)
+		}
 
-		for j, group := range fileGroup {
-			fmt.Printf("    Group %d: %d blocks, Partition: %s, Size: %d, Rows: %d\n",
-				j, len(group), group[0].PartitionID,
-				sumBlocksSize(group), sumBlocksRows(group))
+		fmt.Printf("  Group %d: %d files, Partitions: %v, TotalSize: %d, TotalRows: %d, TotalBlocks: %d\n",
+			mergeGroupCount, len(group), partitionList, totalSize, totalRows, totalBlocks)
+		mergeGroupCount++
+		totalMergeFiles += len(group)
+	}
+
+	// Show remaining single files that won't be merged
+	singleFileCount := 0
+	for _, candidate := range mergeCandidates {
+		// Check if this file is already in a merge group
+		inMergeGroup := false
+		for _, group := range mergeGroups {
+			for _, groupFile := range group {
+				if string(candidate.filePointer) == string(groupFile.filePointer) {
+					inMergeGroup = true
+					break
+				}
+			}
+			if inMergeGroup {
+				break
+			}
+		}
+
+		if !inMergeGroup {
+			fmt.Printf("  Single file %d: Partitions: %v, TotalSize: %d, TotalRows: %d, TotalBlocks: %d\n",
+				singleFileCount, candidate.statistics.partitionIDs, candidate.statistics.totalSize,
+				candidate.statistics.totalRows, candidate.statistics.blockCount)
+			singleFileCount++
 		}
 	}
 
-	// TODO: Write out the new files, with each file written, calling an update to the metastore
-	// TODO: when merging
+	fmt.Printf("\nSUMMARY: %d merge groups (%d files), %d single files, %d total files\n",
+		len(mergeGroups), totalMergeFiles, singleFileCount, len(mergeCandidates))
+
+	// TODO: Execute merges by reading entire files and writing new merged files
+	// TODO: Update metastore to replace old files with new merged files
 
 	return nil
 }
 
-// identifyMergeGroups groups blocks that can be merged together based on partition and size constraints
-func (b *BloomSearchEngine) identifyMergeGroups(sortedBlocks []DataBlockMetadata) [][]DataBlockMetadata {
-	var mergeGroups [][]DataBlockMetadata
+// fileMergeCandidate represents a file that could be merged
+type fileMergeCandidate struct {
+	filePointer []byte
+	metadata    FileMetadata
+	statistics  fileStatistics
+}
 
-	if len(sortedBlocks) == 0 {
-		return mergeGroups
+// fileStatistics contains pre-calculated statistics about a file
+type fileStatistics struct {
+	partitionIDs []string
+	totalSize    int
+	totalRows    int
+	blockCount   int
+}
+
+// calculateFileStatistics computes basic statistics for a file
+func (b *BloomSearchEngine) calculateFileStatistics(metadata FileMetadata) fileStatistics {
+	stats := fileStatistics{
+		partitionIDs: make([]string, 0),
 	}
 
-	currentGroup := []DataBlockMetadata{}
-	currentGroupSize := 0
-	currentGroupRows := 0
-	currentPartition := ""
+	partitionSet := make(map[string]bool)
 
-	for _, block := range sortedBlocks {
-		// Start a new group if partition changes
-		if currentPartition != block.PartitionID {
-			// Finish current group if it has blocks
-			if len(currentGroup) > 0 {
-				mergeGroups = append(mergeGroups, currentGroup)
-			}
+	for _, block := range metadata.DataBlocks {
+		// Track unique partitions
+		if !partitionSet[block.PartitionID] {
+			partitionSet[block.PartitionID] = true
+			stats.partitionIDs = append(stats.partitionIDs, block.PartitionID)
+		}
 
-			// Start new group
-			currentGroup = []DataBlockMetadata{block}
-			currentGroupSize = block.Size
-			currentGroupRows = block.Rows
-			currentPartition = block.PartitionID
+		// Accumulate totals
+		stats.totalSize += block.Size
+		stats.totalRows += block.Rows
+		stats.blockCount++
+	}
+
+	// Sort partition IDs for consistent ordering
+	sort.Strings(stats.partitionIDs)
+
+	return stats
+}
+
+// identifyFileMergeGroups groups files that should be merged together
+func (b *BloomSearchEngine) identifyFileMergeGroups(files []fileMergeCandidate) [][]fileMergeCandidate {
+	if len(files) == 0 {
+		return nil
+	}
+
+	// Sort files by size first, then by partition for better data locality
+	sort.Slice(files, func(i, j int) bool {
+		a, b := files[i], files[j]
+
+		// Primary: Sort by size (smaller first for better packing)
+		if a.statistics.totalSize != b.statistics.totalSize {
+			return a.statistics.totalSize < b.statistics.totalSize
+		}
+
+		// Secondary: Sort by first partition for data locality
+		// This groups similar partitions together when sizes are equal
+		aPartition := ""
+		if len(a.statistics.partitionIDs) > 0 {
+			aPartition = a.statistics.partitionIDs[0]
+		}
+		bPartition := ""
+		if len(b.statistics.partitionIDs) > 0 {
+			bPartition = b.statistics.partitionIDs[0]
+		}
+
+		return aPartition < bPartition
+	})
+
+	var mergeGroups [][]fileMergeCandidate
+	used := make(map[int]bool)
+
+	// Simple greedy approach: try to pack files efficiently
+	for i, file := range files {
+		if used[i] {
 			continue
 		}
 
-		// Check if adding this block would exceed limits
-		newSize := currentGroupSize + block.Size
-		newRows := currentGroupRows + block.Rows
+		currentGroup := []fileMergeCandidate{file}
+		currentGroupSize := file.statistics.totalSize
+		used[i] = true
 
-		if newSize > b.config.MaxRowGroupBytes || newRows > b.config.MaxRowGroupRows {
-			// Current group is full, start a new one
-			mergeGroups = append(mergeGroups, currentGroup)
-			currentGroup = []DataBlockMetadata{block}
-			currentGroupSize = block.Size
-			currentGroupRows = block.Rows
-		} else {
-			currentGroup = append(currentGroup, block)
-			currentGroupSize = newSize
-			currentGroupRows = newRows
+		// Add compatible files to this group
+		for j := i + 1; j < len(files); j++ {
+			if used[j] {
+				continue
+			}
+
+			candidate := files[j]
+			newSize := currentGroupSize + candidate.statistics.totalSize
+
+			if newSize <= b.config.MaxFileSize {
+				currentGroup = append(currentGroup, candidate)
+				currentGroupSize = newSize
+				used[j] = true
+			}
 		}
-	}
 
-	// Don't forget the last group
-	if len(currentGroup) > 0 {
-		mergeGroups = append(mergeGroups, currentGroup)
+		// Only add groups with multiple files
+		if len(currentGroup) > 1 {
+			mergeGroups = append(mergeGroups, currentGroup)
+		}
 	}
 
 	return mergeGroups
-}
-
-// sumBlocksSize calculates the total size of a group of blocks
-func sumBlocksSize(blocks []DataBlockMetadata) int {
-	total := 0
-	for _, block := range blocks {
-		total += block.Size
-	}
-	return total
-}
-
-// sumBlocksRows calculates the total rows of a group of blocks
-func sumBlocksRows(blocks []DataBlockMetadata) int {
-	total := 0
-	for _, block := range blocks {
-		total += block.Rows
-	}
-	return total
-}
-
-// identifyFileGroups groups merge groups into files based on MaxFileSize constraint
-func (b *BloomSearchEngine) identifyFileGroups(mergeGroups [][]DataBlockMetadata) [][][]DataBlockMetadata {
-	var fileGroups [][][]DataBlockMetadata
-
-	if len(mergeGroups) == 0 {
-		return fileGroups
-	}
-
-	currentFileGroups := [][]DataBlockMetadata{}
-	currentFileSize := 0
-
-	for _, group := range mergeGroups {
-		groupSize := sumBlocksSize(group)
-
-		// If this group alone exceeds MaxFileSize, it goes into its own file
-		if groupSize > b.config.MaxFileSize {
-			// First, finish the current file if it has groups
-			if len(currentFileGroups) > 0 {
-				fileGroups = append(fileGroups, currentFileGroups)
-				currentFileGroups = [][]DataBlockMetadata{}
-				currentFileSize = 0
-			}
-
-			// Put the large group in its own file
-			fileGroups = append(fileGroups, [][]DataBlockMetadata{group})
-			continue
-		}
-
-		// Check if adding this group would exceed MaxFileSize
-		if currentFileSize+groupSize > b.config.MaxFileSize {
-			// Current file is full, start a new one
-			fileGroups = append(fileGroups, currentFileGroups)
-			currentFileGroups = [][]DataBlockMetadata{group}
-			currentFileSize = groupSize
-		} else {
-			// Add to current file
-			currentFileGroups = append(currentFileGroups, group)
-			currentFileSize += groupSize
-		}
-	}
-
-	// Don't forget the last file
-	if len(currentFileGroups) > 0 {
-		fileGroups = append(fileGroups, currentFileGroups)
-	}
-
-	return fileGroups
 }

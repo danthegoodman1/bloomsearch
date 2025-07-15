@@ -30,7 +30,7 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	config.MaxBufferedRows = 3                // Flush after 3 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit (won't trigger)
 	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
-	config.BloomExpectedItems = 100           // Much smaller bloom filter
+	config.FileBloomExpectedItems = 100       // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
 
 	// Create and start engine
