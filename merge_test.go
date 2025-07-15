@@ -271,6 +271,7 @@ func TestMergeWithRealEngine(t *testing.T) {
 	// Create the engine with MinMax indexes configured
 	config := DefaultBloomSearchEngineConfig()
 	config.MinMaxIndexes = []string{"timestamp", "user_id"}
+	config.MaxFileSize = 2000 // Set a smaller file size limit (will be used at file level, not merge group level)
 
 	engine, err := NewBloomSearchEngine(config, metaStore, &NullDataStore{})
 	if err != nil {
@@ -285,15 +286,4 @@ func TestMergeWithRealEngine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Merge failed: %v", err)
 	}
-
-	fmt.Println("\n=== EXPECTED BEHAVIOR ===")
-	fmt.Println("1. Partitions should be sorted alphabetically: '' < 'partition_a' < 'partition_b' < 'partition_unique_x' < 'partition_unique_y'")
-	fmt.Println("2. Within each partition, blocks with MinMax indexes should come first")
-	fmt.Println("3. Blocks with MinMax indexes should be sorted by timestamp (then user_id)")
-	fmt.Println("4. When MinMax values are equal, smaller blocks should come first")
-	fmt.Println("5. Edge cases tested:")
-	fmt.Println("   - No partition ID (empty string) - should be sorted first")
-	fmt.Println("   - Unique partition IDs - should each get their own group")
-	fmt.Println("   - Multiple blocks with same timestamp ranges - should be sorted by user_id")
-	fmt.Println("   - Mix of blocks with and without MinMax indexes")
 }

@@ -82,6 +82,7 @@ type BloomSearchEngineConfig struct {
 
 	MaxRowGroupBytes int
 	MaxRowGroupRows  int
+	MaxFileSize      int
 
 	MaxBufferedRows  int
 	MaxBufferedBytes int
@@ -113,6 +114,7 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 
 		MaxRowGroupBytes: 10 * 1024 * 1024,
 		MaxRowGroupRows:  10000,
+		MaxFileSize:      10 * 1024 * 1024 * 1024,
 
 		MaxBufferedRows:  1000,
 		MaxBufferedBytes: 1 * 1024 * 1024,
@@ -1034,6 +1036,8 @@ func (b *BloomSearchEngine) merge(ctx context.Context) error {
 		}
 	}
 
+	// TODO: Create new files with merge groups, respective MaxFileSize
+
 	return nil
 }
 
@@ -1077,7 +1081,6 @@ func (b *BloomSearchEngine) identifyMergeGroups(sortedBlocks []DataBlockMetadata
 			currentGroupSize = block.Size
 			currentGroupRows = block.Rows
 		} else {
-			// Add to current group
 			currentGroup = append(currentGroup, block)
 			currentGroupSize = newSize
 			currentGroupRows = newRows
