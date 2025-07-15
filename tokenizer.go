@@ -71,22 +71,22 @@ func collectPathsAndValues(obj any, prefix string, pathValues map[string]map[str
 // ValueTokenizerFunc is a function that tokenizes a field value into a list of tokens
 type ValueTokenizerFunc func(value any) []string
 
-// BasicWhitespaceTokenizer tokenizes values by splitting on whitespace
-func BasicWhitespaceTokenizer(value any) []string {
+// BasicWhitespaceLowerTokenizer tokenizes values by splitting on whitespace and converting to lowercase
+func BasicWhitespaceLowerTokenizer(value any) []string {
 	// If the value is not a string, return the recursive call of its string representation
 	if str, ok := value.(string); ok {
 		// Split on whitespace and filter out empty strings
-		tokens := strings.Fields(str)
+		tokens := strings.Fields(strings.ToLower(str))
 		return tokens
 	}
 
 	// Convert value to string and recursively call BasicTokenizer
-	return BasicWhitespaceTokenizer(fmt.Sprintf("%v", value))
+	return BasicWhitespaceLowerTokenizer(fmt.Sprintf("%v", value))
 }
 
 func init() {
 	// Test that BasicTokenizer implements ValueTokenizerFunc
-	var _ ValueTokenizerFunc = BasicWhitespaceTokenizer
+	var _ ValueTokenizerFunc = BasicWhitespaceLowerTokenizer
 }
 
 // TestJSONForField tests if a field path exists in JSON, handling arrays by walking them

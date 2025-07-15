@@ -114,7 +114,7 @@ type partitionBuffer struct {
 
 func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 	return BloomSearchEngineConfig{
-		Tokenizer: BasicWhitespaceTokenizer,
+		Tokenizer: BasicWhitespaceLowerTokenizer,
 
 		MaxRowGroupBytes: 10 * 1024 * 1024,
 		MaxRowGroupRows:  10000,
