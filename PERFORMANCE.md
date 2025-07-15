@@ -4,6 +4,8 @@
 
 M3 Max 128GB, 1.6GB dataset (~167MB per file * 10)
 
+Random 00-09 partitions, no minmax indexes, testing FileStore for DataStore + MetaStore
+
 ### Token search
 
 Search for `apple` as a token in any field:
