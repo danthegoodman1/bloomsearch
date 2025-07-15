@@ -213,6 +213,8 @@ Merging files reduces metadata operations (file opens, bloom filter tests) and i
 
 Bloom filters of the same size can be trivially merged by OR-ing their bits. If bloom filter parameters change, the system rebuilds filters from raw data during merge.
 
+The current merge algorithm is not designed to be perfectly optimal, it's designed to be pretty good, and very fast.
+
 #### Coordinated Merges
 
 Multiple concurrent writers need coordination to avoid conflicts. A `CoordinatedMetaStore` can expose lease methods, enabling multiple writers and background merge processes to work together safely.

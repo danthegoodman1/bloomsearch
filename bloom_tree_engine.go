@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -746,14 +747,13 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 //	  }
 //	}
 func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan chan<- map[string]any, errorChan chan<- error, statsChan chan<- BlockStats) error {
-	// Get maybe files from meta store
 	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 	if err != nil {
 		return err
 	}
 
-	// Test file-level bloom filters - use concurrency only when beneficial
-	const concurrencyThreshold = 20 // Minimum files to justify concurrency overhead
+	// Test file-level bloom filters, using concurrency only above a threshold
+	const concurrencyThreshold = 20
 
 	var matchingFiles []MaybeFile
 	if len(maybeFiles) < concurrencyThreshold {
@@ -779,13 +779,11 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 			go func(maybeFile MaybeFile) {
 				defer fileWg.Done()
 
-				// Acquire global semaphore
 				if err := SendWithContext(ctx, b.querySemaphore, struct{}{}); err != nil {
-					return // Context cancelled while waiting for semaphore
+					return
 				}
 				defer func() { <-b.querySemaphore }()
 
-				// Test the file-level bloom filters
 				if b.evaluateBloomFilters(
 					maybeFile.Metadata.FieldBloomFilter,
 					maybeFile.Metadata.TokenBloomFilter,
@@ -802,13 +800,11 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 			close(matchingFilesChan) // close to tell the range below to stop
 		}()
 
-		// Collect matching files
 		for matchingFile := range matchingFilesChan {
 			matchingFiles = append(matchingFiles, matchingFile)
 		}
 	}
 
-	// Collect all data blocks from all files to process concurrently
 	var allJobs []dataBlockJob
 	for _, matchingFile := range matchingFiles {
 		for _, blockMetadata := range matchingFile.Metadata.DataBlocks {
@@ -819,7 +815,6 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 		}
 	}
 
-	// Start worker goroutines - one for each data block
 	var wg sync.WaitGroup
 	workerCtx, workerCancel := context.WithCancel(ctx)
 	for _, job := range allJobs {
@@ -827,9 +822,8 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 		go func(job dataBlockJob) {
 			defer wg.Done()
 
-			// Acquire global semaphore
 			if err := SendWithContext(workerCtx, b.querySemaphore, struct{}{}); err != nil {
-				return // Context cancelled while waiting for semaphore
+				return
 			}
 			defer func() { <-b.querySemaphore }()
 
@@ -839,7 +833,7 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 
 	// Close result channel when all workers are done
 	go func() {
-		defer workerCancel() // Cancel worker context when done
+		defer workerCancel()
 		wg.Wait()
 		close(resultChan) // closing this indicates that all workers are done, and no more errors can come either
 	}()
@@ -877,7 +871,6 @@ func (b *BloomSearchEngine) processDataBlock(
 
 		TryWriteChannel(statsChan, blockStats)
 	}()
-	// Open the file for reading
 	file, err := b.dataStore.OpenFile(ctx, job.filePointer)
 	if err != nil {
 		SendWithContext(ctx, errorChan, fmt.Errorf("failed to open file: %w", err))
@@ -885,14 +878,12 @@ func (b *BloomSearchEngine) processDataBlock(
 	}
 	defer file.Close()
 
-	// Read the data block bloom filters
 	blockBloomFilters, err := ReadDataBlockBloomFilters(file, job.blockMetadata)
 	if err != nil {
 		SendWithContext(ctx, errorChan, fmt.Errorf("failed to read data block bloom filters: %w", err))
 		return
 	}
 
-	// Test the data block bloom filters against the query
 	if !b.evaluateBloomFilters(
 		blockBloomFilters.FieldBloomFilter,
 		blockBloomFilters.TokenBloomFilter,
@@ -903,19 +894,15 @@ func (b *BloomSearchEngine) processDataBlock(
 		return
 	}
 
-	// Read rows from this data block as raw bytes
-	// Seek to the start of row data (after bloom filters)
 	rowDataOffset := int64(job.blockMetadata.Offset + job.blockMetadata.BloomFiltersSize)
 	if _, err := file.Seek(rowDataOffset, 0); err != nil {
 		SendWithContext(ctx, errorChan, fmt.Errorf("failed to seek to row data: %w", err))
 		return
 	}
 
-	// Calculate the size of row data (excluding the final data block hash)
 	rowGroupSize := job.blockMetadata.Size - job.blockMetadata.BloomFiltersSize - HashSize
 
 	for bytesRead := 0; bytesRead < rowGroupSize; {
-		// Read the row length prefix (uint32)
 		lengthBytes := make([]byte, LengthPrefixSize)
 		if _, err := file.Read(lengthBytes); err != nil {
 			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row length: %w", err))
@@ -923,10 +910,8 @@ func (b *BloomSearchEngine) processDataBlock(
 		}
 		bytesRead += LengthPrefixSize
 
-		// Extract the row length
 		rowLength := binary.LittleEndian.Uint32(lengthBytes)
 
-		// Read the row data as raw bytes
 		rowData := make([]byte, rowLength)
 		if _, err := file.Read(rowData); err != nil {
 			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row data: %w", err))
@@ -934,7 +919,6 @@ func (b *BloomSearchEngine) processDataBlock(
 		}
 		bytesRead += int(rowLength)
 
-		// Track bytes processed for all rows, whether they match the query or not
 		bytesProcessed += int64(LengthPrefixSize + rowLength)
 		rowsProcessed++
 
@@ -950,4 +934,178 @@ func (b *BloomSearchEngine) processDataBlock(
 
 		SendWithContext(ctx, resultChan, row)
 	}
+}
+
+// merge will evaluate and merge data files to optimize query performance.
+func (b *BloomSearchEngine) merge(ctx context.Context) error {
+	// We want to get all files so we can evaluate them for merges
+	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	var allDataBlocks []DataBlockMetadata
+	for _, maybeFile := range maybeFiles {
+		allDataBlocks = append(allDataBlocks, maybeFile.Metadata.DataBlocks...)
+	}
+
+	fmt.Println("BEFORE SORTING:")
+	for i, block := range allDataBlocks {
+		fmt.Printf("  [%d] Partition: %s, Size: %d, Rows: %d, HasMinMax: %v",
+			i, block.PartitionID, block.Size, block.Rows, len(block.MinMaxIndexes) > 0)
+		if len(block.MinMaxIndexes) > 0 {
+			fmt.Printf(", MinMax: %v", block.MinMaxIndexes)
+		}
+		fmt.Println()
+	}
+
+	// Sort them for good merge groupings
+	sort.Slice(allDataBlocks, func(i, j int) bool {
+		blockA, blockB := allDataBlocks[i], allDataBlocks[j]
+
+		// First sort by partition ID - cannot mix partitions
+		if blockA.PartitionID != blockB.PartitionID {
+			return blockA.PartitionID < blockB.PartitionID
+		}
+
+		// Within same partition, prefer blocks with MinMax indexes
+		// This allows blocks with indexes to be grouped together for better range optimization
+		aHasMinMax := len(blockA.MinMaxIndexes) > 0
+		bHasMinMax := len(blockB.MinMaxIndexes) > 0
+
+		if aHasMinMax && !bHasMinMax {
+			return true
+		}
+		if !aHasMinMax && bHasMinMax {
+			return false
+		}
+
+		// If both have MinMax indexes, sort by configured MinMax fields in order
+		// This groups blocks with similar/overlapping ranges together for tighter merged ranges
+		if aHasMinMax && bHasMinMax {
+			for _, field := range b.config.MinMaxIndexes {
+				aIndex, aExists := blockA.MinMaxIndexes[field]
+				bIndex, bExists := blockB.MinMaxIndexes[field]
+
+				if aExists && bExists {
+					// Sort by min value first to group overlapping ranges
+					if aIndex.Min != bIndex.Min {
+						return aIndex.Min < bIndex.Min
+					}
+					// If min values are equal, sort by max value
+					if aIndex.Max != bIndex.Max {
+						return aIndex.Max < bIndex.Max
+					}
+				}
+			}
+		}
+
+		// If everything else is equal, sort by size (smaller first for better packing)
+		// This helps when scanning for merge groups that fit within size limits
+		return blockA.Size < blockB.Size
+	})
+
+	fmt.Println("\nAFTER SORTING:")
+	for i, block := range allDataBlocks {
+		fmt.Printf("  [%d] Partition: %s, Size: %d, Rows: %d, HasMinMax: %v",
+			i, block.PartitionID, block.Size, block.Rows, len(block.MinMaxIndexes) > 0)
+		if len(block.MinMaxIndexes) > 0 {
+			fmt.Printf(", MinMax: %v", block.MinMaxIndexes)
+		}
+		fmt.Println()
+	}
+
+	fmt.Println("\nMERGE GROUPING:")
+
+	// Group blocks into merge groups
+	mergeGroups := b.identifyMergeGroups(allDataBlocks)
+
+	for i, group := range mergeGroups {
+		fmt.Printf("  Group %d: %d blocks, Partition: %s, TotalSize: %d, TotalRows: %d\n",
+			i, len(group), group[0].PartitionID,
+			sumBlocksSize(group), sumBlocksRows(group))
+
+		for j, block := range group {
+			fmt.Printf("    Block %d: Size=%d, Rows=%d", j, block.Size, block.Rows)
+			if len(block.MinMaxIndexes) > 0 {
+				fmt.Printf(", MinMax=%v", block.MinMaxIndexes)
+			}
+			fmt.Println()
+		}
+	}
+
+	return nil
+}
+
+// identifyMergeGroups groups blocks that can be merged together based on partition and size constraints
+func (b *BloomSearchEngine) identifyMergeGroups(sortedBlocks []DataBlockMetadata) [][]DataBlockMetadata {
+	var mergeGroups [][]DataBlockMetadata
+
+	if len(sortedBlocks) == 0 {
+		return mergeGroups
+	}
+
+	currentGroup := []DataBlockMetadata{}
+	currentGroupSize := 0
+	currentGroupRows := 0
+	currentPartition := ""
+
+	for _, block := range sortedBlocks {
+		// Start a new group if partition changes
+		if currentPartition != block.PartitionID {
+			// Finish current group if it has blocks
+			if len(currentGroup) > 0 {
+				mergeGroups = append(mergeGroups, currentGroup)
+			}
+
+			// Start new group
+			currentGroup = []DataBlockMetadata{block}
+			currentGroupSize = block.Size
+			currentGroupRows = block.Rows
+			currentPartition = block.PartitionID
+			continue
+		}
+
+		// Check if adding this block would exceed limits
+		newSize := currentGroupSize + block.Size
+		newRows := currentGroupRows + block.Rows
+
+		if newSize > b.config.MaxRowGroupBytes || newRows > b.config.MaxRowGroupRows {
+			// Current group is full, start a new one
+			mergeGroups = append(mergeGroups, currentGroup)
+			currentGroup = []DataBlockMetadata{block}
+			currentGroupSize = block.Size
+			currentGroupRows = block.Rows
+		} else {
+			// Add to current group
+			currentGroup = append(currentGroup, block)
+			currentGroupSize = newSize
+			currentGroupRows = newRows
+		}
+	}
+
+	// Don't forget the last group
+	if len(currentGroup) > 0 {
+		mergeGroups = append(mergeGroups, currentGroup)
+	}
+
+	return mergeGroups
+}
+
+// sumBlocksSize calculates the total size of a group of blocks
+func sumBlocksSize(blocks []DataBlockMetadata) int {
+	total := 0
+	for _, block := range blocks {
+		total += block.Size
+	}
+	return total
+}
+
+// sumBlocksRows calculates the total rows of a group of blocks
+func sumBlocksRows(blocks []DataBlockMetadata) int {
+	total := 0
+	for _, block := range blocks {
+		total += block.Rows
+	}
+	return total
 }
