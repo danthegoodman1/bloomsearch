@@ -220,6 +220,63 @@ func TestMergeWithRealEngine(t *testing.T) {
 		},
 	}
 
+	// Add more partition_a blocks to force splitting across files
+	file8Metadata := FileMetadata{
+		FieldBloomFilter:      bloom1,
+		TokenBloomFilter:      bloom2,
+		FieldTokenBloomFilter: bloom3,
+		DataBlocks: []DataBlockMetadata{
+			{
+				PartitionID: "partition_a",
+				Offset:      0,
+				Size:        700,
+				Rows:        70,
+				MinMaxIndexes: map[string]MinMaxIndex{
+					"timestamp": {Min: 1200, Max: 1800},
+					"user_id":   {Min: 300, Max: 400},
+				},
+			},
+			{
+				PartitionID: "partition_a",
+				Offset:      700,
+				Size:        800,
+				Rows:        80,
+				MinMaxIndexes: map[string]MinMaxIndex{
+					"timestamp": {Min: 1500, Max: 2000},
+					"user_id":   {Min: 350, Max: 450},
+				},
+			},
+		},
+	}
+
+	file9Metadata := FileMetadata{
+		FieldBloomFilter:      bloom1,
+		TokenBloomFilter:      bloom2,
+		FieldTokenBloomFilter: bloom3,
+		DataBlocks: []DataBlockMetadata{
+			{
+				PartitionID: "partition_a",
+				Offset:      0,
+				Size:        600,
+				Rows:        60,
+				MinMaxIndexes: map[string]MinMaxIndex{
+					"timestamp": {Min: 1800, Max: 2200},
+					"user_id":   {Min: 400, Max: 500},
+				},
+			},
+			{
+				PartitionID: "partition_a",
+				Offset:      600,
+				Size:        750,
+				Rows:        75,
+				MinMaxIndexes: map[string]MinMaxIndex{
+					"timestamp": {Min: 2000, Max: 2500},
+					"user_id":   {Min: 450, Max: 550},
+				},
+			},
+		},
+	}
+
 	// Prepare WriteOperations array
 	writeOps := []WriteOperation{
 		{
@@ -250,6 +307,14 @@ func TestMergeWithRealEngine(t *testing.T) {
 			FileMetadata:     &file7Metadata,
 			FilePointerBytes: []byte("file7"),
 		},
+		{
+			FileMetadata:     &file8Metadata,
+			FilePointerBytes: []byte("file8"),
+		},
+		{
+			FileMetadata:     &file9Metadata,
+			FilePointerBytes: []byte("file9"),
+		},
 	}
 
 	// Shuffle the files to make the test more realistic
@@ -271,7 +336,8 @@ func TestMergeWithRealEngine(t *testing.T) {
 	// Create the engine with MinMax indexes configured
 	config := DefaultBloomSearchEngineConfig()
 	config.MinMaxIndexes = []string{"timestamp", "user_id"}
-	config.MaxFileSize = 2000 // Set a smaller file size limit (will be used at file level, not merge group level)
+	config.MaxRowGroupBytes = 4500 // Small merge group size to force splitting
+	config.MaxFileSize = 3000      // File size limit to force partition splitting across files
 
 	engine, err := NewBloomSearchEngine(config, metaStore, &NullDataStore{})
 	if err != nil {

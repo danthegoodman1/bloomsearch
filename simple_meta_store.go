@@ -5,19 +5,19 @@ import (
 	"fmt"
 )
 
-// SimpleMetaStore is a simple map-based implementation for testing
-type SimpleMetaStore struct {
+// MemoryMetaStore is a simple map-based implementation for testing
+type MemoryMetaStore struct {
 	files map[string]FileMetadata
 }
 
-func NewSimpleMetaStore() *SimpleMetaStore {
-	return &SimpleMetaStore{
+func NewSimpleMetaStore() *MemoryMetaStore {
+	return &MemoryMetaStore{
 		files: make(map[string]FileMetadata),
 	}
 }
 
 // Update implements the MetaStore interface
-func (s *SimpleMetaStore) Update(ctx context.Context, writeOps []WriteOperation, deleteOps []DeleteOperation) error {
+func (s *MemoryMetaStore) Update(ctx context.Context, writeOps []WriteOperation, deleteOps []DeleteOperation) error {
 	for _, op := range writeOps {
 		if op.FileMetadata != nil {
 			s.files[string(op.FilePointerBytes)] = *op.FileMetadata
@@ -32,7 +32,7 @@ func (s *SimpleMetaStore) Update(ctx context.Context, writeOps []WriteOperation,
 }
 
 // GetMaybeFilesForQuery implements the MetaStore interface
-func (s *SimpleMetaStore) GetMaybeFilesForQuery(ctx context.Context, prefilter *QueryPrefilter) ([]MaybeFile, error) {
+func (s *MemoryMetaStore) GetMaybeFilesForQuery(ctx context.Context, prefilter *QueryPrefilter) ([]MaybeFile, error) {
 	var result []MaybeFile
 
 	for pointer, metadata := range s.files {
@@ -46,7 +46,7 @@ func (s *SimpleMetaStore) GetMaybeFilesForQuery(ctx context.Context, prefilter *
 }
 
 // PrintFiles prints all files in the metastore for debugging
-func (s *SimpleMetaStore) PrintFiles() {
+func (s *MemoryMetaStore) PrintFiles() {
 	fmt.Println("Files in metastore:")
 	for pointer, metadata := range s.files {
 		fmt.Printf("  File: %s\n", pointer)

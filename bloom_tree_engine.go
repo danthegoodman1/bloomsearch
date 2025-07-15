@@ -1036,7 +1036,33 @@ func (b *BloomSearchEngine) merge(ctx context.Context) error {
 		}
 	}
 
-	// TODO: Create new files with merge groups, respective MaxFileSize
+	fmt.Println("\nFILE GROUPING:")
+
+	// Group merge groups into files
+	fileGroups := b.identifyFileGroups(mergeGroups)
+
+	for i, fileGroup := range fileGroups {
+		totalSize := 0
+		totalRows := 0
+		totalBlocks := 0
+		for _, group := range fileGroup {
+			totalSize += sumBlocksSize(group)
+			totalRows += sumBlocksRows(group)
+			totalBlocks += len(group)
+		}
+
+		fmt.Printf("  File %d: %d merge groups, %d total blocks, TotalSize: %d, TotalRows: %d\n",
+			i, len(fileGroup), totalBlocks, totalSize, totalRows)
+
+		for j, group := range fileGroup {
+			fmt.Printf("    Group %d: %d blocks, Partition: %s, Size: %d, Rows: %d\n",
+				j, len(group), group[0].PartitionID,
+				sumBlocksSize(group), sumBlocksRows(group))
+		}
+	}
+
+	// TODO: Write out the new files, with each file written, calling an update to the metastore
+	// TODO: when merging
 
 	return nil
 }
@@ -1111,4 +1137,53 @@ func sumBlocksRows(blocks []DataBlockMetadata) int {
 		total += block.Rows
 	}
 	return total
+}
+
+// identifyFileGroups groups merge groups into files based on MaxFileSize constraint
+func (b *BloomSearchEngine) identifyFileGroups(mergeGroups [][]DataBlockMetadata) [][][]DataBlockMetadata {
+	var fileGroups [][][]DataBlockMetadata
+
+	if len(mergeGroups) == 0 {
+		return fileGroups
+	}
+
+	currentFileGroups := [][]DataBlockMetadata{}
+	currentFileSize := 0
+
+	for _, group := range mergeGroups {
+		groupSize := sumBlocksSize(group)
+
+		// If this group alone exceeds MaxFileSize, it goes into its own file
+		if groupSize > b.config.MaxFileSize {
+			// First, finish the current file if it has groups
+			if len(currentFileGroups) > 0 {
+				fileGroups = append(fileGroups, currentFileGroups)
+				currentFileGroups = [][]DataBlockMetadata{}
+				currentFileSize = 0
+			}
+
+			// Put the large group in its own file
+			fileGroups = append(fileGroups, [][]DataBlockMetadata{group})
+			continue
+		}
+
+		// Check if adding this group would exceed MaxFileSize
+		if currentFileSize+groupSize > b.config.MaxFileSize {
+			// Current file is full, start a new one
+			fileGroups = append(fileGroups, currentFileGroups)
+			currentFileGroups = [][]DataBlockMetadata{group}
+			currentFileSize = groupSize
+		} else {
+			// Add to current file
+			currentFileGroups = append(currentFileGroups, group)
+			currentFileSize += groupSize
+		}
+	}
+
+	// Don't forget the last file
+	if len(currentFileGroups) > 0 {
+		fileGroups = append(fileGroups, currentFileGroups)
+	}
+
+	return fileGroups
 }
