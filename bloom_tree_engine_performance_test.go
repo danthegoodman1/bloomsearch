@@ -33,7 +33,7 @@ func TestGenerateSyntheticData(t *testing.T) {
 
 	config.MaxRowGroupBytes = 10 * 1024 * 1024 // 10MB row groups
 	// config.MaxRowGroupBytes = 1 * 1024 * 1024 * 1024 // 1GB row groups (for 100GB test)
-	config.MaxRowGroupRows = 10000 // Very large row limit (ensure byte limit hits first)
+	config.MaxRowGroupRows = 1000000 // Very large row limit (ensure byte limit hits first)
 	// config.MaxRowGroupRows = 1000000                 // Large row limit (for 100GB test)
 
 	// Set buffering to trigger on row group size, not buffer limits
@@ -441,7 +441,6 @@ func TestQueryPerformance(t *testing.T) {
 				for i, result := range allResults {
 					resultJSON, _ := json.MarshalIndent(result, "", "  ")
 					fmt.Printf("Result %d: %s\n", i+1, string(resultJSON))
-					fmt.Println(UniqueFields(result, "."))
 				}
 			} else {
 				fmt.Printf("\n--- No Results Found ---\n")
