@@ -237,9 +237,11 @@ func (b *BloomSearchEngine) Flush(ctx context.Context) error {
 		// Wait for flush to complete (once committed, let it finish)
 		return <-doneChan
 	case <-ctx.Done():
+		req.reset()
 		b.requestPool.Put(req)
 		return ctx.Err()
 	case <-b.ctx.Done():
+		req.reset()
 		b.requestPool.Put(req)
 		return context.Canceled
 	}
