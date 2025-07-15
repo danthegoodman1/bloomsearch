@@ -12,6 +12,8 @@ BloomSearch provides extremely low memory usage and low cold-start searches thro
 
 Perfect for logs, JSON documents, and high-cardinality keyword search.
 
+
+
 ## Quick start
 
 ```bash
@@ -95,6 +97,7 @@ See tests for complete working examples, including partitioning and minmax index
   - [MetaStore](#metastore)
   - [Write path](#write-path)
   - [Query path](#query-path)
+- [Performance](#performance)
 - [Contributing](#contributing)
 
 ## Concepts
@@ -326,6 +329,10 @@ processor reads the row group one row at a time, allowing to stream matches back
 This enables processing of arbitrarily large results as well.
 
 When the `resultChan` closes, there are no more active row group processors, and the caller can exit.
+
+## Performance
+
+See [`PERFORMANCE.md`](/PERFORMANCE.md)
 
 ## Contributing
 
