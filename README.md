@@ -288,6 +288,9 @@ Advanced implementations using databases can pre-filter partition IDs and minmax
 
 Configurable flush triggers: row count, byte size, or time-based.
 
+Buffering is done in a single thread to remove lock content, and at flush time spawns off a dedicated goroutine for writing the buffers. This means
+that flushing has no impact on ingestion performance.
+
 ### Query path
 
 Query flow for `field`, `token`, or `field:token` combinations:
