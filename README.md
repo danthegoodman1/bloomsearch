@@ -257,8 +257,8 @@ Handles file metadata storage and query pre-filtering:
 
 ```go
 type MetaStore interface {
-    GetMaybeFilesForQuery(ctx context.Context, query *QueryCondition) ([]MaybeFile, error)
-    WriteFileMetadata(ctx context.Context, fileMetadata *FileMetadata, filePointerBytes []byte) error
+    GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error)
+    Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error
 }
 ```
 
