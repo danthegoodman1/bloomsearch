@@ -91,12 +91,13 @@ See tests for complete working examples, including partitioning and minmax index
     - [Partitions](#partitions)
     - [MinMax Indexes](#minmax-indexes)
   - [Merging](#merging)
-    - [Coordinated Merges](#coordinated-merges)
+    - [Coordinated Merges (issue)](#coordinated-merges-issue)
     - [TTLs](#ttls)
   - [DataStore](#datastore)
   - [MetaStore](#metastore)
   - [Write path](#write-path)
   - [Query path](#query-path)
+    - [Distributed Query Processing (issue)](#distributed-query-processing-issue)
 - [Performance](#performance)
 - [Contributing](#contributing)
 
@@ -228,7 +229,7 @@ This does mean that we do have to build file-level bloom filters at ingest time,
 
 The current merge algorithm is not designed to be perfectly optimal, it's designed to be pretty good, and very fast.
 
-#### Coordinated Merges
+#### Coordinated Merges ([issue](https://github.com/danthegoodman1/bloomsearch/issues/19))
 
 Multiple concurrent writers need coordination to avoid conflicts. A `CoordinatedMetaStore` can expose lease methods, enabling multiple writers and background merge processes to work together safely.
 
@@ -270,7 +271,7 @@ Advanced implementations using databases can pre-filter partition IDs and minmax
 
 ```
 ┌─────────────┐    ┌─────────────────┐    ┌──────────────┐
-│   Ingest    │ ──►│   Buffer        │ ──►│   Flush      │
+│1. Ingest    │ ──►│2. Buffer        │ ──►│3. Flush      │
 │   Rows      │    │   • Partitions  │    │   • Create   │
 │             │    │   • Bloom       │    │     file     │
 │             │    │   • MinMax      │    │   • Stream   │
@@ -278,7 +279,7 @@ Advanced implementations using databases can pre-filter partition IDs and minmax
                                           └──────┬───────┘
                                                  │
                                           ┌──────▼───────┐
-                                          │   Finalize   │
+                                          │4. Finalize   │
                                           │   • Metadata │
                                           │   • Update   │
                                           │     stores   │
@@ -293,15 +294,15 @@ Query flow for `field`, `token`, or `field:token` combinations:
 
 ```
 ┌─────────────┐    ┌─────────────────┐    ┌──────────────┐
-│   Build     │ ──►│   Pre-filter    │ ──►│ Bloom Test   │
-│   Query     │    │  (MetaStore)    │    │ (file-level) │
+│1. Build     │ ──►│2. Pre-filter    │ ──►│3. Bloom Test │
+│   Query     │    │   (MetaStore)   │    │ (file-level) │
 │             │    │                 │    │              │
 └─────────────┘    └─────────────────┘    └──────┬───────┘
                                                  │
                                                  ▼
 ┌─────────────┐    ┌─────────────────┐    ┌──────────────┐
-│   Row       │ ◄──│   Bloom Test    │ ◄──│   Stream     │
-│   Scan      │    │  (block-level)  │    │   Blocks     │
+│6. Row       │ ◄──│5. Bloom Test    │ ◄──│4. Stream     │
+│   Scan      │    │   (block-level) │    │   Blocks     │
 │             │    │                 │    │              │
 └─────────────┘    └─────────────────┘    └──────────────┘
 ```
@@ -329,6 +330,29 @@ processor reads the row group one row at a time, allowing to stream matches back
 This enables processing of arbitrarily large results as well.
 
 When the `resultChan` closes, there are no more active row group processors, and the caller can exit.
+
+#### Distributed Query Processing ([issue](https://github.com/danthegoodman1/bloomsearch/issues/14))
+
+Query processing naturally decomposes into independent row group tasks that can be distributed across multiple nodes. Since results are streamed back asynchronously without ordering guarantees, this creates a perfectly parallelizable workload.
+
+Distributed query processing extends the existing path like this:
+
+```
+┌─────────────┐     ┌─────────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│1. Build     │ ──► │2. Pre-filter    │ ──► │3. Scatter    │ ──► │4. Peers      │ ──► │5. Stream     │
+│   Query     │     │   MetaStore     │     │   Work to    │     │   Process    │ ──► │   Results    │
+│             │     │                 │     │    Peers     │     │  Row Groups  │ ──► │   Back to    │
+└─────────────┘     └─────────────────┘     └──────────────┘     └──────────────┘ ──► │ Coordinator  │
+                                                                                      └──────────────┘
+```
+
+1. **Build Query** - Coordinator constructs the query with bloom conditions and prefilters
+2. **Pre-filter MetaStore** - Coordinator identifies candidate files using partition and MinMax indexes where possible
+3. **Scatter Work to Peers** - Coordinator distributes row group processing tasks across available peers
+4. **Peers Process Row Groups** - Each peer performs bloom filter tests and row scanning independently
+5. **Stream Results Back to Coordinator** - Peers stream matching rows directly to the coordinator via unique query IDs
+
+Peer discovery uses gossip protocol for fault tolerance, while work assignment prioritizes peers with available capacity. Each peer maintains its own connection to the coordinator for result streaming, enabling horizontal scaling without central bottlenecks.
 
 ## Performance
 
