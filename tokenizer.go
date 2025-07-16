@@ -20,11 +20,11 @@ type FieldValues struct {
 //
 // Example:
 //
-//	{"user": {"name": "John", "tags": [{"type": "admin"}, {"role": "user"}]}}
+//	{"user": {"name": "John", "tags": [{"type": "user"}, {"role": "admin"}]}}
 //
 // Returns:
 //
-//	[{Path: "user.name", Values: ["John"]}, {Path: "user.tags.type", Values: ["admin"]}, {Path: "user.tags.role", Values: ["user"]}] (with delimiter ".")
+//	[{Path: "user.name", Values: ["John"]}, {Path: "user.tags.type", Values: ["user"]}, {Path: "user.tags.role", Values: ["admin"]}] (with delimiter ".")
 func UniqueFields(row map[string]any, delimiter string) []FieldValues {
 	pathValues := make(map[string]map[string]bool)
 	collectPathsAndValues(row, "", pathValues, delimiter)
