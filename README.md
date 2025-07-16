@@ -338,12 +338,12 @@ Query processing naturally decomposes into independent row group tasks that can 
 Distributed query processing extends the existing path like this:
 
 ```
-┌──────────┐     ┌──────────────┐     ┌─────────── ┐     ┌─────────────┐     ┌─────────────┐
-│1. Build  │ ──► │2. Pre-filter │ ──► │3. Scatter  │ ──► │4. Peers     │ ──► │5. Stream    │
-│   Query  │     │   MetaStore  │     │   Work to  │     │   Process   │ ──► │   Results   │
-│          │     │              │     │    Peers   │     │  Row Groups │ ──► │   Back to   │
-└──────────┘     └──────────────┘     └─────────── ┘     └─────────────┘ ──► │ Coordinator │
-                                                                             └─────────────┘
+┌──────────┐     ┌──────────────┐     ┌───────────┐     ┌─────────────┐     ┌─────────────┐
+│1. Build  │ ──► │2. Pre-filter │ ──► │3. Scatter │ ──► │4. Peers     │ ──► │5. Stream    │
+│   Query  │     │   MetaStore  │     │   Work to │     │   Process   │ ──► │   Results   │
+│          │     │              │     │    Peers  │     │  Row Groups │ ──► │   Back to   │
+└──────────┘     └──────────────┘     └───────────┘     └─────────────┘ ──► │ Coordinator │
+                                                                            └─────────────┘
 ```
 
 1. **Build Query** - Coordinator constructs the query with bloom conditions and prefilters
