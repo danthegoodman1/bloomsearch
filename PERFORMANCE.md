@@ -1,5 +1,13 @@
 # Performance Testing
 
+I've explored using:
+
+1. Per-file concurrency instead of per-block
+2. Alterantive JSON serialization
+3. Buffered IO for the FileStore implementation
+
+And did not see any performance gains outside of error, often seeing reduced performance.
+
 ## Primitive test (Query Concurrency: 100)
 
 M3 Max 128GB, 1.6GB dataset (~167MB per file * 10)
