@@ -354,6 +354,8 @@ func TestQueryPerformance(t *testing.T) {
 			var totalResultsReturned int64
 			var blockCount int
 			var allResults []map[string]any
+			var peakRowsPerSec float64
+			var peakBytesPerSec float64
 
 			// Start query
 			startTime := time.Now()
@@ -372,6 +374,19 @@ func TestQueryPerformance(t *testing.T) {
 					totalDuration += stat.Duration
 					totalRowsProcessed += int64(stat.RowsProcessed)
 					totalBytesProcessed += int64(stat.BytesProcessed)
+
+					// Calculate individual block throughput and track peaks
+					if stat.Duration.Seconds() > 0 {
+						blockRowsPerSec := float64(stat.RowsProcessed) / stat.Duration.Seconds()
+						blockBytesPerSec := float64(stat.BytesProcessed) / stat.Duration.Seconds()
+
+						if blockRowsPerSec > peakRowsPerSec {
+							peakRowsPerSec = blockRowsPerSec
+						}
+						if blockBytesPerSec > peakBytesPerSec {
+							peakBytesPerSec = blockBytesPerSec
+						}
+					}
 
 					// fmt.Printf("  Block %s[%d]: %s rows/s, %s bytes/s, %d rows, %s skipped=%t\n",
 					// 	string(stat.FilePointer)[:8], // Show first 8 chars of pointer
@@ -423,6 +438,7 @@ func TestQueryPerformance(t *testing.T) {
 			fmt.Printf("Total bytes processed: %s\n", formatBytes(totalBytesProcessed))
 			fmt.Printf("Results returned: %d\n", totalResultsReturned)
 			fmt.Printf("System throughput: %.0f rows/sec, %s/sec\n", systemRowsPerSec, formatBytes(int64(systemBytesPerSec)))
+			fmt.Printf("Peak worker throughput: %.0f rows/sec, %s/sec\n", peakRowsPerSec, formatBytes(int64(peakBytesPerSec)))
 			fmt.Printf("Concurrency factor: %.1fx (combined worker time: %v)\n", totalDuration.Seconds()/queryTime.Seconds(), totalDuration)
 
 			if totalRowsProcessed > 0 {
