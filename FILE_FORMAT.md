@@ -39,15 +39,36 @@ Dedicated metadata stores can store the partition IDs and minmax index values ex
 ```
 [Data Block Bloom Filters] (JSON serialized)
 [uint64: Data Block Bloom Filters xxhash]
-[uint32: N row bytes]
-[row bytes]
-...
-[uint64: Data Block xxhash]
+[Compressed Row Data]
 ```
 
+### Row Data Section
+The row data section contains length-prefixed rows that may be compressed:
+
+```
+[uint32: row 1 length]
+[row 1 bytes]
+[uint32: row 2 length] 
+[row 2 bytes]
+...
+```
+
+### Compression Support
+Row data can be compressed using:
+- **None**: Raw uncompressed data
+- **Snappy**: Fast compression/decompression for query performance
+- **Zstd**: Higher compression ratios for storage efficiency
+
+The compression type and uncompressed size are stored in the data block metadata for efficient decompression.
+
+### Bloom Filters
 The bloom filters are stored at the beginning of each data block for efficient access during query processing. They include:
 - Field bloom filter (for field paths)
 - Token bloom filter (for tokenized values)
 - Field+Token bloom filter (for field:token combinations)
 
 The bloom filters are JSON-serialized and have their own integrity hash.
+
+### Integrity Verification
+- **Bloom filters hash**: Stored immediately after bloom filters
+- **Row data hash**: Stored in metadata (DataBlockMetadata.RowDataHash) for integrity verification without requiring additional I/O

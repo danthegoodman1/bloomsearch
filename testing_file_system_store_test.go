@@ -32,6 +32,7 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
 	config.FileBloomExpectedItems = 100       // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
+	config.RowDataCompression = CompressionNone
 
 	// Create and start engine
 	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)

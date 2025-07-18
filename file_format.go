@@ -139,11 +139,20 @@ func ReadDataBlockBloomFilters(file io.ReadSeeker, blockMetadata DataBlockMetada
 	return DataBlockBloomFiltersFromBytesWithHash(bloomFiltersBytes, bloomFiltersHashBytes)
 }
 
+// CompressionType represents the compression algorithm used for row data
+type CompressionType string
+
+const (
+	CompressionNone   CompressionType = "none"
+	CompressionSnappy CompressionType = "snappy"
+	CompressionZstd   CompressionType = "zstd"
+)
+
 type DataBlockMetadata struct {
 	// Absolute file offset (includes bloom filters at the beginning)
 	Offset int
 
-	// Size includes the bloom filters, their hash, row data, and the data block hash at the end
+	// Size includes the bloom filters, their hash, and row data (no trailing hash)
 	Size int
 	Rows int
 
@@ -152,4 +161,13 @@ type DataBlockMetadata struct {
 
 	MinMaxIndexes map[string]MinMaxIndex `json:",omitempty"`
 	PartitionID   string                 `json:",omitempty"`
+
+	// Compression algorithm used for the row data in this block
+	Compression CompressionType `json:",omitempty"`
+
+	// Uncompressed size of row data (for decompression buffer allocation)
+	UncompressedSize int `json:",omitempty"`
+
+	// Hash of the compressed row data (for integrity verification)
+	RowDataHash uint64 `json:",omitempty"`
 }

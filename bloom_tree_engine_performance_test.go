@@ -12,6 +12,7 @@ import (
 
 // TestGenerateSyntheticData generates ~100GB of random data for performance testing
 func TestGenerateSyntheticData(t *testing.T) {
+	t.Skip("Skipping performance test by default")
 	// Clean up test directory before starting
 	testDir := "./test_data/performance_test"
 	if err := os.RemoveAll(testDir); err != nil {
@@ -195,6 +196,7 @@ func formatBytes(bytes int64) string {
 
 // TestInspectGeneratedFiles inspects the files created by TestGenerateSyntheticData
 func TestInspectGeneratedFiles(t *testing.T) {
+	t.Skip("Skipping performance test by default")
 	testDir := "./test_data/performance_test"
 
 	// Create filesystem stores to read the data
@@ -259,6 +261,7 @@ func TestInspectGeneratedFiles(t *testing.T) {
 
 // TestQueryPerformance queries the synthetic data and measures performance
 func TestQueryPerformance(t *testing.T) {
+	t.Skip("Skipping performance test by default")
 	// Use the same test directory from data generation test
 	testDir := "./test_data/performance_test"
 

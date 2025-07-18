@@ -271,7 +271,7 @@ func TestEvaluateBloomFilters(t *testing.T) {
 	}
 }
 
-func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
+func TestBloomSearchEngineQueryEndToEndUncompressed(t *testing.T) {
 	// Clean up test directory before starting
 	testDir := "./test_data/query_test"
 	if err := os.RemoveAll(testDir); err != nil {
@@ -289,6 +289,7 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 	config.MaxBufferedTime = 10 * time.Second // Large time limit
 	config.FileBloomExpectedItems = 100       // Smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
+	config.RowDataCompression = CompressionNone
 
 	// Create and start engine
 	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
@@ -341,10 +342,10 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 			expectedRows:        testRows, // Both rows have 'level' field
 		},
 		{
-			name:                "token search for 'Alice' should match first row",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("Alice").Build(),
+			name:                "token search for 'alice' should match first row",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("alice").Build(),
 			expectedResultCount: 1,
-			expectedRows:        []map[string]any{testRows[0]}, // Only first row has 'Alice'
+			expectedRows:        []map[string]any{testRows[0]}, // Only first row has 'Alice' (tokenized as 'alice')
 		},
 		{
 			name:                "field-token search for 'level:error' should match first row",
@@ -440,4 +441,349 @@ func TestBloomSearchEngineQueryEndToEnd(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBloomSearchEngineQueryEndToEndZstd(t *testing.T) {
+	// Clean up test directory before starting
+	testDir := "./test_data/query_test"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	// Create test directory for file system data store
+	dataStore := NewFileSystemDataStore(testDir)
+	metaStore := dataStore
+
+	// Create config
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 2                // Flush after 2 rows
+	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
+	config.MaxBufferedTime = 10 * time.Second // Large time limit
+	config.FileBloomExpectedItems = 100       // Smaller bloom filter
+	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
+	config.RowDataCompression = CompressionZstd
+
+	// Create and start engine
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	// Create test data - use float64 for numeric values since JSON unmarshaling converts to float64
+	testRows := []map[string]any{
+		{"id": 1.0, "name": "Alice", "level": "error", "service": "auth"},
+		{"id": 2.0, "name": "Bob", "level": "info", "service": "payment"},
+	}
+
+	// Ingest rows and wait for flush
+	ctx := context.Background()
+	doneChan := make(chan error, 1)
+	err = engine.IngestRows(ctx, testRows, doneChan)
+	if err != nil {
+		t.Fatalf("Failed to ingest rows: %v", err)
+	}
+
+	// Wait for flush to complete
+	select {
+	case err := <-doneChan:
+		if err != nil {
+			t.Fatalf("Flush failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Flush did not complete within timeout")
+	}
+
+	// Test queries that should match
+	testCases := []struct {
+		name                string
+		query               *Query
+		expectedResultCount int
+		expectedRows        []map[string]any
+	}{
+		{
+			name:                "field search for 'level' should match both rows",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("level").Build(),
+			expectedResultCount: 2,
+			expectedRows:        testRows, // Both rows have 'level' field
+		},
+		{
+			name:                "token search for 'alice' should match first row",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("alice").Build(),
+			expectedResultCount: 1,
+			expectedRows:        []map[string]any{testRows[0]}, // Only first row has 'Alice' (tokenized as 'alice')
+		},
+		{
+			name:                "field-token search for 'level:error' should match first row",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error").Build(),
+			expectedResultCount: 1,
+			expectedRows:        []map[string]any{testRows[0]}, // Only first row has level=error
+		},
+		{
+			name:                "field search for nonexistent field should not match",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent").Build(),
+			expectedResultCount: 0,
+			expectedRows:        []map[string]any{},
+		},
+		{
+			name:                "token search for nonexistent token should not match",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent").Build(),
+			expectedResultCount: 0,
+			expectedRows:        []map[string]any{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Execute query
+			resultChan := make(chan map[string]any, 100)
+			errorChan := make(chan error, 10)
+			statsChan := make(chan BlockStats, 10)
+			err := engine.Query(ctx, tc.query, resultChan, errorChan, statsChan)
+			if err != nil {
+				t.Fatalf("Query failed: %v", err)
+			}
+
+			// Print stats as they come in
+			go func() {
+				for stat := range statsChan {
+					t.Logf("Block %s[%d]: %s rows/s, %s",
+						string(stat.FilePointer), stat.BlockOffset,
+						FormatRate(stat.RowsProcessed, stat.Duration),
+						FormatBytesPerSecond(stat.BytesProcessed, stat.Duration))
+				}
+			}()
+
+			var results []map[string]any
+			var queryErr error
+
+			for result := range resultChan {
+				results = append(results, result)
+			}
+
+			select {
+			case err := <-errorChan:
+				if err != nil {
+					queryErr = err
+				}
+			default:
+			}
+
+			// Verify results
+			if queryErr != nil {
+				t.Fatalf("Query error: %v", queryErr)
+			}
+
+			// Check result count
+			if len(results) != tc.expectedResultCount {
+				t.Errorf("Expected %d results but got %d", tc.expectedResultCount, len(results))
+			}
+
+			// Check that we got the expected rows
+			if tc.expectedResultCount > 0 {
+				// Convert results to a map for easy lookup
+				resultMap := make(map[any]map[string]any)
+				for _, result := range results {
+					if id, ok := result["id"]; ok {
+						resultMap[id] = result
+					}
+				}
+
+				// Check each expected row
+				for _, expectedRow := range tc.expectedRows {
+					if id, ok := expectedRow["id"]; ok {
+						if actualRow, found := resultMap[id]; found {
+							// Check each field in the expected row
+							for key, expectedValue := range expectedRow {
+								if actualValue, exists := actualRow[key]; !exists || actualValue != expectedValue {
+									t.Errorf("Expected row %v to have %s=%v, but got %v", id, key, expectedValue, actualValue)
+								}
+							}
+						} else {
+							t.Errorf("Expected row with id=%v not found in results", id)
+						}
+					}
+				}
+			}
+		})
+	}
+
+}
+func TestBloomSearchEngineQueryEndToEndSnappy(t *testing.T) {
+	// Clean up test directory before starting
+	testDir := "./test_data/query_test"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	// Create test directory for file system data store
+	dataStore := NewFileSystemDataStore(testDir)
+	metaStore := dataStore
+
+	// Create config
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 2                // Flush after 2 rows
+	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
+	config.MaxBufferedTime = 10 * time.Second // Large time limit
+	config.FileBloomExpectedItems = 100       // Smaller bloom filter
+	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
+	config.RowDataCompression = CompressionSnappy
+
+	// Create and start engine
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	// Create test data - use float64 for numeric values since JSON unmarshaling converts to float64
+	testRows := []map[string]any{
+		{"id": 1.0, "name": "Alice", "level": "error", "service": "auth"},
+		{"id": 2.0, "name": "Bob", "level": "info", "service": "payment"},
+	}
+
+	// Ingest rows and wait for flush
+	ctx := context.Background()
+	doneChan := make(chan error, 1)
+	err = engine.IngestRows(ctx, testRows, doneChan)
+	if err != nil {
+		t.Fatalf("Failed to ingest rows: %v", err)
+	}
+
+	// Wait for flush to complete
+	select {
+	case err := <-doneChan:
+		if err != nil {
+			t.Fatalf("Flush failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Flush did not complete within timeout")
+	}
+
+	// Test queries that should match
+	testCases := []struct {
+		name                string
+		query               *Query
+		expectedResultCount int
+		expectedRows        []map[string]any
+	}{
+		{
+			name:                "field search for 'level' should match both rows",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("level").Build(),
+			expectedResultCount: 2,
+			expectedRows:        testRows, // Both rows have 'level' field
+		},
+		{
+			name:                "token search for 'alice' should match first row",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("alice").Build(),
+			expectedResultCount: 1,
+			expectedRows:        []map[string]any{testRows[0]}, // Only first row has 'Alice' (tokenized as 'alice')
+		},
+		{
+			name:                "field-token search for 'level:error' should match first row",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error").Build(),
+			expectedResultCount: 1,
+			expectedRows:        []map[string]any{testRows[0]}, // Only first row has level=error
+		},
+		{
+			name:                "field search for nonexistent field should not match",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent").Build(),
+			expectedResultCount: 0,
+			expectedRows:        []map[string]any{},
+		},
+		{
+			name:                "token search for nonexistent token should not match",
+			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent").Build(),
+			expectedResultCount: 0,
+			expectedRows:        []map[string]any{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Execute query
+			resultChan := make(chan map[string]any, 100)
+			errorChan := make(chan error, 10)
+			statsChan := make(chan BlockStats, 10)
+			err := engine.Query(ctx, tc.query, resultChan, errorChan, statsChan)
+			if err != nil {
+				t.Fatalf("Query failed: %v", err)
+			}
+
+			// Print stats as they come in
+			go func() {
+				for stat := range statsChan {
+					t.Logf("Block %s[%d]: %s rows/s, %s",
+						string(stat.FilePointer), stat.BlockOffset,
+						FormatRate(stat.RowsProcessed, stat.Duration),
+						FormatBytesPerSecond(stat.BytesProcessed, stat.Duration))
+				}
+			}()
+
+			var results []map[string]any
+			var queryErr error
+
+			for result := range resultChan {
+				results = append(results, result)
+			}
+
+			select {
+			case err := <-errorChan:
+				if err != nil {
+					queryErr = err
+				}
+			default:
+			}
+
+			// Verify results
+			if queryErr != nil {
+				t.Fatalf("Query error: %v", queryErr)
+			}
+
+			// Check result count
+			if len(results) != tc.expectedResultCount {
+				t.Errorf("Expected %d results but got %d", tc.expectedResultCount, len(results))
+			}
+
+			// Check that we got the expected rows
+			if tc.expectedResultCount > 0 {
+				// Convert results to a map for easy lookup
+				resultMap := make(map[any]map[string]any)
+				for _, result := range results {
+					if id, ok := result["id"]; ok {
+						resultMap[id] = result
+					}
+				}
+
+				// Check each expected row
+				for _, expectedRow := range tc.expectedRows {
+					if id, ok := expectedRow["id"]; ok {
+						if actualRow, found := resultMap[id]; found {
+							// Check each field in the expected row
+							for key, expectedValue := range expectedRow {
+								if actualValue, exists := actualRow[key]; !exists || actualValue != expectedValue {
+									t.Errorf("Expected row %v to have %s=%v, but got %v", id, key, expectedValue, actualValue)
+								}
+							}
+						} else {
+							t.Errorf("Expected row with id=%v not found in results", id)
+						}
+					}
+				}
+			}
+		})
+	}
+
 }

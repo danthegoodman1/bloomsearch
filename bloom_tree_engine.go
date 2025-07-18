@@ -1,17 +1,21 @@
 package bloomsearch
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/cespare/xxhash"
+	"github.com/klauspost/compress/snappy"
+	"github.com/klauspost/compress/zstd"
 )
 
 var (
@@ -100,16 +104,26 @@ type BloomSearchEngineConfig struct {
 	// Bloom filter parameters
 	FileBloomExpectedItems uint
 	BloomFalsePositiveRate float64
+
+	// Compression configuration
+	RowDataCompression CompressionType
+
+	// Compression level for zstd (1-22, higher = better compression, slower)
+	// Ignored for snappy compression
+	ZstdCompressionLevel int
 }
 
 type partitionBuffer struct {
 	partitionID           string
 	rowCount              int
 	minMaxIndexes         map[string]MinMaxIndex
-	buffer                []byte
+	buffer                bytes.Buffer
 	fieldBloomFilter      *bloom.BloomFilter
 	tokenBloomFilter      *bloom.BloomFilter
 	fieldTokenBloomFilter *bloom.BloomFilter
+	zstdEncoder           *zstd.Encoder
+	snappyEncoder         *snappy.Writer
+	uncompressedSize      int
 }
 
 func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
@@ -130,6 +144,10 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 
 		FileBloomExpectedItems: 100_000,
 		BloomFalsePositiveRate: 0.001,
+
+		// Default to Snappy for fast decompression
+		RowDataCompression:   CompressionSnappy,
+		ZstdCompressionLevel: 3, // Balanced compression/speed for zstd
 	}
 }
 
@@ -348,11 +366,24 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 			partitionBuffers[partitionID] = &partitionBuffer{
 				partitionID:           partitionID,
 				minMaxIndexes:         make(map[string]MinMaxIndex),
-				buffer:                make([]byte, 0),
+				buffer:                bytes.Buffer{},
 				fieldBloomFilter:      bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
 				tokenBloomFilter:      bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
 				fieldTokenBloomFilter: bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
+				uncompressedSize:      0,
+				rowCount:              0,
 			}
+			var err error
+			if b.config.RowDataCompression == CompressionZstd {
+				partitionBuffers[partitionID].zstdEncoder, err = zstd.NewWriter(&partitionBuffers[partitionID].buffer, zstd.WithEncoderLevel(zstd.EncoderLevel(b.config.ZstdCompressionLevel)))
+				if err != nil {
+					SendWithContext(ctx, req.doneChan, fmt.Errorf("failed to create zstd encoder: %w", err))
+					return
+				}
+			} else if b.config.RowDataCompression == CompressionSnappy {
+				partitionBuffers[partitionID].snappyEncoder = snappy.NewWriter(&partitionBuffers[partitionID].buffer)
+			}
+
 		}
 	}
 
@@ -422,28 +453,42 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 			}
 
 			// Write length prefix (uint32) followed by row bytes
-			lengthBytes := make([]byte, 4)
+			lengthBytes := make([]byte, LengthPrefixSize)
 			binary.LittleEndian.PutUint32(lengthBytes, uint32(len(rowBytes)))
-			partitionBuffer.buffer = append(partitionBuffer.buffer, lengthBytes...)
-			partitionBuffer.buffer = append(partitionBuffer.buffer, rowBytes...)
+			switch b.config.RowDataCompression {
+			case CompressionZstd:
+				partitionBuffer.zstdEncoder.Write(lengthBytes)
+				partitionBuffer.zstdEncoder.Write(rowBytes)
+			case CompressionSnappy:
+				// Use streaming compression for Snappy
+				partitionBuffer.snappyEncoder.Write(lengthBytes)
+				partitionBuffer.snappyEncoder.Write(rowBytes)
+			default:
+				partitionBuffer.buffer.Write(lengthBytes)
+				partitionBuffer.buffer.Write(rowBytes)
+			}
 
 			// Increment stats
-			*bufferedBytes += len(rowBytes) + 4 // +4 for length prefix
+			partitionBuffer.uncompressedSize += len(rowBytes) + LengthPrefixSize
 			partitionBuffer.rowCount += 1
+
+			// Use uncompressed size for flush decisions since compression may buffer data
+			uncompressedRowSize := len(rowBytes) + LengthPrefixSize
+			*bufferedBytes += uncompressedRowSize
 			*bufferedRowCount += 1
 		}
 
 		// Check partition-level limits
 		if !shouldFlush {
-			partitionBytes := len(partitionBuffer.buffer)
+			partitionUncompressedBytes := partitionBuffer.uncompressedSize
 
 			if partitionBuffer.rowCount >= b.config.MaxRowGroupRows {
 				fmt.Printf("FLUSH TRIGGER: Partition '%s' hit max rows (%d >= %d)\n",
 					partitionBuffer.partitionID, partitionBuffer.rowCount, b.config.MaxRowGroupRows)
 				shouldFlush = true
-			} else if partitionBytes >= b.config.MaxRowGroupBytes {
-				fmt.Printf("FLUSH TRIGGER: Partition '%s' hit max bytes (%d >= %d)\n",
-					partitionBuffer.partitionID, partitionBytes, b.config.MaxRowGroupBytes)
+			} else if partitionUncompressedBytes >= b.config.MaxRowGroupBytes {
+				fmt.Printf("FLUSH TRIGGER: Partition '%s' hit max uncompressed bytes (%d >= %d)\n",
+					partitionBuffer.partitionID, partitionUncompressedBytes, b.config.MaxRowGroupBytes)
 				shouldFlush = true
 			}
 		}
@@ -480,7 +525,7 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 			len(partitionBuffers), *bufferedRowCount, *bufferedBytes)
 		for partitionID, partition := range partitionBuffers {
 			fmt.Printf("  Partition '%s': %d rows, %d bytes\n",
-				partitionID, partition.rowCount, len(partition.buffer))
+				partitionID, partition.rowCount, partition.buffer.Len())
 		}
 		b.flushBufferedData(partitionBuffers, doneChans, bufferedRowCount, bufferedBytes, bufferStartTime)
 	}
@@ -538,6 +583,29 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 
 	// For each partition buffer, write the data block to the data store
 	for _, partitionBuffer := range flushReq.partitionBuffers {
+		// Finalize compression encoders before writing
+		var compressedData []byte
+		switch b.config.RowDataCompression {
+		case CompressionZstd:
+			if partitionBuffer.zstdEncoder != nil {
+				if err := partitionBuffer.zstdEncoder.Close(); err != nil {
+					TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to close zstd encoder: %w", err))
+					return
+				}
+			}
+			compressedData = partitionBuffer.buffer.Bytes()
+		case CompressionSnappy:
+			// Close the streaming snappy encoder to finalize compression
+			if partitionBuffer.snappyEncoder != nil {
+				if err := partitionBuffer.snappyEncoder.Close(); err != nil {
+					TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to close snappy encoder: %w", err))
+					return
+				}
+			}
+			compressedData = partitionBuffer.buffer.Bytes()
+		default:
+			compressedData = partitionBuffer.buffer.Bytes()
+		}
 		// Create data block bloom filters struct
 		dataBlockBloomFilters := &DataBlockBloomFilters{
 			FieldBloomFilter:      partitionBuffer.fieldBloomFilter,
@@ -560,39 +628,32 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 			return
 		}
 
+		// Calculate hash of compressed row data
+		rowDataHash := xxhash.Sum64(compressedData)
+
 		// Write the row data buffer
-		if _, err := writer.Write(partitionBuffer.buffer); err != nil {
+		if _, err := writer.Write(compressedData); err != nil {
 			// Write error to all done channels
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write data block: %w", err))
 			return
 		}
 
-		// Calculate hash of the entire data block (bloom filters + hash + row data)
-		dataBlockBytes := make([]byte, 0, len(bloomFiltersBytes)+8+len(partitionBuffer.buffer))
-		dataBlockBytes = append(dataBlockBytes, bloomFiltersBytes...)
-		dataBlockBytes = append(dataBlockBytes, bloomFiltersHashBytes...)
-		dataBlockBytes = append(dataBlockBytes, partitionBuffer.buffer...)
-		dataBlockHash := xxhash.Sum64(dataBlockBytes)
-
-		dataBlockHashBytes := make([]byte, HashSize)
-		binary.LittleEndian.PutUint64(dataBlockHashBytes, dataBlockHash)
-		if _, err := writer.Write(dataBlockHashBytes); err != nil {
-			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write data block hash: %w", err))
-			return
-		}
-
-		if _, err := fileHash.Write(dataBlockBytes); err != nil {
+		// Stream hash calculation without copying data
+		if _, err := fileHash.Write(bloomFiltersBytes); err != nil {
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
 			return
 		}
-
-		if _, err := fileHash.Write(dataBlockHashBytes); err != nil {
+		if _, err := fileHash.Write(bloomFiltersHashBytes); err != nil {
+			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
+			return
+		}
+		if _, err := fileHash.Write(compressedData); err != nil {
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
 			return
 		}
 
 		bloomFiltersSize := len(bloomFiltersBytes) + HashSize
-		dataBlockSize := bloomFiltersSize + len(partitionBuffer.buffer) + HashSize
+		dataBlockSize := bloomFiltersSize + len(compressedData)
 
 		fileMetadata.DataBlocks = append(fileMetadata.DataBlocks, DataBlockMetadata{
 			PartitionID:      partitionBuffer.partitionID,
@@ -601,6 +662,9 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 			Size:             dataBlockSize,
 			BloomFiltersSize: bloomFiltersSize,
 			MinMaxIndexes:    partitionBuffer.minMaxIndexes,
+			Compression:      b.config.RowDataCompression,
+			UncompressedSize: partitionBuffer.uncompressedSize,
+			RowDataHash:      rowDataHash,
 		})
 
 		currentOffset += dataBlockSize
@@ -934,24 +998,98 @@ func (b *BloomSearchEngine) processDataBlock(
 		return
 	}
 
-	rowGroupSize := job.blockMetadata.Size - job.blockMetadata.BloomFiltersSize - HashSize
+	// Calculate compressed row data size (no trailing hash now)
+	compressedRowDataSize := job.blockMetadata.Size - job.blockMetadata.BloomFiltersSize
 
-	for bytesRead := 0; bytesRead < rowGroupSize; {
+	// Create a limited reader for the compressed row data
+	limitedReader := io.LimitReader(file, int64(compressedRowDataSize))
+
+	// Create appropriate decompression reader based on compression type
+	var rowDataReader io.Reader
+	switch job.blockMetadata.Compression {
+	case CompressionNone:
+		// Direct streaming from file
+		rowDataReader = limitedReader
+
+	case CompressionSnappy:
+		// For streaming snappy, we need to read all compressed data first for hash verification
+		compressedRowData := make([]byte, compressedRowDataSize)
+		if _, err := io.ReadFull(limitedReader, compressedRowData); err != nil {
+			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read compressed row data: %w", err))
+			return
+		}
+
+		// Verify hash if available
+		if job.blockMetadata.RowDataHash != 0 {
+			computedHash := xxhash.Sum64(compressedRowData)
+			if computedHash != job.blockMetadata.RowDataHash {
+				SendWithContext(ctx, errorChan, fmt.Errorf("row data hash mismatch: expected %x, got %x", job.blockMetadata.RowDataHash, computedHash))
+				return
+			}
+		}
+
+		// Use streaming snappy decompression to match streaming compression
+		compressedReader := bytes.NewReader(compressedRowData)
+		snappyReader := snappy.NewReader(compressedReader)
+		rowDataReader = snappyReader
+
+	case CompressionZstd:
+		// For Zstd, we can use streaming decompression, but we still need to read the full compressed data
+		// because zstd.NewReader doesn't accept a size-limited reader reliably
+		compressedRowData := make([]byte, compressedRowDataSize)
+		if _, err := io.ReadFull(limitedReader, compressedRowData); err != nil {
+			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read compressed row data: %w", err))
+			return
+		}
+
+		// Verify hash if available
+		if job.blockMetadata.RowDataHash != 0 {
+			computedHash := xxhash.Sum64(compressedRowData)
+			if computedHash != job.blockMetadata.RowDataHash {
+				SendWithContext(ctx, errorChan, fmt.Errorf("row data hash mismatch: expected %x, got %x", job.blockMetadata.RowDataHash, computedHash))
+				return
+			}
+		}
+
+		decoder, err := zstd.NewReader(nil)
+		if err != nil {
+			SendWithContext(ctx, errorChan, fmt.Errorf("failed to create zstd decoder: %w", err))
+			return
+		}
+		defer decoder.Close()
+
+		decompressedData, err := decoder.DecodeAll(compressedRowData, make([]byte, 0, job.blockMetadata.UncompressedSize))
+		if err != nil {
+			SendWithContext(ctx, errorChan, fmt.Errorf("failed to decompress zstd data: %w", err))
+			return
+		}
+		rowDataReader = bytes.NewReader(decompressedData)
+
+	default:
+		SendWithContext(ctx, errorChan, fmt.Errorf("unsupported compression type: %s", job.blockMetadata.Compression))
+		return
+	}
+
+	// Now read individual rows from the decompressed stream
+	for {
 		lengthBytes := make([]byte, LengthPrefixSize)
-		if _, err := file.Read(lengthBytes); err != nil {
+		n, err := rowDataReader.Read(lengthBytes)
+		if err == io.EOF {
+			break // End of data
+		}
+		if err != nil || n != LengthPrefixSize {
 			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row length: %w", err))
 			return
 		}
-		bytesRead += LengthPrefixSize
 
 		rowLength := binary.LittleEndian.Uint32(lengthBytes)
 
 		rowData := make([]byte, rowLength)
-		if _, err := file.Read(rowData); err != nil {
+		n, err = rowDataReader.Read(rowData)
+		if err != nil || n != int(rowLength) {
 			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row data: %w", err))
 			return
 		}
-		bytesRead += int(rowLength)
 
 		if !TestJSONForBloomQuery(rowData, bloomQuery, ".", b.config.Tokenizer) {
 			continue
@@ -1052,6 +1190,7 @@ func (b *BloomSearchEngine) merge(ctx context.Context) error {
 
 	// TODO: Execute merges by reading entire files and writing new merged files
 	// TODO: Update metastore to replace old files with new merged files
+	// TODO: if row groups are compressed, we need to create a decompression and compression stream
 
 	return nil
 }
