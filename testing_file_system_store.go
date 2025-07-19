@@ -172,7 +172,10 @@ func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query 
 }
 
 func (fs *FileSystemDataStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {
-	// no-op, it's stored in the files
+	// writes are no-op, it's stored in the files
+	for _, delete := range deletes {
+		os.Remove(string(delete.FilePointerBytes))
+	}
 	return nil
 }
 
