@@ -217,17 +217,13 @@ Merging files reduces metadata operations (file opens, bloom filter tests) and i
 
 Bloom filters of the same size can be trivially merged by OR-ing their bits. If bloom filter parameters change, the system rebuilds filters from raw data during merge.
 
-**Two-Level Bloom Filter Strategy:**
+Two files are considered mergeable if they have the same file-level bloom filter parameters, and combined they are still under the max file size threshold.
 
-Two merge strategies were considered:
-1. **File-level merging** (chosen): Smaller bloom filters for row groups, larger for files. Must merge whole files together.
-2. **Block-level fragmentation**: Standard bloom filter sizes for both levels, can fragment blocks across files.
+Once two files have been decided to merge, the algorithm then considers whether row groups within the files can be merged. They are considered mergeable if they share the same partition ID, have the same bloom filter parameters and combined are under the max row group size parameters (number of rows is ignored here since this matters less than when memory-buffering).
 
-We chose file-level merging because it's more I/O efficient for poorly-organized data. With suboptimal partitioning or MinMax indexes, block-level fragmentation forces reading many large bloom filters, while file-level merging reads fewer, more targeted filters. This approach provides better general-purpose performance without requiring users to optimize their data organization.
+Then, all merging is done via streaming to keep memory usage low.
 
-This does mean that we do have to build file-level bloom filters at ingest time, rather than merging all of the partitions at flush time, which is ok because that optimizes for query speed at the cost of ingest speed.
-
-The current merge algorithm is not designed to be perfectly optimal, it's designed to be pretty good, and very fast.
+First, the new file is created in the DataStore. Then, row groups are merged together by decompressing and rewriting them (this means different compression settings are supported and consolidated) and bloom filters merged. Row groups that are not merged are simply copied in as-is without decompressing. Row group metadata is merged (minmax indexes, number of rows, etc.) and added to the running file metadata. The final file metadata is created by merging all file-level bloom filters and writing it out to the new file. Finally, the MetaStore receives an update to atomically create the new file, and delete all the old files.
 
 #### Coordinated Merges ([issue](https://github.com/danthegoodman1/bloomsearch/issues/19))
 
