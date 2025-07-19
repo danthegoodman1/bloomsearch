@@ -30,9 +30,9 @@ const (
 )
 
 type FileMetadata struct {
-	FieldBloomFilter      *bloom.BloomFilter // must exist
-	TokenBloomFilter      *bloom.BloomFilter // must exist
-	FieldTokenBloomFilter *bloom.BloomFilter // must exist
+	BloomFilters           BloomFilters
+	BloomExpectedItems     uint
+	BloomFalsePositiveRate float64
 
 	DataBlocks []DataBlockMetadata
 }
@@ -71,16 +71,16 @@ func FileMetadataFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*Fil
 	return &metadata, nil
 }
 
-// DataBlockBloomFilters contains the bloom filters for a data block
+// BloomFilters contains the bloom filters for a data block
 // This struct is serialized and stored at the beginning of each data block
-type DataBlockBloomFilters struct {
-	FieldBloomFilter      *bloom.BloomFilter `json:"field_bloom_filter"`       // must exist
-	TokenBloomFilter      *bloom.BloomFilter `json:"token_bloom_filter"`       // must exist
-	FieldTokenBloomFilter *bloom.BloomFilter `json:"field_token_bloom_filter"` // must exist
+type BloomFilters struct {
+	FieldBloomFilter      *bloom.BloomFilter
+	TokenBloomFilter      *bloom.BloomFilter
+	FieldTokenBloomFilter *bloom.BloomFilter
 }
 
 // Returns the data block bloom filters as a byte slice and the xxhash of the bloom filters
-func (d *DataBlockBloomFilters) Bytes() ([]byte, []byte) {
+func (d *BloomFilters) Bytes() ([]byte, []byte) {
 	jsonBytes, err := json.Marshal(d)
 	if err != nil {
 		panic(err)
@@ -91,7 +91,7 @@ func (d *DataBlockBloomFilters) Bytes() ([]byte, []byte) {
 	return jsonBytes, xxhashBytes
 }
 
-func DataBlockBloomFiltersFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*DataBlockBloomFilters, error) {
+func DataBlockBloomFiltersFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*BloomFilters, error) {
 	// Calculate xxhash of the provided bytes
 	actualHash := xxhash.Sum64(bytes)
 
@@ -104,7 +104,7 @@ func DataBlockBloomFiltersFromBytesWithHash(bytes []byte, expectedHashBytes []by
 	}
 
 	// Unmarshal the JSON bytes into DataBlockBloomFilters
-	var bloomFilters DataBlockBloomFilters
+	var bloomFilters BloomFilters
 	err := json.Unmarshal(bytes, &bloomFilters)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal bloom filters: %w", err)
@@ -114,7 +114,7 @@ func DataBlockBloomFiltersFromBytesWithHash(bytes []byte, expectedHashBytes []by
 }
 
 // ReadDataBlockBloomFilters reads bloom filters from a data block given a file reader and block metadata
-func ReadDataBlockBloomFilters(file io.ReadSeeker, blockMetadata DataBlockMetadata) (*DataBlockBloomFilters, error) {
+func ReadDataBlockBloomFilters(file io.ReadSeeker, blockMetadata DataBlockMetadata) (*BloomFilters, error) {
 	// Seek to the beginning of the data block
 	_, err := file.Seek(int64(blockMetadata.Offset), 0)
 	if err != nil {
@@ -170,4 +170,7 @@ type DataBlockMetadata struct {
 
 	// Hash of the compressed row data (for integrity verification)
 	RowDataHash uint64 `json:",omitempty"`
+
+	BloomExpectedItems     uint
+	BloomFalsePositiveRate float64
 }

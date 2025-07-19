@@ -90,9 +90,9 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 
 	// Verify metadata structure
 	assert.Len(t, maybeFile.Metadata.DataBlocks, 1, "Expected exactly 1 data block")
-	assert.NotNil(t, maybeFile.Metadata.FieldBloomFilter, "Field bloom filter should exist")
-	assert.NotNil(t, maybeFile.Metadata.TokenBloomFilter, "Token bloom filter should exist")
-	assert.NotNil(t, maybeFile.Metadata.FieldTokenBloomFilter, "Field+Token bloom filter should exist")
+	assert.NotNil(t, maybeFile.Metadata.BloomFilters.FieldBloomFilter, "Field bloom filter should exist")
+	assert.NotNil(t, maybeFile.Metadata.BloomFilters.TokenBloomFilter, "Token bloom filter should exist")
+	assert.NotNil(t, maybeFile.Metadata.BloomFilters.FieldTokenBloomFilter, "Field+Token bloom filter should exist")
 
 	block := maybeFile.Metadata.DataBlocks[0]
 	assert.Equal(t, 3, block.Rows, "Expected 3 rows in the block")
@@ -107,9 +107,9 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 
 	// Print bloom filter info
 	fmt.Printf("  Bloom Filters:\n")
-	fmt.Printf("    Field Filter: %v\n", maybeFile.Metadata.FieldBloomFilter != nil)
-	fmt.Printf("    Token Filter: %v\n", maybeFile.Metadata.TokenBloomFilter != nil)
-	fmt.Printf("    Field+Token Filter: %v\n", maybeFile.Metadata.FieldTokenBloomFilter != nil)
+	fmt.Printf("    Field Filter: %v\n", maybeFile.Metadata.BloomFilters.FieldBloomFilter != nil)
+	fmt.Printf("    Token Filter: %v\n", maybeFile.Metadata.BloomFilters.TokenBloomFilter != nil)
+	fmt.Printf("    Field+Token Filter: %v\n", maybeFile.Metadata.BloomFilters.FieldTokenBloomFilter != nil)
 
 	fmt.Printf("  Matching Data Blocks: %d\n", len(maybeFile.Metadata.DataBlocks))
 
