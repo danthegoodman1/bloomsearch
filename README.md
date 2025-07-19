@@ -379,4 +379,4 @@ The common pattern I used is:
 1. Define a clear spec (with a todo list)
 2. Have it build that
 3. Have it write tests to my spec that check edge cases and verify robustness
-4. Have it simplify the code and find consolidation and code reusability opportunities
+4. Have it simplify the code and find consolidation and code reusability opportunities - an example can be seen in [this commit](https://github.com/danthegoodman1/bloomsearch/commit/f498dc6445974e9a4296fb5c27c8fa05c8dbe60e)
