@@ -34,6 +34,69 @@ func makeFieldTokenKey(field, token string) string {
 	return field + "::" + token
 }
 
+// compressionEncoders holds compression-related objects
+type compressionEncoders struct {
+	writer        io.Writer
+	zstdEncoder   *zstd.Encoder
+	snappyEncoder *snappy.Writer
+}
+
+// createCompressionWriter creates appropriate compression writer based on configuration
+func (b *BloomSearchEngine) createCompressionWriter(dest io.Writer) (*compressionEncoders, error) {
+	encoders := &compressionEncoders{}
+
+	switch b.config.RowDataCompression {
+	case CompressionZstd:
+		var err error
+		encoders.zstdEncoder, err = zstd.NewWriter(dest, zstd.WithEncoderLevel(zstd.EncoderLevel(b.config.ZstdCompressionLevel)))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
+		}
+		encoders.writer = encoders.zstdEncoder
+	case CompressionSnappy:
+		encoders.snappyEncoder = snappy.NewBufferedWriter(dest)
+		encoders.writer = encoders.snappyEncoder
+	default:
+		encoders.writer = dest
+	}
+
+	return encoders, nil
+}
+
+// finalizeCompression closes any compression encoders and finalizes compression
+func (e *compressionEncoders) finalizeCompression() error {
+	if e.zstdEncoder != nil {
+		if err := e.zstdEncoder.Close(); err != nil {
+			return fmt.Errorf("failed to close zstd encoder: %w", err)
+		}
+	}
+	if e.snappyEncoder != nil {
+		if err := e.snappyEncoder.Close(); err != nil {
+			return fmt.Errorf("failed to close snappy encoder: %w", err)
+		}
+	}
+	return nil
+}
+
+// writeBloomFiltersWithHash serializes bloom filters and writes them with their hash to a writer
+func (b *BloomSearchEngine) writeBloomFiltersWithHash(writer io.Writer, bloomFilters *BloomFilters) ([]byte, []byte, int, error) {
+	// Serialize bloom filters and get hash
+	bloomFiltersBytes, bloomFiltersHashBytes := bloomFilters.Bytes()
+
+	// Write bloom filters
+	if _, err := writer.Write(bloomFiltersBytes); err != nil {
+		return nil, nil, 0, fmt.Errorf("failed to write bloom filters: %w", err)
+	}
+
+	// Write bloom filters hash
+	if _, err := writer.Write(bloomFiltersHashBytes); err != nil {
+		return nil, nil, 0, fmt.Errorf("failed to write bloom filters hash: %w", err)
+	}
+
+	// Return bloom filter bytes, hash bytes, and total size written
+	return bloomFiltersBytes, bloomFiltersHashBytes, len(bloomFiltersBytes) + len(bloomFiltersHashBytes), nil
+}
+
 type PartitionFunc func(row map[string]any) string
 
 type ingestRequest struct {
@@ -135,8 +198,7 @@ type partitionBuffer struct {
 	fieldBloomFilter      *bloom.BloomFilter
 	tokenBloomFilter      *bloom.BloomFilter
 	fieldTokenBloomFilter *bloom.BloomFilter
-	zstdEncoder           *zstd.Encoder
-	snappyEncoder         *snappy.Writer
+	compressionEncoders   *compressionEncoders
 	uncompressedSize      int
 }
 
@@ -390,14 +452,10 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 				rowCount:              0,
 			}
 			var err error
-			if b.config.RowDataCompression == CompressionZstd {
-				partitionBuffers[partitionID].zstdEncoder, err = zstd.NewWriter(&partitionBuffers[partitionID].buffer, zstd.WithEncoderLevel(zstd.EncoderLevel(b.config.ZstdCompressionLevel)))
-				if err != nil {
-					SendWithContext(ctx, req.doneChan, fmt.Errorf("failed to create zstd encoder: %w", err))
-					return
-				}
-			} else if b.config.RowDataCompression == CompressionSnappy {
-				partitionBuffers[partitionID].snappyEncoder = snappy.NewBufferedWriter(&partitionBuffers[partitionID].buffer)
+			partitionBuffers[partitionID].compressionEncoders, err = b.createCompressionWriter(&partitionBuffers[partitionID].buffer)
+			if err != nil {
+				SendWithContext(ctx, req.doneChan, fmt.Errorf("failed to create compression writer: %w", err))
+				return
 			}
 
 		}
@@ -471,18 +529,8 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 			// Write length prefix (uint32) followed by row bytes
 			lengthBytes := make([]byte, LengthPrefixSize)
 			binary.LittleEndian.PutUint32(lengthBytes, uint32(len(rowBytes)))
-			switch b.config.RowDataCompression {
-			case CompressionZstd:
-				partitionBuffer.zstdEncoder.Write(lengthBytes)
-				partitionBuffer.zstdEncoder.Write(rowBytes)
-			case CompressionSnappy:
-				// Use streaming compression for Snappy
-				partitionBuffer.snappyEncoder.Write(lengthBytes)
-				partitionBuffer.snappyEncoder.Write(rowBytes)
-			default:
-				partitionBuffer.buffer.Write(lengthBytes)
-				partitionBuffer.buffer.Write(rowBytes)
-			}
+			partitionBuffer.compressionEncoders.writer.Write(lengthBytes)
+			partitionBuffer.compressionEncoders.writer.Write(rowBytes)
 
 			// Increment stats
 			partitionBuffer.uncompressedSize += len(rowBytes) + LengthPrefixSize
@@ -605,27 +653,11 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 	for _, partitionBuffer := range flushReq.partitionBuffers {
 		// Finalize compression encoders before writing
 		var compressedData []byte
-		switch b.config.RowDataCompression {
-		case CompressionZstd:
-			if partitionBuffer.zstdEncoder != nil {
-				if err := partitionBuffer.zstdEncoder.Close(); err != nil {
-					TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to close zstd encoder: %w", err))
-					return
-				}
-			}
-			compressedData = partitionBuffer.buffer.Bytes()
-		case CompressionSnappy:
-			// Close the streaming snappy encoder to finalize compression
-			if partitionBuffer.snappyEncoder != nil {
-				if err := partitionBuffer.snappyEncoder.Close(); err != nil {
-					TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to close snappy encoder: %w", err))
-					return
-				}
-			}
-			compressedData = partitionBuffer.buffer.Bytes()
-		default:
-			compressedData = partitionBuffer.buffer.Bytes()
+		if err := partitionBuffer.compressionEncoders.finalizeCompression(); err != nil {
+			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to finalize compression: %w", err))
+			return
 		}
+		compressedData = partitionBuffer.buffer.Bytes()
 		// Create data block bloom filters struct
 		dataBlockBloomFilters := &BloomFilters{
 			FieldBloomFilter:      partitionBuffer.fieldBloomFilter,
@@ -633,18 +665,10 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 			FieldTokenBloomFilter: partitionBuffer.fieldTokenBloomFilter,
 		}
 
-		// Serialize bloom filters and get hash
-		bloomFiltersBytes, bloomFiltersHashBytes := dataBlockBloomFilters.Bytes()
-
-		// Write bloom filters to data block
-		if _, err := writer.Write(bloomFiltersBytes); err != nil {
+		// Write bloom filters and hash
+		bloomFiltersBytes, bloomFiltersHashBytes, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, dataBlockBloomFilters)
+		if err != nil {
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write bloom filters: %w", err))
-			return
-		}
-
-		// Write bloom filters hash
-		if _, err := writer.Write(bloomFiltersHashBytes); err != nil {
-			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write bloom filters hash: %w", err))
 			return
 		}
 
@@ -672,7 +696,6 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 			return
 		}
 
-		bloomFiltersSize := len(bloomFiltersBytes) + HashSize
 		dataBlockSize := bloomFiltersSize + len(compressedData)
 
 		fileMetadata.DataBlocks = append(fileMetadata.DataBlocks, DataBlockMetadata{
@@ -693,35 +716,8 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 	}
 
 	// Write final metadata to data store and footer
-	metadataBytes, metadataHashBytes := fileMetadata.Bytes()
-
-	// Write file metadata
-	if _, err := writer.Write(metadataBytes); err != nil {
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata: %w", err))
-		return
-	}
-
-	if _, err := writer.Write(metadataHashBytes); err != nil {
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata hash: %w", err))
-		return
-	}
-
-	metadataLengthBytes := make([]byte, LengthPrefixSize)
-	binary.LittleEndian.PutUint32(metadataLengthBytes, uint32(len(metadataBytes)))
-	if _, err := writer.Write(metadataLengthBytes); err != nil {
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata length: %w", err))
-		return
-	}
-
-	versionBytes := make([]byte, VersionPrefixSize)
-	binary.LittleEndian.PutUint32(versionBytes, FileVersion)
-	if _, err := writer.Write(versionBytes); err != nil {
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file version: %w", err))
-		return
-	}
-
-	if _, err := writer.Write([]byte(MagicBytes)); err != nil {
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write magic bytes: %w", err))
+	if err := b.writeFileMetadataAndFooter(writer, &fileMetadata); err != nil {
+		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata and footer: %w", err))
 		return
 	}
 
@@ -1712,39 +1708,22 @@ func (b *BloomSearchEngine) mergeDataBlocks(writer io.Writer, allBlocks []blockW
 
 // streamMergeDataBlocks performs streaming merge of multiple data block readers
 func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*dataBlockRowReader, partitionID string, bloomFilters *BloomFilters, minMaxIndexes map[string]MinMaxIndex, offset int) (*DataBlockMetadata, error) {
-	// Serialize bloom filters
-	bloomFiltersBytes, bloomFiltersHashBytes := bloomFilters.Bytes()
-
-	// Write bloom filters
-	if _, err := writer.Write(bloomFiltersBytes); err != nil {
+	// Serialize and write bloom filters
+	_, _, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, bloomFilters)
+	if err != nil {
 		return nil, fmt.Errorf("failed to write bloom filters: %w", err)
-	}
-	if _, err := writer.Write(bloomFiltersHashBytes); err != nil {
-		return nil, fmt.Errorf("failed to write bloom filters hash: %w", err)
 	}
 
 	// Prepare compressed row data
 	var compressedData bytes.Buffer
-	var rowDataWriter io.Writer
-	var zstdEncoder *zstd.Encoder
-	var snappyEncoder *snappy.Writer
 	uncompressedSize := 0
 	rowCount := 0
 
-	switch b.config.RowDataCompression {
-	case CompressionZstd:
-		var err error
-		zstdEncoder, err = zstd.NewWriter(&compressedData, zstd.WithEncoderLevel(zstd.EncoderLevel(b.config.ZstdCompressionLevel)))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
-		}
-		rowDataWriter = zstdEncoder
-	case CompressionSnappy:
-		snappyEncoder = snappy.NewBufferedWriter(&compressedData)
-		rowDataWriter = snappyEncoder
-	default:
-		rowDataWriter = &compressedData
+	compressionEncoders, err := b.createCompressionWriter(&compressedData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create compression writer: %w", err)
 	}
+	rowDataWriter := compressionEncoders.writer
 
 	// Stream merge all readers (simple round-robin for now, could be more sophisticated)
 	for {
@@ -1791,15 +1770,8 @@ func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*d
 	}
 
 	// Finalize compression
-	if zstdEncoder != nil {
-		if err := zstdEncoder.Close(); err != nil {
-			return nil, fmt.Errorf("failed to close zstd encoder: %w", err)
-		}
-	}
-	if snappyEncoder != nil {
-		if err := snappyEncoder.Close(); err != nil {
-			return nil, fmt.Errorf("failed to close snappy encoder: %w", err)
-		}
+	if err := compressionEncoders.finalizeCompression(); err != nil {
+		return nil, fmt.Errorf("failed to finalize compression: %w", err)
 	}
 
 	// Calculate hash and write compressed data
@@ -1808,7 +1780,6 @@ func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*d
 		return nil, fmt.Errorf("failed to write compressed row data: %w", err)
 	}
 
-	bloomFiltersSize := len(bloomFiltersBytes) + HashSize
 	totalSize := bloomFiltersSize + compressedData.Len()
 
 	return &DataBlockMetadata{

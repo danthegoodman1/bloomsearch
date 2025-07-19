@@ -100,6 +100,7 @@ See tests for complete working examples, including partitioning and minmax index
     - [Distributed Query Processing (issue)](#distributed-query-processing-issue)
 - [Performance](#performance)
 - [Contributing](#contributing)
+  - [AI Code](#ai-code)
 
 ## Concepts
 
@@ -364,3 +365,18 @@ Do not submit random PRs, they will be closed.
 For feature requests and bugs, create an Issue.
 
 For questions, create a Discussion.
+
+### AI Code
+
+More as a disclaimer, this codebase was heavily contributed by Claude 4 Sonnet using Cursor.
+
+I normally use Goland (which I miss many features from that fill massive gaps in the go linter/compiler, like telling me what's needed to implement an interface).
+
+All code has been carefully reviewed, and tests have been written, to ensure validity and that it is of the quality that I would write myself.
+
+The common pattern I used is:
+
+1. Define a clear spec (with a todo list)
+2. Have it build that
+3. Have it write tests to my spec that check edge cases and verify robustness
+4. Have it simplify the code and find consolidation and code reusability opportunities
