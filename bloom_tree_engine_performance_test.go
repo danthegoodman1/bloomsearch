@@ -261,7 +261,7 @@ func TestInspectGeneratedFiles(t *testing.T) {
 
 // TestQueryPerformance queries the synthetic data and measures performance
 func TestQueryPerformance(t *testing.T) {
-	t.Skip("Skipping performance test by default")
+	// t.Skip("Skipping performance test by default")
 	// Use the same test directory from data generation test
 	testDir := "./test_data/performance_test"
 

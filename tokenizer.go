@@ -234,15 +234,19 @@ func walkJSONForFieldValue(value gjson.Result, pathComponents []string, depth in
 
 // TestJSONForBloomCondition tests a JSON string against a bloom condition using gjson
 func TestJSONForBloomCondition(jsonBytes []byte, condition *BloomCondition, delimiter string, tokenizer ValueTokenizerFunc) bool {
-	jsonStr := string(jsonBytes)
+	// Parse once to avoid repeated string allocation and parsing
+	return testGJSONForBloomCondition(gjson.ParseBytes(jsonBytes), condition, delimiter, tokenizer)
+}
 
+// testGJSONForBloomCondition evaluates a single condition against a parsed gjson value
+func testGJSONForBloomCondition(value gjson.Result, condition *BloomCondition, delimiter string, tokenizer ValueTokenizerFunc) bool {
 	switch condition.Type {
 	case BloomField:
-		return TestJSONForField(jsonStr, condition.Field, delimiter)
+		return TestGJSONForField(value, condition.Field, delimiter)
 	case BloomToken:
-		return TestJSONForToken(jsonStr, condition.Token, tokenizer)
+		return TestGJSONForToken(value, condition.Token, tokenizer)
 	case BloomFieldToken:
-		return TestJSONForFieldToken(jsonStr, condition.Field, delimiter, condition.Token, tokenizer)
+		return TestGJSONForFieldToken(value, condition.Field, delimiter, condition.Token, tokenizer)
 	default:
 		return false
 	}
@@ -250,30 +254,28 @@ func TestJSONForBloomCondition(jsonBytes []byte, condition *BloomCondition, deli
 
 // TestJSONForBloomGroup tests a JSON string against a bloom group using gjson
 func TestJSONForBloomGroup(jsonBytes []byte, group *BloomGroup, delimiter string, tokenizer ValueTokenizerFunc) bool {
+	// Parse once for the entire group
+	return testGJSONForBloomGroup(gjson.ParseBytes(jsonBytes), group, delimiter, tokenizer)
+}
+
+// testGJSONForBloomGroup evaluates a group with short-circuit logic against a parsed value
+func testGJSONForBloomGroup(value gjson.Result, group *BloomGroup, delimiter string, tokenizer ValueTokenizerFunc) bool {
 	if len(group.Conditions) == 0 {
-		return true // Empty group matches everything
+		return true
 	}
 
-	// Evaluate each condition in the group
-	conditionResults := make([]bool, len(group.Conditions))
-	for i, condition := range group.Conditions {
-		conditionResults[i] = TestJSONForBloomCondition(jsonBytes, &condition, delimiter, tokenizer)
-	}
-
-	// Combine condition results based on group combinator
 	if group.Combinator == CombinatorOR {
-		// Any condition can match
-		for _, result := range conditionResults {
-			if result {
+		for i := range group.Conditions {
+			if testGJSONForBloomCondition(value, &group.Conditions[i], delimiter, tokenizer) {
 				return true
 			}
 		}
 		return false
 	}
 
-	// Default AND behavior: all conditions must match
-	for _, result := range conditionResults {
-		if !result {
+	// AND default
+	for i := range group.Conditions {
+		if !testGJSONForBloomCondition(value, &group.Conditions[i], delimiter, tokenizer) {
 			return false
 		}
 	}
@@ -283,31 +285,55 @@ func TestJSONForBloomGroup(jsonBytes []byte, group *BloomGroup, delimiter string
 // TestJSONForBloomQuery tests a JSON string against a bloom query using gjson
 func TestJSONForBloomQuery(jsonBytes []byte, bloomQuery *BloomQuery, delimiter string, tokenizer ValueTokenizerFunc) bool {
 	if bloomQuery == nil || len(bloomQuery.Groups) == 0 {
-		return true // No bloom filtering needed
+		return true
 	}
 
-	// Evaluate each group
-	groupResults := make([]bool, len(bloomQuery.Groups))
-	for i, group := range bloomQuery.Groups {
-		groupResults[i] = TestJSONForBloomGroup(jsonBytes, &group, delimiter, tokenizer)
-	}
+	value := gjson.ParseBytes(jsonBytes)
 
-	// Combine group results based on query combinator
 	if bloomQuery.Combinator == CombinatorOR {
-		// Any group can match
-		for _, result := range groupResults {
-			if result {
+		for i := range bloomQuery.Groups {
+			if testGJSONForBloomGroup(value, &bloomQuery.Groups[i], delimiter, tokenizer) {
 				return true
 			}
 		}
 		return false
 	}
 
-	// Default AND behavior: all groups must match
-	for _, result := range groupResults {
-		if !result {
+	for i := range bloomQuery.Groups {
+		if !testGJSONForBloomGroup(value, &bloomQuery.Groups[i], delimiter, tokenizer) {
 			return false
 		}
 	}
 	return true
+}
+
+// Byte-based helpers that operate on a pre-parsed gjson.Result
+func TestGJSONForField(value gjson.Result, fieldPath, delimiter string) bool {
+	pathComponents := strings.Split(fieldPath, delimiter)
+	return walkJSONForField(value, pathComponents, 0)
+}
+
+func TestGJSONForToken(value gjson.Result, token string, tokenizer ValueTokenizerFunc) bool {
+	return walkJSONForValue(value, func(v gjson.Result) bool {
+		tokens := tokenizer(v.Value())
+		for _, t := range tokens {
+			if t == token {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestGJSONForFieldToken(value gjson.Result, fieldPath, delimiter, token string, tokenizer ValueTokenizerFunc) bool {
+	pathComponents := strings.Split(fieldPath, delimiter)
+	return walkJSONForFieldValue(value, pathComponents, 0, func(v gjson.Result) bool {
+		tokens := tokenizer(v.Value())
+		for _, t := range tokens {
+			if t == token {
+				return true
+			}
+		}
+		return false
+	})
 }

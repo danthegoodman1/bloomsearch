@@ -755,26 +755,19 @@ func (b *BloomSearchEngine) evaluateBloomFilters(
 		return true // No bloom filtering needed, since it's only used to DISQUALIFY files
 	}
 
-	// Evaluate each group
-	groupResults := make([]bool, len(bloomQuery.Groups))
-	for i, group := range bloomQuery.Groups {
-		groupResults[i] = b.evaluateBloomGroup(fieldFilter, tokenFilter, fieldTokenFilter, &group)
-	}
-
-	// Combine group results based on query combinator
+	// Combine with short-circuit logic
 	if bloomQuery.Combinator == CombinatorOR {
-		// Any group can match
-		for _, result := range groupResults {
-			if result {
+		for i := range bloomQuery.Groups {
+			if b.evaluateBloomGroup(fieldFilter, tokenFilter, fieldTokenFilter, &bloomQuery.Groups[i]) {
 				return true
 			}
 		}
 		return false
 	}
 
-	// Default AND behavior: all groups must match
-	for _, result := range groupResults {
-		if !result {
+	// AND default
+	for i := range bloomQuery.Groups {
+		if !b.evaluateBloomGroup(fieldFilter, tokenFilter, fieldTokenFilter, &bloomQuery.Groups[i]) {
 			return false
 		}
 	}
@@ -792,26 +785,18 @@ func (b *BloomSearchEngine) evaluateBloomGroup(
 		return true // Empty group matches everything, since we can't disqualify it
 	}
 
-	// Evaluate each condition in the group
-	conditionResults := make([]bool, len(group.Conditions))
-	for i, condition := range group.Conditions {
-		conditionResults[i] = b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, &condition)
-	}
-
-	// Combine condition results based on group combinator
 	if group.Combinator == CombinatorOR {
-		// Any condition can match
-		for _, result := range conditionResults {
-			if result {
+		for i := range group.Conditions {
+			if b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, &group.Conditions[i]) {
 				return true
 			}
 		}
 		return false
 	}
 
-	// Default AND behavior: all conditions must match
-	for _, result := range conditionResults {
-		if !result {
+	// AND default
+	for i := range group.Conditions {
+		if !b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, &group.Conditions[i]) {
 			return false
 		}
 	}
@@ -827,10 +812,23 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 ) (result bool) {
 	switch condition.Type {
 	case BloomField:
+		// If the filter is nil (e.g., not present in metadata), we cannot disqualify
+		if fieldFilter == nil {
+			fmt.Println("[WARNING] fieldFilter is nil, how did your file not have this filter?")
+			return true
+		}
 		result = fieldFilter.TestString(condition.Field)
 	case BloomToken:
+		if tokenFilter == nil {
+			fmt.Println("[WARNING] tokenFilter is nil, how did your file not have this filter?")
+			return true
+		}
 		result = tokenFilter.TestString(condition.Token)
 	case BloomFieldToken:
+		if fieldTokenFilter == nil {
+			fmt.Println("[WARNING] fieldTokenFilter is nil, how did your file not have this filter?")
+			return true
+		}
 		key := makeFieldTokenKey(condition.Field, condition.Token)
 		result = fieldTokenFilter.TestString(key)
 	default:
@@ -1039,15 +1037,17 @@ func (b *BloomSearchEngine) processDataBlock(
 			return
 		}
 		rowDataReader = decoder
+		defer decoder.Close()
 	default:
 		SendWithContext(ctx, errorChan, fmt.Errorf("unsupported compression type: %s", job.blockMetadata.Compression))
 		return
 	}
 
 	// Now read individual rows from the decompressed stream
+	var lengthBytes [LengthPrefixSize]byte
+	rowBuf := make([]byte, 0)
 	for {
-		lengthBytes := make([]byte, LengthPrefixSize)
-		n, err := rowDataReader.Read(lengthBytes)
+		n, err := io.ReadFull(rowDataReader, lengthBytes[:])
 		if err == io.EOF {
 			break // End of data
 		}
@@ -1056,21 +1056,26 @@ func (b *BloomSearchEngine) processDataBlock(
 			return
 		}
 
-		rowLength := binary.LittleEndian.Uint32(lengthBytes)
+		rowLength := binary.LittleEndian.Uint32(lengthBytes[:])
 
-		rowData := make([]byte, rowLength)
-		n, err = rowDataReader.Read(rowData)
+		if cap(rowBuf) < int(rowLength) {
+			rowBuf = make([]byte, int(rowLength))
+		} else {
+			rowBuf = rowBuf[:int(rowLength)]
+		}
+
+		n, err = io.ReadFull(rowDataReader, rowBuf)
 		if err != nil || n != int(rowLength) {
 			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row data: %w", err))
 			return
 		}
 
-		if !TestJSONForBloomQuery(rowData, bloomQuery, ".", b.config.Tokenizer) {
+		if !TestJSONForBloomQuery(rowBuf, bloomQuery, ".", b.config.Tokenizer) {
 			continue
 		}
 
 		row := make(map[string]any)
-		if err := json.Unmarshal(rowData, &row); err != nil {
+		if err := json.Unmarshal(rowBuf, &row); err != nil {
 			SendWithContext(ctx, errorChan, fmt.Errorf("failed to unmarshal row: %w", err))
 			return
 		}
@@ -1807,6 +1812,7 @@ type dataBlockRowReader struct {
 	hashReader    *hashCalculatingReader
 	expectedHash  uint64
 	hashVerified  bool
+	zstdDecoder   *zstd.Decoder
 }
 
 // newDataBlockRowReader creates a streaming reader for a data block
@@ -1832,6 +1838,7 @@ func (b *BloomSearchEngine) newDataBlockRowReader(file io.ReadSeeker, blockMetad
 
 	// Create appropriate decompression reader based on compression type
 	var rowDataReader io.Reader
+	var zstdDec *zstd.Decoder
 	switch blockMetadata.Compression {
 	case CompressionNone:
 		rowDataReader = hashReader
@@ -1843,8 +1850,8 @@ func (b *BloomSearchEngine) newDataBlockRowReader(file io.ReadSeeker, blockMetad
 		if err != nil {
 			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 		}
-		// Note: decoder will be closed when reading is complete
 		rowDataReader = decoder
+		zstdDec = decoder
 	default:
 		return nil, fmt.Errorf("unsupported compression type: %s", blockMetadata.Compression)
 	}
@@ -1860,6 +1867,9 @@ func (b *BloomSearchEngine) newDataBlockRowReader(file io.ReadSeeker, blockMetad
 		expectedHash:  blockMetadata.RowDataHash,
 		hashVerified:  hashAlreadyVerified,
 	}
+	if zstdDec != nil {
+		reader.zstdDecoder = zstdDec
+	}
 
 	// Read the first row to initialize
 	reader.next()
@@ -1873,8 +1883,8 @@ func (r *dataBlockRowReader) next() {
 		return
 	}
 
-	lengthBytes := make([]byte, LengthPrefixSize)
-	n, err := r.rowDataReader.Read(lengthBytes)
+	var lengthBytes [LengthPrefixSize]byte
+	n, err := io.ReadFull(r.rowDataReader, lengthBytes[:])
 	if err == io.EOF {
 		r.hasMore = false
 		// Verify hash if we haven't already and we have a hash to verify
@@ -1882,25 +1892,41 @@ func (r *dataBlockRowReader) next() {
 			computedHash := r.hashReader.Sum64()
 			if computedHash != r.expectedHash {
 				r.err = fmt.Errorf("row data hash mismatch: expected %x, got %x", r.expectedHash, computedHash)
+				r.closeDecoder()
 				return
 			}
 			r.hashVerified = true
 		}
+		r.closeDecoder()
 		return
 	}
 	if err != nil || n != LengthPrefixSize {
 		r.err = fmt.Errorf("failed to read row length: %w", err)
 		r.hasMore = false
+		r.closeDecoder()
 		return
 	}
 
-	rowLength := binary.LittleEndian.Uint32(lengthBytes)
-	r.currentRow = make([]byte, rowLength)
-	n, err = r.rowDataReader.Read(r.currentRow)
+	rowLength := binary.LittleEndian.Uint32(lengthBytes[:])
+	if cap(r.currentRow) < int(rowLength) {
+		r.currentRow = make([]byte, int(rowLength))
+	} else {
+		r.currentRow = r.currentRow[:int(rowLength)]
+	}
+	n, err = io.ReadFull(r.rowDataReader, r.currentRow)
 	if err != nil || n != int(rowLength) {
 		r.err = fmt.Errorf("failed to read row data: %w", err)
 		r.hasMore = false
+		r.closeDecoder()
 		return
+	}
+}
+
+// closeDecoder closes the zstd decoder if present (idempotent)
+func (r *dataBlockRowReader) closeDecoder() {
+	if r.zstdDecoder != nil {
+		r.zstdDecoder.Close()
+		r.zstdDecoder = nil
 	}
 }
 
@@ -1910,9 +1936,11 @@ func (r *dataBlockRowReader) getCurrentRow() []byte {
 		return nil
 	}
 
-	current := r.currentRow
+	// Copy to preserve contents across advance when buffers are reused
+	out := make([]byte, len(r.currentRow))
+	copy(out, r.currentRow)
 	r.next() // advance to next row
-	return current
+	return out
 }
 
 // writeFileMetadataAndFooter writes the file metadata and footer to complete the file

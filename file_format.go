@@ -123,15 +123,13 @@ func ReadDataBlockBloomFilters(file io.ReadSeeker, blockMetadata DataBlockMetada
 
 	// Read bloom filters bytes (excluding the hash)
 	bloomFiltersBytes := make([]byte, blockMetadata.BloomFiltersSize-8)
-	_, err = file.Read(bloomFiltersBytes)
-	if err != nil {
+	if _, err = io.ReadFull(file, bloomFiltersBytes); err != nil {
 		return nil, fmt.Errorf("failed to read bloom filters: %w", err)
 	}
 
 	// Read bloom filters hash
 	bloomFiltersHashBytes := make([]byte, 8)
-	_, err = file.Read(bloomFiltersHashBytes)
-	if err != nil {
+	if _, err = io.ReadFull(file, bloomFiltersHashBytes); err != nil {
 		return nil, fmt.Errorf("failed to read bloom filters hash: %w", err)
 	}
 
