@@ -64,8 +64,8 @@ func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata,
 	fileSize := stat.Size()
 
 	// Check if file is large enough to contain the footer
-	// Footer: [8 bytes magic] + [4 bytes version] + [4 bytes metadata length] + [8 bytes metadata hash]
-	minFooterSize := int64(8 + 4 + 4 + 8)
+	// Footer: [8 bytes magic] + [4 bytes version] + [4 bytes metadata length] + [HashSize bytes metadata hash]
+	minFooterSize := int64(8 + 4 + 4 + HashSize)
 	if fileSize < minFooterSize {
 		return nil, fmt.Errorf("file %s is too small to be a valid bloom file", filePath)
 	}
@@ -104,15 +104,15 @@ func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata,
 	metadataLength := binary.LittleEndian.Uint32(metadataLengthBytes)
 
 	// Read metadata hash
-	metadataHashBytes := make([]byte, 8)
-	_, err = file.ReadAt(metadataHashBytes, fileSize-8-4-4-8)
+	metadataHashBytes := make([]byte, HashSize)
+	_, err = file.ReadAt(metadataHashBytes, fileSize-8-4-4-int64(HashSize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read metadata hash from %s: %w", filePath, err)
 	}
 
 	// Read metadata
 	metadataBytes := make([]byte, metadataLength)
-	metadataOffset := fileSize - 8 - 4 - 4 - 8 - int64(metadataLength)
+	metadataOffset := fileSize - 8 - 4 - 4 - int64(HashSize) - int64(metadataLength)
 	_, err = file.ReadAt(metadataBytes, metadataOffset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read metadata from %s: %w", filePath, err)

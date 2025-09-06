@@ -127,12 +127,12 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 
 	// First, read the bloom filters from the beginning of the data block
 	bloomFiltersSize := block.BloomFiltersSize
-	bloomFiltersBytes := make([]byte, bloomFiltersSize-8) // -8 for the hash
+	bloomFiltersBytes := make([]byte, bloomFiltersSize-HashSize) // exclude hash
 	_, err = file.Read(bloomFiltersBytes)
 	assert.NoError(t, err)
 
 	// Read the bloom filters hash
-	bloomFiltersHashBytes := make([]byte, 8)
+	bloomFiltersHashBytes := make([]byte, HashSize)
 	_, err = file.Read(bloomFiltersHashBytes)
 	assert.NoError(t, err)
 
@@ -146,8 +146,8 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	fmt.Printf("  Bloom filters loaded successfully from data block\n")
 
 	// Now read the row data
-	// (block.Size - BloomFiltersSize - 8) gives us the row data size (excluding final hash)
-	rowDataSize := block.Size - block.BloomFiltersSize - 8
+	// (block.Size - BloomFiltersSize) gives us the row data size
+	rowDataSize := block.Size - block.BloomFiltersSize
 	bytesRead := 0
 	rowCount := 0
 	readRows := make([]map[string]any, 0, block.Rows)

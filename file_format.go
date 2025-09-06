@@ -11,8 +11,9 @@ import (
 	"fmt"
 	"io"
 
+	"hash/crc32"
+
 	"github.com/bits-and-blooms/bloom/v3"
-	"github.com/cespare/xxhash"
 )
 
 var (
@@ -26,8 +27,11 @@ const (
 
 	LengthPrefixSize  = 4
 	VersionPrefixSize = 4
-	HashSize          = 8
+	HashSize          = 4
 )
+
+// CRC32C table used for checksums (Castagnoli)
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 type FileMetadata struct {
 	BloomFilters           BloomFilters
@@ -37,24 +41,24 @@ type FileMetadata struct {
 	DataBlocks []DataBlockMetadata
 }
 
-// Returns the file metadata as a byte slice and the xxhash of the file metadata
+// Returns the file metadata as a byte slice and the CRC32C of the file metadata
 func (f *FileMetadata) Bytes() ([]byte, []byte) {
 	jsonBytes, err := json.Marshal(f)
 	if err != nil {
 		panic(err)
 	}
-	xxhashValue := xxhash.Sum64(jsonBytes)
-	xxhashBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(xxhashBytes, xxhashValue)
-	return jsonBytes, xxhashBytes
+	crc := crc32.Checksum(jsonBytes, crc32cTable)
+	crcBytes := make([]byte, HashSize)
+	binary.LittleEndian.PutUint32(crcBytes, crc)
+	return jsonBytes, crcBytes
 }
 
 func FileMetadataFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*FileMetadata, error) {
-	// Calculate xxhash of the provided bytes
-	actualHash := xxhash.Sum64(bytes)
+	// Calculate CRC32C of the provided bytes
+	actualHash := crc32.Checksum(bytes, crc32cTable)
 
-	// Convert expected hash bytes to uint64
-	expectedHash := binary.LittleEndian.Uint64(expectedHashBytes)
+	// Convert expected hash bytes to uint32
+	expectedHash := binary.LittleEndian.Uint32(expectedHashBytes)
 
 	// Verify hash matches
 	if actualHash != expectedHash {
@@ -79,24 +83,24 @@ type BloomFilters struct {
 	FieldTokenBloomFilter *bloom.BloomFilter
 }
 
-// Returns the data block bloom filters as a byte slice and the xxhash of the bloom filters
+// Returns the data block bloom filters as a byte slice and the CRC32C of the bloom filters
 func (d *BloomFilters) Bytes() ([]byte, []byte) {
 	jsonBytes, err := json.Marshal(d)
 	if err != nil {
 		panic(err)
 	}
-	xxhashValue := xxhash.Sum64(jsonBytes)
-	xxhashBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(xxhashBytes, xxhashValue)
-	return jsonBytes, xxhashBytes
+	crc := crc32.Checksum(jsonBytes, crc32cTable)
+	crcBytes := make([]byte, HashSize)
+	binary.LittleEndian.PutUint32(crcBytes, crc)
+	return jsonBytes, crcBytes
 }
 
 func DataBlockBloomFiltersFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*BloomFilters, error) {
-	// Calculate xxhash of the provided bytes
-	actualHash := xxhash.Sum64(bytes)
+	// Calculate CRC32C of the provided bytes
+	actualHash := crc32.Checksum(bytes, crc32cTable)
 
-	// Convert expected hash bytes to uint64
-	expectedHash := binary.LittleEndian.Uint64(expectedHashBytes)
+	// Convert expected hash bytes to uint32
+	expectedHash := binary.LittleEndian.Uint32(expectedHashBytes)
 
 	// Verify hash matches
 	if actualHash != expectedHash {
@@ -122,13 +126,13 @@ func ReadDataBlockBloomFilters(file io.ReadSeeker, blockMetadata DataBlockMetada
 	}
 
 	// Read bloom filters bytes (excluding the hash)
-	bloomFiltersBytes := make([]byte, blockMetadata.BloomFiltersSize-8)
+	bloomFiltersBytes := make([]byte, blockMetadata.BloomFiltersSize-HashSize)
 	if _, err = io.ReadFull(file, bloomFiltersBytes); err != nil {
 		return nil, fmt.Errorf("failed to read bloom filters: %w", err)
 	}
 
 	// Read bloom filters hash
-	bloomFiltersHashBytes := make([]byte, 8)
+	bloomFiltersHashBytes := make([]byte, HashSize)
 	if _, err = io.ReadFull(file, bloomFiltersHashBytes); err != nil {
 		return nil, fmt.Errorf("failed to read bloom filters hash: %w", err)
 	}
@@ -167,7 +171,7 @@ type DataBlockMetadata struct {
 	UncompressedSize int `json:",omitempty"`
 
 	// Hash of the compressed row data (for integrity verification)
-	RowDataHash uint64 `json:",omitempty"`
+	RowDataHash uint32 `json:",omitempty"`
 
 	BloomExpectedItems     uint
 	BloomFalsePositiveRate float64
