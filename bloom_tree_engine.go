@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"hash/crc32"
 	"io"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/bits-and-blooms/bloom/v3"
-	"github.com/cespare/xxhash"
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 )
@@ -646,7 +646,6 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		return
 	}
 
-	fileHash := xxhash.New()
 	currentOffset := 0
 
 	// For each partition buffer, write the data block to the data store
@@ -666,14 +665,14 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		}
 
 		// Write bloom filters and hash
-		bloomFiltersBytes, bloomFiltersHashBytes, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, dataBlockBloomFilters)
+		_, _, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, dataBlockBloomFilters)
 		if err != nil {
 			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write bloom filters: %w", err))
 			return
 		}
 
-		// Calculate hash of compressed row data
-		rowDataHash := xxhash.Sum64(compressedData)
+		// Calculate hash of compressed row data (CRC32C)
+		rowDataHash := crc32.Checksum(compressedData, crc32cTable)
 
 		// Write the row data buffer
 		if _, err := writer.Write(compressedData); err != nil {
@@ -682,19 +681,7 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 			return
 		}
 
-		// Stream hash calculation without copying data
-		if _, err := fileHash.Write(bloomFiltersBytes); err != nil {
-			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
-			return
-		}
-		if _, err := fileHash.Write(bloomFiltersHashBytes); err != nil {
-			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
-			return
-		}
-		if _, err := fileHash.Write(compressedData); err != nil {
-			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to hash file data: %w", err))
-			return
-		}
+		// No file-level hash currently needed
 
 		dataBlockSize := bloomFiltersSize + len(compressedData)
 
@@ -1085,7 +1072,7 @@ func (b *BloomSearchEngine) processDataBlock(
 
 	// Verify hash after all data has been read
 	if job.blockMetadata.RowDataHash != 0 {
-		computedHash := hashReader.Sum64()
+		computedHash := hashReader.Sum32()
 		if computedHash != job.blockMetadata.RowDataHash {
 			SendWithContext(ctx, errorChan, fmt.Errorf("row data hash mismatch: expected %x, got %x", job.blockMetadata.RowDataHash, computedHash))
 			return
@@ -1780,7 +1767,7 @@ func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*d
 	}
 
 	// Calculate hash and write compressed data
-	rowDataHash := xxhash.Sum64(compressedData.Bytes())
+	rowDataHash := crc32.Checksum(compressedData.Bytes(), crc32cTable)
 	if _, err := writer.Write(compressedData.Bytes()); err != nil {
 		return nil, fmt.Errorf("failed to write compressed row data: %w", err)
 	}
@@ -1810,7 +1797,7 @@ type dataBlockRowReader struct {
 	currentRow    []byte
 	err           error
 	hashReader    *hashCalculatingReader
-	expectedHash  uint64
+	expectedHash  uint32
 	hashVerified  bool
 	zstdDecoder   *zstd.Decoder
 }
@@ -1889,7 +1876,7 @@ func (r *dataBlockRowReader) next() {
 		r.hasMore = false
 		// Verify hash if we haven't already and we have a hash to verify
 		if !r.hashVerified && r.expectedHash != 0 && r.hashReader != nil {
-			computedHash := r.hashReader.Sum64()
+			computedHash := r.hashReader.Sum32()
 			if computedHash != r.expectedHash {
 				r.err = fmt.Errorf("row data hash mismatch: expected %x, got %x", r.expectedHash, computedHash)
 				r.closeDecoder()
@@ -1976,10 +1963,10 @@ func (b *BloomSearchEngine) writeFileMetadataAndFooter(writer io.Writer, metadat
 	return nil
 }
 
-// hashCalculatingReader wraps an io.Reader and calculates xxhash as data is read
+// hashCalculatingReader wraps an io.Reader and calculates checksum as data is read
 type hashCalculatingReader struct {
 	reader    io.Reader
-	hasher    hash.Hash64
+	hasher    hash.Hash32
 	totalRead int64
 	limit     int64
 }
@@ -1987,7 +1974,7 @@ type hashCalculatingReader struct {
 func newHashCalculatingReader(reader io.Reader, limit int64) *hashCalculatingReader {
 	return &hashCalculatingReader{
 		reader: reader,
-		hasher: xxhash.New(),
+		hasher: crc32.New(crc32cTable),
 		limit:  limit,
 	}
 }
@@ -2011,5 +1998,10 @@ func (h *hashCalculatingReader) Read(p []byte) (n int, err error) {
 }
 
 func (h *hashCalculatingReader) Sum64() uint64 {
-	return h.hasher.Sum64()
+	// Maintain compatibility with callers expecting Sum64; derive from 32-bit checksum
+	return uint64(h.hasher.Sum32())
+}
+
+func (h *hashCalculatingReader) Sum32() uint32 {
+	return h.hasher.Sum32()
 }

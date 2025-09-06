@@ -12,7 +12,7 @@ As the number of rows within a row group increases, the bloom filter stays at a 
 ...
 [Data Block N]
 [File Metadata]
-[uint64: File Metadata xxhash]
+[uint32: File Metadata CRC32C]
 [uint32: File Metadata Length]
 [uint32: File Version]
 [8 bytes: magic bytes "BLOMSRCH"]
@@ -38,7 +38,7 @@ Dedicated metadata stores can store the partition IDs and minmax index values ex
 
 ```
 [Data Block Bloom Filters] (JSON serialized)
-[uint64: Data Block Bloom Filters xxhash]
+[uint32: Data Block Bloom Filters CRC32C]
 [Compressed Row Data]
 ```
 
@@ -67,8 +67,8 @@ The bloom filters are stored at the beginning of each data block for efficient a
 - Token bloom filter (for tokenized values)
 - Field+Token bloom filter (for field:token combinations)
 
-The bloom filters are JSON-serialized and have their own integrity hash.
+The bloom filters are JSON-serialized and have their own integrity hash (CRC32C, 4 bytes).
 
 ### Integrity Verification
-- **Bloom filters hash**: Stored immediately after bloom filters
-- **Row data hash**: Stored in metadata (DataBlockMetadata.RowDataHash) for integrity verification without requiring additional I/O
+- **Bloom filters hash (CRC32C, 4 bytes)**: Stored immediately after bloom filters
+- **Row data hash (CRC32C, 4 bytes)**: Stored in metadata (`DataBlockMetadata.RowDataHash`) for integrity verification without requiring additional I/O
