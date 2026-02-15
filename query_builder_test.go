@@ -137,3 +137,92 @@ func TestMatchPrefilterSupportsOrAndBetweenPartitionAndMinMax(t *testing.T) {
 		t.Fatalf("expected prefilter to reject non-matching metadata")
 	}
 }
+
+func TestNewQuerySupportsImplicitRegexAndExpression(t *testing.T) {
+	query := NewQuery().
+		FieldRegex("service", "^pay").
+		FieldRegex("message", "timeout$").
+		Build()
+
+	if query.Regex.Expression == nil {
+		t.Fatalf("expected regex expression to be set")
+	}
+
+	if query.Regex.Expression.expressionType != regexExpressionAnd {
+		t.Fatalf("expected root regex expression type %q, got %q", regexExpressionAnd, query.Regex.Expression.expressionType)
+	}
+
+	if len(query.Regex.Expression.children) != 2 {
+		t.Fatalf("expected 2 regex child expressions, got %d", len(query.Regex.Expression.children))
+	}
+}
+
+func TestMatchRegexSupportsNestedBooleanExpressions(t *testing.T) {
+	query := NewQuery().
+		MatchRegex(
+			RegexOr(
+				RegexAnd(
+					FieldRegex("service", "^auth$"),
+					FieldRegex("message", "failed"),
+				),
+				FieldRegex("level", "^error$"),
+			),
+		).
+		Build()
+
+	if query.Regex.Expression == nil {
+		t.Fatalf("expected regex expression to be set")
+	}
+
+	if query.Regex.Expression.expressionType != regexExpressionOr {
+		t.Fatalf("expected root regex expression type %q, got %q", regexExpressionOr, query.Regex.Expression.expressionType)
+	}
+
+	if len(query.Regex.Expression.children) != 2 {
+		t.Fatalf("expected 2 regex child expressions, got %d", len(query.Regex.Expression.children))
+	}
+}
+
+func TestRegexFieldGuardBloomQueryPreservesBooleanShape(t *testing.T) {
+	regexQuery := &RegexQuery{
+		Expression: &RegexExpression{
+			expressionType: regexExpressionOr,
+			children: []RegexExpression{
+				{
+					expressionType: regexExpressionCondition,
+					condition:      &RegexCondition{Field: "service", Pattern: "^pay"},
+				},
+				{
+					expressionType: regexExpressionAnd,
+					children: []RegexExpression{
+						{
+							expressionType: regexExpressionCondition,
+							condition:      &RegexCondition{Field: "level", Pattern: "^error$"},
+						},
+						{
+							expressionType: regexExpressionCondition,
+							condition:      &RegexCondition{Field: "message", Pattern: "timeout"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	guard := RegexFieldGuardBloomQuery(regexQuery)
+	if guard == nil || guard.Expression == nil {
+		t.Fatalf("expected regex field guard bloom expression")
+	}
+
+	if guard.Expression.expressionType != bloomExpressionOr {
+		t.Fatalf("expected top level OR bloom expression, got %q", guard.Expression.expressionType)
+	}
+
+	if len(guard.Expression.children) != 2 {
+		t.Fatalf("expected 2 top level children, got %d", len(guard.Expression.children))
+	}
+
+	if guard.Expression.children[0].condition == nil || guard.Expression.children[0].condition.Type != BloomField || guard.Expression.children[0].condition.Field != "service" {
+		t.Fatalf("expected first child to be bloom field condition for service")
+	}
+}

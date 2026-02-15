@@ -137,6 +137,34 @@ query := NewQuery().Token("error").Build()
 query := NewQuery().FieldToken("service", "payment").Build()
 ```
 
+**Field regex search (final scan stage)** - Apply regex to the full value of a specific field path:
+```go
+// Find rows where `.message` contains timeout-like text
+query := NewQuery().
+    FieldRegex("message", "(?i)timeout|connection reset").
+    Build()
+```
+
+Regex filters support boolean composition and are always evaluated as a final-stage AND filter after normal bloom matching:
+```go
+// Bloom narrowing first, then regex final filter:
+// finalMatch = bloomMatch AND regexMatch
+query := NewQuery().
+    Field("service").
+    MatchRegex(
+        RegexAnd(
+            RegexOr(
+                FieldRegex("service", "^payment$"),
+                FieldRegex("service", "^auth$"),
+            ),
+            FieldRegex("message", "timeout"),
+        ),
+    ).
+    Build()
+```
+
+Regex evaluation targets full field value strings (not tokenizer tokens).
+
 **Complex combinations**:
 ```go
 // (field AND token) OR fieldtoken
@@ -312,7 +340,7 @@ that flushing has no impact on ingestion performance.
 
 ### Query path
 
-Query flow for `field`, `token`, or `field:token` combinations:
+Query flow for `field`, `token`, `field:token`, and final-stage `field regex` combinations:
 
 ```
 ┌─────────────┐    ┌─────────────────┐    ┌──────────────┐
@@ -323,10 +351,17 @@ Query flow for `field`, `token`, or `field:token` combinations:
                                                  │
                                                  ▼
 ┌─────────────┐    ┌─────────────────┐    ┌──────────────┐
-│6. Row       │ ◄──│5. Bloom Test    │ ◄──│4. Stream     │
-│   Scan      │    │   (block-level) │    │   Blocks     │
+│6. Row Bloom │ ◄──│5. Bloom Test    │ ◄──│4. Stream     │
+│   Match     │    │   (block-level) │    │   Blocks     │
 │             │    │                 │    │              │
-└─────────────┘    └─────────────────┘    └──────────────┘
+└──────┬──────┘    └─────────────────┘    └──────────────┘
+       │
+       ▼
+┌─────────────┐
+│7. Regex     │
+│   Final     │
+│   Filter    │
+└─────────────┘
 ```
 
 ```go
@@ -345,6 +380,8 @@ maybeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 ```
 
 Query processing is done highly-concurrently: A goroutine is spawned for every file (if the result is over 20 files), and for every row group. This allows it to maximimze multi-core machines.
+
+When regex filters are present, the engine compiles patterns once per query and derives a field-existence bloom guard for earlier file/block pruning.
 
 Memory usage scales with concurrent file reads, not dataset size.
 

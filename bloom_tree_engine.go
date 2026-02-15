@@ -17,6 +17,7 @@ import (
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
+	"github.com/tidwall/gjson"
 )
 
 var (
@@ -843,6 +844,22 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 //	  }
 //	}
 func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan chan<- map[string]any, errorChan chan<- error, statsChan chan<- BlockStats) error {
+	if query == nil {
+		query = NewQuery().Build()
+	}
+
+	rowBloomQuery := query.Bloom
+	if rowBloomQuery == nil {
+		rowBloomQuery = &BloomQuery{}
+	}
+
+	compiledRegexQuery, err := CompileRegexQuery(query.Regex)
+	if err != nil {
+		return fmt.Errorf("failed to compile regex query: %w", err)
+	}
+
+	pruneBloomQuery := AndBloomQueries(rowBloomQuery, RegexFieldGuardBloomQuery(query.Regex))
+
 	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 	if err != nil {
 		return err
@@ -860,7 +877,7 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 				maybeFile.Metadata.BloomFilters.FieldBloomFilter,
 				maybeFile.Metadata.BloomFilters.TokenBloomFilter,
 				maybeFile.Metadata.BloomFilters.FieldTokenBloomFilter,
-				query.Bloom,
+				pruneBloomQuery,
 			) {
 				matchingFiles = append(matchingFiles, maybeFile)
 			}
@@ -884,7 +901,7 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 					maybeFile.Metadata.BloomFilters.FieldBloomFilter,
 					maybeFile.Metadata.BloomFilters.TokenBloomFilter,
 					maybeFile.Metadata.BloomFilters.FieldTokenBloomFilter,
-					query.Bloom,
+					pruneBloomQuery,
 				) {
 					SendWithContext(ctx, matchingFilesChan, maybeFile)
 				}
@@ -923,7 +940,7 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 			}
 			defer func() { <-b.querySemaphore }()
 
-			b.processDataBlock(workerCtx, job, resultChan, errorChan, query.Bloom, statsChan)
+			b.processDataBlock(workerCtx, job, resultChan, errorChan, rowBloomQuery, pruneBloomQuery, compiledRegexQuery, statsChan)
 		}(job)
 	}
 
@@ -943,7 +960,9 @@ func (b *BloomSearchEngine) processDataBlock(
 	job dataBlockJob,
 	resultChan chan<- map[string]any,
 	errorChan chan<- error,
-	bloomQuery *BloomQuery,
+	rowBloomQuery *BloomQuery,
+	pruneBloomQuery *BloomQuery,
+	regexQuery *compiledRegexQuery,
 	statsChan chan<- BlockStats,
 ) {
 	blockStartTime := time.Now()
@@ -983,7 +1002,7 @@ func (b *BloomSearchEngine) processDataBlock(
 		blockBloomFilters.FieldBloomFilter,
 		blockBloomFilters.TokenBloomFilter,
 		blockBloomFilters.FieldTokenBloomFilter,
-		bloomQuery,
+		pruneBloomQuery,
 	) {
 		bloomFilterSkipped = true
 		return
@@ -1051,7 +1070,8 @@ func (b *BloomSearchEngine) processDataBlock(
 			return
 		}
 
-		if !TestJSONForBloomQuery(rowBuf, bloomQuery, ".", b.config.Tokenizer) {
+		rowValue := gjson.ParseBytes(rowBuf)
+		if !TestGJSONForQuery(rowValue, rowBloomQuery, regexQuery, ".", b.config.Tokenizer) {
 			continue
 		}
 

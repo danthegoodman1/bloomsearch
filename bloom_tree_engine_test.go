@@ -1572,3 +1572,173 @@ func TestBloomSearchEngineMergeDifferentCompressionConfigs(t *testing.T) {
 
 	t.Log("SUCCESS: Files with different compression configs (None, Zstd, Snappy) were merged successfully!")
 }
+
+func TestBloomSearchEngineQueryRegexFinalStageAndOr(t *testing.T) {
+	testDir := "./test_data/query_test_regex_final_stage"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	dataStore := NewFileSystemDataStore(testDir)
+	metaStore := dataStore
+
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 4
+	config.MaxBufferedBytes = 1024 * 1024
+	config.MaxBufferedTime = 10 * time.Second
+	config.FileBloomExpectedItems = 100
+	config.BloomFalsePositiveRate = 0.01
+	config.RowDataCompression = CompressionNone
+
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	ctx := context.Background()
+	rows := []map[string]any{
+		{"id": 1.0, "service": "payment", "message": "timeout while charging"},
+		{"id": 2.0, "service": "payment", "message": "payment succeeded"},
+		{"id": 3.0, "service": "auth", "message": "timeout while login"},
+		{"id": 4.0, "service": "auth", "message": "login ok"},
+	}
+	flushAndWait(t, engine, ctx, rows, "regex final-stage rows")
+
+	runQueryTest(t, engine, ctx, "Regex should run as final stage with internal AND/OR",
+		NewQuery().
+			Field("service").
+			MatchRegex(
+				RegexAnd(
+					RegexOr(
+						FieldRegex("service", "^payment$"),
+						FieldRegex("service", "^auth$"),
+					),
+					FieldRegex("message", "timeout"),
+				),
+			),
+		2,
+		[]map[string]any{rows[0], rows[2]},
+	)
+}
+
+func TestBloomSearchEngineQueryInvalidRegexReturnsError(t *testing.T) {
+	testDir := "./test_data/query_test_regex_invalid"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	dataStore := NewFileSystemDataStore(testDir)
+	metaStore := dataStore
+
+	config := DefaultBloomSearchEngineConfig()
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	resultChan := make(chan map[string]any, 10)
+	errorChan := make(chan error, 10)
+	statsChan := make(chan BlockStats, 10)
+	query := NewQuery().FieldRegex("message", "[unterminated(").Build()
+
+	err = engine.Query(context.Background(), query, resultChan, errorChan, statsChan)
+	if err == nil {
+		t.Fatalf("expected regex compile error but got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to compile regex query") {
+		t.Fatalf("expected compile regex error, got: %v", err)
+	}
+}
+
+func TestBloomSearchEngineRegexFieldGuardPrunesFiles(t *testing.T) {
+	testDir := "./test_data/query_test_regex_pruning"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	dataStore := NewFileSystemDataStore(testDir)
+	metaStore := dataStore
+
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 1
+	config.MaxBufferedBytes = 1024 * 1024
+	config.MaxBufferedTime = 10 * time.Second
+	config.FileBloomExpectedItems = 100
+	config.BloomFalsePositiveRate = 0.01
+	config.RowDataCompression = CompressionNone
+
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	ctx := context.Background()
+	flushAndWait(t, engine, ctx, []map[string]any{
+		{"id": 1.0, "service": "payment"},
+	}, "row without regex field")
+	flushAndWait(t, engine, ctx, []map[string]any{
+		{"id": 2.0, "service": "auth", "message": "timeout"},
+	}, "row with regex field")
+
+	resultChan := make(chan map[string]any, 10)
+	errorChan := make(chan error, 10)
+	statsChan := make(chan BlockStats, 10)
+
+	query := NewQuery().
+		FieldRegex("message", "timeout").
+		Build()
+
+	err = engine.Query(ctx, query, resultChan, errorChan, statsChan)
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+
+	var results []map[string]any
+	for row := range resultChan {
+		results = append(results, row)
+	}
+
+	select {
+	case queryErr := <-errorChan:
+		if queryErr != nil {
+			t.Fatalf("Query returned error: %v", queryErr)
+		}
+	default:
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	var stats []BlockStats
+	for {
+		select {
+		case stat := <-statsChan:
+			stats = append(stats, stat)
+		default:
+			goto doneStats
+		}
+	}
+
+doneStats:
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0]["id"] != 2.0 {
+		t.Fatalf("expected row id=2.0, got %v", results[0]["id"])
+	}
+	if len(stats) != 1 {
+		t.Fatalf("expected only one block to be processed due regex field pruning, got %d", len(stats))
+	}
+}

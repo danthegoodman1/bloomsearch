@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/tidwall/gjson"
 )
 
 func TestUniqueFields(t *testing.T) {
@@ -273,5 +274,40 @@ func TestJSONMatching(t *testing.T) {
 		assert.True(t, TestJSONForFieldToken(jsonStr, "user.tags.role", ".", "user", BasicWhitespaceLowerTokenizer))
 		assert.False(t, TestJSONForFieldToken(jsonStr, "user.tags.type", ".", "user", BasicWhitespaceLowerTokenizer))
 		assert.False(t, TestJSONForFieldToken(jsonStr, "user.tags.role", ".", "admin", BasicWhitespaceLowerTokenizer))
+	})
+}
+
+func TestRegexQueryMatching(t *testing.T) {
+	t.Run("FieldRegexMatchesNestedValuesAndNonStringPrimitives", func(t *testing.T) {
+		query := NewQuery().
+			MatchRegex(
+				RegexAnd(
+					FieldRegex("users.name", "(?i)^jo"),
+					RegexOr(
+						FieldRegex("users.active", "^true$"),
+						FieldRegex("users.id", "^2$"),
+					),
+				),
+			).
+			Build()
+
+		compiledRegexQuery, err := CompileRegexQuery(query.Regex)
+		assert.NoError(t, err)
+
+		matchingJSON := `{"users":[{"id":1,"name":"John","active":true},{"id":2,"name":"Jane","active":false}]}`
+		nonMatchingJSON := `{"users":[{"id":3,"name":"Alice","active":false}]}`
+
+		assert.True(t, TestGJSONForQuery(gjson.Parse(matchingJSON), nil, compiledRegexQuery, ".", BasicWhitespaceLowerTokenizer))
+		assert.False(t, TestGJSONForQuery(gjson.Parse(nonMatchingJSON), nil, compiledRegexQuery, ".", BasicWhitespaceLowerTokenizer))
+	})
+
+	t.Run("InvalidRegexFailsCompile", func(t *testing.T) {
+		query := NewQuery().
+			FieldRegex("message", "[unterminated(").
+			Build()
+
+		compiledRegexQuery, err := CompileRegexQuery(query.Regex)
+		assert.Error(t, err)
+		assert.Nil(t, compiledRegexQuery)
 	})
 }

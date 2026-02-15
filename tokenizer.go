@@ -3,6 +3,7 @@ package bloomsearch
 import (
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -294,6 +295,133 @@ func TestJSONForBloomQuery(jsonBytes []byte, bloomQuery *BloomQuery, delimiter s
 
 	value := gjson.ParseBytes(jsonBytes)
 	return testGJSONForBloomExpression(value, bloomQuery.Expression, delimiter, tokenizer)
+}
+
+type compiledRegexCondition struct {
+	field   string
+	pattern *regexp.Regexp
+}
+
+type compiledRegexExpression struct {
+	expressionType RegexExpressionType
+	condition      *compiledRegexCondition
+	children       []compiledRegexExpression
+}
+
+type compiledRegexQuery struct {
+	expression *compiledRegexExpression
+}
+
+func CompileRegexQuery(regexQuery *RegexQuery) (*compiledRegexQuery, error) {
+	if regexQuery == nil || regexQuery.Expression == nil {
+		return nil, nil
+	}
+
+	expression, err := compileRegexExpression(regexQuery.Expression)
+	if err != nil {
+		return nil, err
+	}
+	return &compiledRegexQuery{expression: expression}, nil
+}
+
+func compileRegexExpression(expression *RegexExpression) (*compiledRegexExpression, error) {
+	if expression == nil {
+		return nil, nil
+	}
+
+	switch expression.expressionType {
+	case regexExpressionCondition:
+		if expression.condition == nil {
+			return nil, nil
+		}
+		compiledPattern, err := regexp.Compile(expression.condition.Pattern)
+		if err != nil {
+			return nil, err
+		}
+		return &compiledRegexExpression{
+			expressionType: regexExpressionCondition,
+			condition: &compiledRegexCondition{
+				field:   expression.condition.Field,
+				pattern: compiledPattern,
+			},
+		}, nil
+	case regexExpressionAnd, regexExpressionOr:
+		children := make([]compiledRegexExpression, 0, len(expression.children))
+		for i := range expression.children {
+			child, err := compileRegexExpression(&expression.children[i])
+			if err != nil {
+				return nil, err
+			}
+			if child != nil {
+				children = append(children, *child)
+			}
+		}
+		return &compiledRegexExpression{
+			expressionType: expression.expressionType,
+			children:       children,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown regex expression type: %s", expression.expressionType)
+	}
+}
+
+func testGJSONForRegexCondition(value gjson.Result, condition *compiledRegexCondition, delimiter string) bool {
+	if condition == nil {
+		return true
+	}
+	pathComponents := strings.Split(condition.field, delimiter)
+	return walkJSONForFieldValue(value, pathComponents, 0, func(v gjson.Result) bool {
+		return condition.pattern.MatchString(fmt.Sprintf("%v", v.Value()))
+	})
+}
+
+func testGJSONForRegexExpression(value gjson.Result, expression *compiledRegexExpression, delimiter string) bool {
+	if expression == nil {
+		return true
+	}
+
+	switch expression.expressionType {
+	case regexExpressionCondition:
+		if expression.condition == nil {
+			return true
+		}
+		return testGJSONForRegexCondition(value, expression.condition, delimiter)
+	case regexExpressionOr:
+		if len(expression.children) == 0 {
+			return false
+		}
+		for i := range expression.children {
+			if testGJSONForRegexExpression(value, &expression.children[i], delimiter) {
+				return true
+			}
+		}
+		return false
+	case regexExpressionAnd:
+		for i := range expression.children {
+			if !testGJSONForRegexExpression(value, &expression.children[i], delimiter) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func TestGJSONForQuery(value gjson.Result, bloomQuery *BloomQuery, regexQuery *compiledRegexQuery, delimiter string, tokenizer ValueTokenizerFunc) bool {
+	if bloomQuery != nil && bloomQuery.Expression != nil {
+		if !testGJSONForBloomExpression(value, bloomQuery.Expression, delimiter, tokenizer) {
+			return false
+		}
+	}
+
+	if regexQuery != nil && regexQuery.expression != nil {
+		if !testGJSONForRegexExpression(value, regexQuery.expression, delimiter) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // Byte-based helpers that operate on a pre-parsed gjson.Result

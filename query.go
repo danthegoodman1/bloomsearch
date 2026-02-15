@@ -473,6 +473,29 @@ type BloomQuery struct {
 	Expression *BloomExpression `json:",omitempty"`
 }
 
+type RegexCondition struct {
+	Field   string
+	Pattern string
+}
+
+type RegexExpressionType string
+
+const (
+	regexExpressionCondition RegexExpressionType = "CONDITION"
+	regexExpressionAnd       RegexExpressionType = "AND"
+	regexExpressionOr        RegexExpressionType = "OR"
+)
+
+type RegexExpression struct {
+	expressionType RegexExpressionType
+	condition      *RegexCondition
+	children       []RegexExpression
+}
+
+type RegexQuery struct {
+	Expression *RegexExpression `json:",omitempty"`
+}
+
 func Field(field string) BloomExpression {
 	return BloomExpression{
 		expressionType: bloomExpressionCondition,
@@ -530,10 +553,116 @@ func flattenExpressions(expressions []BloomExpression, expressionType BloomExpre
 	return flattened
 }
 
-// Query combines prefiltering (partitions/minmax) with bloom filtering
+func FieldRegex(field, pattern string) RegexExpression {
+	return RegexExpression{
+		expressionType: regexExpressionCondition,
+		condition: &RegexCondition{
+			Field:   field,
+			Pattern: pattern,
+		},
+	}
+}
+
+func RegexAnd(expressions ...RegexExpression) RegexExpression {
+	return RegexExpression{
+		expressionType: regexExpressionAnd,
+		children:       flattenRegexExpressions(expressions, regexExpressionAnd),
+	}
+}
+
+func RegexOr(expressions ...RegexExpression) RegexExpression {
+	return RegexExpression{
+		expressionType: regexExpressionOr,
+		children:       flattenRegexExpressions(expressions, regexExpressionOr),
+	}
+}
+
+func flattenRegexExpressions(expressions []RegexExpression, expressionType RegexExpressionType) []RegexExpression {
+	flattened := make([]RegexExpression, 0, len(expressions))
+	for _, expression := range expressions {
+		if expression.expressionType == expressionType && expression.condition == nil {
+			flattened = append(flattened, expression.children...)
+			continue
+		}
+		flattened = append(flattened, expression)
+	}
+	return flattened
+}
+
+func regexExpressionToBloomFieldExpression(expression *RegexExpression) *BloomExpression {
+	if expression == nil {
+		return nil
+	}
+
+	switch expression.expressionType {
+	case regexExpressionCondition:
+		if expression.condition == nil {
+			return nil
+		}
+		condition := &BloomCondition{
+			Type:  BloomField,
+			Field: expression.condition.Field,
+		}
+		return &BloomExpression{
+			expressionType: bloomExpressionCondition,
+			condition:      condition,
+		}
+	case regexExpressionAnd:
+		children := make([]BloomExpression, 0, len(expression.children))
+		for i := range expression.children {
+			child := regexExpressionToBloomFieldExpression(&expression.children[i])
+			if child != nil {
+				children = append(children, *child)
+			}
+		}
+		return &BloomExpression{
+			expressionType: bloomExpressionAnd,
+			children:       children,
+		}
+	case regexExpressionOr:
+		children := make([]BloomExpression, 0, len(expression.children))
+		for i := range expression.children {
+			child := regexExpressionToBloomFieldExpression(&expression.children[i])
+			if child != nil {
+				children = append(children, *child)
+			}
+		}
+		return &BloomExpression{
+			expressionType: bloomExpressionOr,
+			children:       children,
+		}
+	default:
+		return nil
+	}
+}
+
+func RegexFieldGuardBloomQuery(query *RegexQuery) *BloomQuery {
+	if query == nil || query.Expression == nil {
+		return nil
+	}
+	expression := regexExpressionToBloomFieldExpression(query.Expression)
+	if expression == nil {
+		return nil
+	}
+	return &BloomQuery{Expression: expression}
+}
+
+func AndBloomQueries(left, right *BloomQuery) *BloomQuery {
+	if left == nil || left.Expression == nil {
+		return right
+	}
+	if right == nil || right.Expression == nil {
+		return left
+	}
+	combinedExpression := And(*left.Expression, *right.Expression)
+	return &BloomQuery{Expression: &combinedExpression}
+}
+
+// Query combines prefiltering (partitions/minmax), bloom filtering, and regex scan filtering.
 type Query struct {
 	Prefilter *QueryPrefilter // for partitions and minmax indexes
 	Bloom     *BloomQuery     // for field/token/fieldtoken searches
+	Regex     *RegexQuery     // for field-scoped regex scan filtering
 }
 
 // NewQuery creates a query builder with an implicit AND expression.
@@ -542,8 +671,10 @@ func NewQuery() *QueryBuilder {
 		query: &Query{
 			Prefilter: NewQueryPrefilter(),
 			Bloom:     &BloomQuery{},
+			Regex:     &RegexQuery{},
 		},
 		implicitBloomAnd: make([]BloomExpression, 0),
+		implicitRegexAnd: make([]RegexExpression, 0),
 	}
 }
 
@@ -552,6 +683,8 @@ type QueryBuilder struct {
 
 	bloomExplicitSet bool
 	implicitBloomAnd []BloomExpression
+	regexExplicitSet bool
+	implicitRegexAnd []RegexExpression
 }
 
 func (b *QueryBuilder) Field(field string) *QueryBuilder {
@@ -580,6 +713,22 @@ func (b *QueryBuilder) Match(expression BloomExpression) *QueryBuilder {
 	return b.where(expression)
 }
 
+func (b *QueryBuilder) FieldRegex(field, pattern string) *QueryBuilder {
+	b.addRegexExpression(FieldRegex(field, pattern))
+	return b
+}
+
+func (b *QueryBuilder) whereRegex(expression RegexExpression) *QueryBuilder {
+	b.regexExplicitSet = true
+	b.implicitRegexAnd = b.implicitRegexAnd[:0]
+	b.query.Regex.Expression = &expression
+	return b
+}
+
+func (b *QueryBuilder) MatchRegex(expression RegexExpression) *QueryBuilder {
+	return b.whereRegex(expression)
+}
+
 // Prefilter methods
 func (b *QueryBuilder) MatchPrefilter(expression PrefilterExpression) *QueryBuilder {
 	b.query.Prefilter.Expression = &expression
@@ -599,10 +748,27 @@ func (b *QueryBuilder) addBloomExpression(expression BloomExpression) {
 	b.implicitBloomAnd = append(b.implicitBloomAnd, expression)
 }
 
+func (b *QueryBuilder) addRegexExpression(expression RegexExpression) {
+	if b.regexExplicitSet {
+		if b.query.Regex.Expression == nil {
+			b.query.Regex.Expression = &expression
+			return
+		}
+		combined := RegexAnd(*b.query.Regex.Expression, expression)
+		b.query.Regex.Expression = &combined
+		return
+	}
+	b.implicitRegexAnd = append(b.implicitRegexAnd, expression)
+}
+
 func (b *QueryBuilder) Build() *Query {
 	if !b.bloomExplicitSet && len(b.implicitBloomAnd) > 0 {
 		expression := And(b.implicitBloomAnd...)
 		b.query.Bloom.Expression = &expression
+	}
+	if !b.regexExplicitSet && len(b.implicitRegexAnd) > 0 {
+		expression := RegexAnd(b.implicitRegexAnd...)
+		b.query.Regex.Expression = &expression
 	}
 	return b.query
 }
