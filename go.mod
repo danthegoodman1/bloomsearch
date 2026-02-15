@@ -1,6 +1,6 @@
 module github.com/danthegoodman1/bloomsearch
 
-go 1.24.0
+go 1.26.0
 
 require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.0

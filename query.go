@@ -49,50 +49,89 @@ const (
 	CombinatorOR  Combinator = "OR"
 )
 
-// QueryPrefilter represents a complete query with conditions on partitions and MinMaxIndexes.
-//
-// Partition conditions are OR-ed together (since a block can only belong to one partition)
-// MinMaxIndex conditions are OR-ed within a field, and either AND or OR-ed across fields (Default is AND).
+type prefilterConditionType string
+
+const (
+	prefilterConditionPartition prefilterConditionType = "PARTITION"
+	prefilterConditionMinMax    prefilterConditionType = "MINMAX"
+)
+
+type PrefilterCondition struct {
+	conditionType      prefilterConditionType
+	partitionCondition *StringCondition
+	minMaxFieldName    string
+	minMaxCondition    *NumericCondition
+}
+
+type prefilterExpressionType string
+
+const (
+	prefilterExpressionCondition prefilterExpressionType = "CONDITION"
+	prefilterExpressionAnd       prefilterExpressionType = "AND"
+	prefilterExpressionOr        prefilterExpressionType = "OR"
+)
+
+type PrefilterExpression struct {
+	expressionType prefilterExpressionType
+	condition      *PrefilterCondition
+	children       []PrefilterExpression
+}
+
+func Partition(condition StringCondition) PrefilterExpression {
+	return PrefilterExpression{
+		expressionType: prefilterExpressionCondition,
+		condition: &PrefilterCondition{
+			conditionType:      prefilterConditionPartition,
+			partitionCondition: &condition,
+		},
+	}
+}
+
+func MinMax(fieldName string, condition NumericCondition) PrefilterExpression {
+	return PrefilterExpression{
+		expressionType: prefilterExpressionCondition,
+		condition: &PrefilterCondition{
+			conditionType:   prefilterConditionMinMax,
+			minMaxFieldName: fieldName,
+			minMaxCondition: &condition,
+		},
+	}
+}
+
+func PrefilterAnd(expressions ...PrefilterExpression) PrefilterExpression {
+	return PrefilterExpression{
+		expressionType: prefilterExpressionAnd,
+		children:       flattenPrefilterExpressions(expressions, prefilterExpressionAnd),
+	}
+}
+
+func PrefilterOr(expressions ...PrefilterExpression) PrefilterExpression {
+	return PrefilterExpression{
+		expressionType: prefilterExpressionOr,
+		children:       flattenPrefilterExpressions(expressions, prefilterExpressionOr),
+	}
+}
+
+func flattenPrefilterExpressions(expressions []PrefilterExpression, expressionType prefilterExpressionType) []PrefilterExpression {
+	flattened := make([]PrefilterExpression, 0, len(expressions))
+	for _, expression := range expressions {
+		if expression.expressionType == expressionType && expression.condition == nil {
+			flattened = append(flattened, expression.children...)
+			continue
+		}
+		flattened = append(flattened, expression)
+	}
+	return flattened
+}
+
+// QueryPrefilter represents prefilter conditions against partition IDs and minmax indexes.
+// Expressions can be combined arbitrarily with AND/OR using PrefilterAnd and PrefilterOr.
 type QueryPrefilter struct {
-	// Partition conditions - these are OR-ed together (since a block can only belong to one partition)
-	PartitionConditions []StringCondition `json:",omitempty"`
-
-	// MinMaxIndex conditions - map field name to list of conditions (conditions are OR-ed within a field)
-	MinMaxConditions map[string][]NumericCondition `json:",omitempty"`
-
-	// How to combine conditions across different MinMaxIndex fields (AND or OR)
-	// Default is AND if not specified
-	MinMaxFieldCombinator Combinator `json:",omitempty"`
+	Expression *PrefilterExpression `json:",omitempty"`
 }
 
-// NewQueryPrefilter creates a new empty query condition with AND MinMaxIndex field combinator
 func NewQueryPrefilter() *QueryPrefilter {
-	return &QueryPrefilter{
-		PartitionConditions:   make([]StringCondition, 0),
-		MinMaxConditions:      make(map[string][]NumericCondition),
-		MinMaxFieldCombinator: CombinatorAND,
-	}
-}
-
-// AddPartitionCondition adds a partition condition
-func (q *QueryPrefilter) AddPartitionCondition(condition StringCondition) *QueryPrefilter {
-	q.PartitionConditions = append(q.PartitionConditions, condition)
-	return q
-}
-
-// AddMinMaxCondition adds a MinMaxIndex condition for a specific field
-func (q *QueryPrefilter) AddMinMaxCondition(fieldName string, condition NumericCondition) *QueryPrefilter {
-	if q.MinMaxConditions == nil {
-		q.MinMaxConditions = make(map[string][]NumericCondition)
-	}
-	q.MinMaxConditions[fieldName] = append(q.MinMaxConditions[fieldName], condition)
-	return q
-}
-
-// WithMinMaxFieldCombinator sets how conditions across different MinMaxIndex fields should be combined
-func (q *QueryPrefilter) WithMinMaxFieldCombinator(combinator Combinator) *QueryPrefilter {
-	q.MinMaxFieldCombinator = combinator
-	return q
+	return &QueryPrefilter{}
 }
 
 // Helper functions for creating common conditions
@@ -320,75 +359,66 @@ func EvaluateMinMaxCondition(minMaxIndex MinMaxIndex, condition NumericCondition
 	}
 }
 
-// EvaluateDataBlockMetadata checks if a DataBlockMetadata matches the query conditions
+// EvaluateDataBlockMetadata checks if a DataBlockMetadata matches the prefilter expression.
 func EvaluateDataBlockMetadata(metadata *DataBlockMetadata, query *QueryPrefilter) bool {
-	// Check partition conditions (any can match, since a block can only belong to one partition)
-	if len(query.PartitionConditions) > 0 {
-		partitionMatches := false
-		for _, partitionCondition := range query.PartitionConditions {
-			if EvaluateStringCondition(metadata.PartitionID, partitionCondition) {
-				partitionMatches = true
-				break
-			}
-		}
-		if !partitionMatches {
-			return false
-		}
+	if query == nil || query.Expression == nil {
+		return true
 	}
+	return evaluatePrefilterExpression(metadata, query.Expression)
+}
 
-	// Check MinMaxIndex conditions
-	if len(query.MinMaxConditions) == 0 {
-		// No MinMaxIndex conditions to check
+func evaluatePrefilterExpression(metadata *DataBlockMetadata, expression *PrefilterExpression) bool {
+	if expression == nil {
 		return true
 	}
 
-	// Handle OR case first, then fall through to AND (default)
-	if query.MinMaxFieldCombinator == CombinatorOR {
-		// Any field can match (within each field conditions are OR-ed)
-		for fieldName, conditions := range query.MinMaxConditions {
-			minMaxIndex, exists := metadata.MinMaxIndexes[fieldName]
-			if !exists {
-				// If the field doesn't exist in the metadata, skip this field
-				continue
-			}
-
-			// Check if any condition for this field matches
-			for _, condition := range conditions {
-				if EvaluateMinMaxCondition(minMaxIndex, condition) {
-					// Found a match, we can return true immediately
-					return true
-				}
+	switch expression.expressionType {
+	case prefilterExpressionCondition:
+		if expression.condition == nil {
+			return true
+		}
+		return evaluatePrefilterCondition(metadata, expression.condition)
+	case prefilterExpressionOr:
+		if len(expression.children) == 0 {
+			return false
+		}
+		for i := range expression.children {
+			if evaluatePrefilterExpression(metadata, &expression.children[i]) {
+				return true
 			}
 		}
-
-		// No field matched
+		return false
+	case prefilterExpressionAnd:
+		for i := range expression.children {
+			if !evaluatePrefilterExpression(metadata, &expression.children[i]) {
+				return false
+			}
+		}
+		return true
+	default:
 		return false
 	}
+}
 
-	// Default AND behavior: All fields must match (within each field conditions are OR-ed)
-	for fieldName, conditions := range query.MinMaxConditions {
-		minMaxIndex, exists := metadata.MinMaxIndexes[fieldName]
+func evaluatePrefilterCondition(metadata *DataBlockMetadata, condition *PrefilterCondition) bool {
+	switch condition.conditionType {
+	case prefilterConditionPartition:
+		if condition.partitionCondition == nil {
+			return true
+		}
+		return EvaluateStringCondition(metadata.PartitionID, *condition.partitionCondition)
+	case prefilterConditionMinMax:
+		if condition.minMaxCondition == nil {
+			return true
+		}
+		minMaxIndex, exists := metadata.MinMaxIndexes[condition.minMaxFieldName]
 		if !exists {
-			// If the field doesn't exist in the metadata, we can't match the condition
 			return false
 		}
-
-		// At least one condition for this field must match
-		fieldMatches := false
-		for _, condition := range conditions {
-			if EvaluateMinMaxCondition(minMaxIndex, condition) {
-				fieldMatches = true
-				break
-			}
-		}
-
-		if !fieldMatches {
-			return false
-		}
+		return EvaluateMinMaxCondition(minMaxIndex, *condition.minMaxCondition)
+	default:
+		return false
 	}
-
-	// Everything matched
-	return true
 }
 
 // FilterDataBlocks filters a slice of DataBlockMetadata based on query conditions
@@ -425,14 +455,79 @@ type BloomCondition struct {
 	Token string // for TOKEN and FIELD_TOKEN
 }
 
-type BloomGroup struct {
-	Conditions []BloomCondition
-	Combinator Combinator // how to combine conditions within this group
+type BloomExpressionType string
+
+const (
+	bloomExpressionCondition BloomExpressionType = "CONDITION"
+	bloomExpressionAnd       BloomExpressionType = "AND"
+	bloomExpressionOr        BloomExpressionType = "OR"
+)
+
+type BloomExpression struct {
+	expressionType BloomExpressionType
+	condition      *BloomCondition
+	children       []BloomExpression
 }
 
 type BloomQuery struct {
-	Groups     []BloomGroup
-	Combinator Combinator // how to combine groups (default AND)
+	Expression *BloomExpression `json:",omitempty"`
+}
+
+func Field(field string) BloomExpression {
+	return BloomExpression{
+		expressionType: bloomExpressionCondition,
+		condition: &BloomCondition{
+			Type:  BloomField,
+			Field: field,
+		},
+	}
+}
+
+func Token(token string) BloomExpression {
+	return BloomExpression{
+		expressionType: bloomExpressionCondition,
+		condition: &BloomCondition{
+			Type:  BloomToken,
+			Token: token,
+		},
+	}
+}
+
+func FieldToken(field, token string) BloomExpression {
+	return BloomExpression{
+		expressionType: bloomExpressionCondition,
+		condition: &BloomCondition{
+			Type:  BloomFieldToken,
+			Field: field,
+			Token: token,
+		},
+	}
+}
+
+func And(expressions ...BloomExpression) BloomExpression {
+	return BloomExpression{
+		expressionType: bloomExpressionAnd,
+		children:       flattenExpressions(expressions, bloomExpressionAnd),
+	}
+}
+
+func Or(expressions ...BloomExpression) BloomExpression {
+	return BloomExpression{
+		expressionType: bloomExpressionOr,
+		children:       flattenExpressions(expressions, bloomExpressionOr),
+	}
+}
+
+func flattenExpressions(expressions []BloomExpression, expressionType BloomExpressionType) []BloomExpression {
+	flattened := make([]BloomExpression, 0, len(expressions))
+	for _, expression := range expressions {
+		if expression.expressionType == expressionType && expression.condition == nil {
+			flattened = append(flattened, expression.children...)
+			continue
+		}
+		flattened = append(flattened, expression)
+	}
+	return flattened
 }
 
 // Query combines prefiltering (partitions/minmax) with bloom filtering
@@ -441,97 +536,73 @@ type Query struct {
 	Bloom     *BloomQuery     // for field/token/fieldtoken searches
 }
 
-func NewQueryWithGroupCombinator(queryCombinator Combinator) *QueryBuilder {
+// NewQuery creates a query builder with an implicit AND expression.
+func NewQuery() *QueryBuilder {
 	return &QueryBuilder{
 		query: &Query{
 			Prefilter: NewQueryPrefilter(),
-			Bloom:     &BloomQuery{Groups: []BloomGroup{}, Combinator: queryCombinator},
+			Bloom:     &BloomQuery{},
 		},
-		currentGroup: &BloomGroup{Conditions: []BloomCondition{}, Combinator: CombinatorAND},
+		implicitBloomAnd: make([]BloomExpression, 0),
 	}
 }
 
 type QueryBuilder struct {
-	query        *Query
-	currentGroup *BloomGroup
+	query *Query
+
+	bloomExplicitSet bool
+	implicitBloomAnd []BloomExpression
 }
 
-// Bloom filter methods
 func (b *QueryBuilder) Field(field string) *QueryBuilder {
-	b.ensureGroupStarted()
-	b.currentGroup.Conditions = append(b.currentGroup.Conditions, BloomCondition{
-		Type:  BloomField,
-		Field: field,
-	})
+	b.addBloomExpression(Field(field))
 	return b
 }
 
 func (b *QueryBuilder) Token(token string) *QueryBuilder {
-	b.ensureGroupStarted()
-	b.currentGroup.Conditions = append(b.currentGroup.Conditions, BloomCondition{
-		Type:  BloomToken,
-		Token: token,
-	})
+	b.addBloomExpression(Token(token))
 	return b
 }
 
 func (b *QueryBuilder) FieldToken(field, token string) *QueryBuilder {
-	b.ensureGroupStarted()
-	b.currentGroup.Conditions = append(b.currentGroup.Conditions, BloomCondition{
-		Type:  BloomFieldToken,
-		Field: field,
-		Token: token,
-	})
+	b.addBloomExpression(FieldToken(field, token))
 	return b
 }
 
-// ensureGroupStarted starts a default AND group if no group has been started
-func (b *QueryBuilder) ensureGroupStarted() {
-	// If we haven't started any groups and currentGroup is empty, this is the first group
-	if len(b.query.Bloom.Groups) == 0 && len(b.currentGroup.Conditions) == 0 {
-		// Set default group combinator to AND only if it hasn't been explicitly set
-		if b.currentGroup.Combinator == "" {
-			b.currentGroup.Combinator = CombinatorAND
+func (b *QueryBuilder) where(expression BloomExpression) *QueryBuilder {
+	b.bloomExplicitSet = true
+	b.implicitBloomAnd = b.implicitBloomAnd[:0]
+	b.query.Bloom.Expression = &expression
+	return b
+}
+
+func (b *QueryBuilder) Match(expression BloomExpression) *QueryBuilder {
+	return b.where(expression)
+}
+
+// Prefilter methods
+func (b *QueryBuilder) MatchPrefilter(expression PrefilterExpression) *QueryBuilder {
+	b.query.Prefilter.Expression = &expression
+	return b
+}
+
+func (b *QueryBuilder) addBloomExpression(expression BloomExpression) {
+	if b.bloomExplicitSet {
+		if b.query.Bloom.Expression == nil {
+			b.query.Bloom.Expression = &expression
+			return
 		}
+		combined := And(*b.query.Bloom.Expression, expression)
+		b.query.Bloom.Expression = &combined
+		return
 	}
-}
-
-// Group management - starts a new group with the specified combinator
-func (b *QueryBuilder) And() *QueryBuilder {
-	b.finishCurrentGroup()
-	b.currentGroup = &BloomGroup{Conditions: []BloomCondition{}, Combinator: CombinatorAND}
-	return b
-}
-
-func (b *QueryBuilder) Or() *QueryBuilder {
-	b.finishCurrentGroup()
-	b.currentGroup = &BloomGroup{Conditions: []BloomCondition{}, Combinator: CombinatorOR}
-	return b
-}
-
-// Prefilter methods (delegate to existing API)
-func (b *QueryBuilder) AddPartitionCondition(condition StringCondition) *QueryBuilder {
-	b.query.Prefilter.AddPartitionCondition(condition)
-	return b
-}
-
-func (b *QueryBuilder) AddMinMaxCondition(fieldName string, condition NumericCondition) *QueryBuilder {
-	b.query.Prefilter.AddMinMaxCondition(fieldName, condition)
-	return b
-}
-
-func (b *QueryBuilder) WithMinMaxFieldCombinator(combinator Combinator) *QueryBuilder {
-	b.query.Prefilter.WithMinMaxFieldCombinator(combinator)
-	return b
-}
-
-func (b *QueryBuilder) finishCurrentGroup() {
-	if len(b.currentGroup.Conditions) > 0 {
-		b.query.Bloom.Groups = append(b.query.Bloom.Groups, *b.currentGroup)
-	}
+	b.implicitBloomAnd = append(b.implicitBloomAnd, expression)
 }
 
 func (b *QueryBuilder) Build() *Query {
-	b.finishCurrentGroup()
+	if !b.bloomExplicitSet && len(b.implicitBloomAnd) > 0 {
+		expression := And(b.implicitBloomAnd...)
+		b.query.Bloom.Expression = &expression
+	}
 	return b.query
 }

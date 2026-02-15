@@ -1,4 +1,4 @@
-#  <img src="https://media.tenor.com/oarbV8g0O0gAAAAi/smiling-flower-kids%27-choice-awards.gif" width="36px" /> BloomSearch <img src="https://media.tenor.com/oarbV8g0O0gAAAAi/smiling-flower-kids%27-choice-awards.gif" width="36px" /> <!-- omit in toc -->
+#  BloomSearch <!-- omit in toc -->
 
 **Keyword search engine with hierarchical bloom filters for massive datasets**
 
@@ -55,7 +55,7 @@ errorChan := make(chan error, 10)
 err := engine.Query(
     ctx,
     // Query for rows where `.level: "error"`
-    NewQueryWithGroupCombinator(CombinatorAND).Field("level").Token("error").Build(),
+    NewQuery().Field("level").Token("error").Build(),
     resultChan,
     errorChan,
 )
@@ -122,35 +122,54 @@ Given example log records:
 **Field search** - Find records containing a specific field path:
 ```go
 // Find all records with "retry_count" field
-query := NewQueryWithGroupCombinator(CombinatorAND).Field("retry_count").Build()
+query := NewQuery().Field("retry_count").Build()
 ```
 
 **Token search** - Find records containing a value anywhere:
 ```go
 // Find all records containing "error" in any field
-query := NewQueryWithGroupCombinator(CombinatorAND).Token("error").Build()
+query := NewQuery().Token("error").Build()
 ```
 
 **Field:token search** - Find records with a specific value in a specific field:
 ```go
 // Find all records where `.service: "payment"`
-query := NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "payment").Build()
+query := NewQuery().FieldToken("service", "payment").Build()
 ```
 
 **Complex combinations**:
 ```go
-// (field AND token) AND fieldtoken (groups combined with AND)
-query := NewQueryWithGroupCombinator(CombinatorAND).
-    Field("retry_count").Token("error").        // group1: AND within group
-    And().FieldToken("service", "payment").     // group2
+// (field AND token) OR fieldtoken
+query := NewQuery().
+    Match(
+        Or(
+            // And(Field, Token) means "field exists" AND "token exists anywhere" (can be different fields).
+            And(
+                Field("retry_count"),
+                Token("error"),
+            ),
+            // FieldToken means the token must be present in this specific field.
+            FieldToken("service", "payment"),
+        ),
+    ).
     Build()
 
-// (field AND token) OR fieldtoken (groups combined with OR)
-query := NewQueryWithGroupCombinator(CombinatorOR).
-    And().Field("retry_count").Token("error").  // group1: AND within group
-    And().FieldToken("service", "payment").     // group2
+// (service OR level) AND token:error
+query := NewQuery().
+    Match(
+        And(
+            Or(
+                Field("service"),
+                Field("level"),
+            ),
+            Token("error"),
+        ),
+    ).
     Build()
 ```
+
+`Match(...)` takes a boolean expression tree built from `And(...)` and `Or(...)`.
+Simple chained calls like `.Field(...).Token(...)` still default to implicit `AND`.
 
 Queries can be combined with AND/OR operators and filtered by [partitions](#partitions) and [minmax indexes](#minmax-indexes).
 
@@ -200,15 +219,18 @@ Track minimum and maximum values for numeric fields, enabling range-based prunin
 config.MinMaxIndexes = []string{"timestamp", "response_time"}
 
 // Query with range filter and bloom conditions
-query := NewQueryWithGroupCombinator(CombinatorAND).
-    AddMinMaxCondition("timestamp", NumericBetween(start, end)).
-    AddMinMaxCondition("response_time", NumericLessThan(1000)).
-    WithMinMaxFieldCombinator(CombinatorAND).
+query := NewQuery().
+    MatchPrefilter(
+        PrefilterAnd(
+            MinMax("timestamp", NumericBetween(start, end)),
+            MinMax("response_time", NumericLessThan(1000)),
+        ),
+    ).
     FieldToken("level", "error").
     Build()
 ```
 
-Within each field, conditions are OR-ed. Across fields, use `CombinatorAND` (default) or `CombinatorOR`.
+Use `MatchPrefilter(...)` with `PrefilterAnd(...)` / `PrefilterOr(...)` for prefilter logic.
 
 MinMax indexes are optional. When querying with range conditions, files without minmax indexes are always included to avoid missing data.
 
@@ -309,9 +331,13 @@ Query flow for `field`, `token`, or `field:token` combinations:
 
 ```go
 // Example query combining prefiltering with bloom search
-query := NewQueryWithGroupCombinator(CombinatorAND).
-    AddPartitionCondition(PartitionEquals("202301")).
-    AddMinMaxCondition("timestamp", NumericBetween(start, end)).
+query := NewQuery().
+    MatchPrefilter(
+        PrefilterOr(
+            Partition(PartitionEquals("202301")),
+            MinMax("timestamp", NumericBetween(start, end)),
+        ),
+    ).
     Field("user_id").Token("error").
     Build()
 

@@ -738,56 +738,50 @@ func (b *BloomSearchEngine) evaluateBloomFilters(
 	fieldTokenFilter *bloom.BloomFilter,
 	bloomQuery *BloomQuery,
 ) bool {
-	if bloomQuery == nil || len(bloomQuery.Groups) == 0 {
+	if bloomQuery == nil || bloomQuery.Expression == nil {
 		return true // No bloom filtering needed, since it's only used to DISQUALIFY files
 	}
 
-	// Combine with short-circuit logic
-	if bloomQuery.Combinator == CombinatorOR {
-		for i := range bloomQuery.Groups {
-			if b.evaluateBloomGroup(fieldFilter, tokenFilter, fieldTokenFilter, &bloomQuery.Groups[i]) {
-				return true
-			}
-		}
-		return false
-	}
-
-	// AND default
-	for i := range bloomQuery.Groups {
-		if !b.evaluateBloomGroup(fieldFilter, tokenFilter, fieldTokenFilter, &bloomQuery.Groups[i]) {
-			return false
-		}
-	}
-	return true
+	return b.evaluateBloomExpression(fieldFilter, tokenFilter, fieldTokenFilter, bloomQuery.Expression)
 }
 
-// evaluateBloomGroup tests if bloom filters match a single bloom group
-func (b *BloomSearchEngine) evaluateBloomGroup(
+// evaluateBloomExpression tests if bloom filters match a bloom expression tree
+func (b *BloomSearchEngine) evaluateBloomExpression(
 	fieldFilter *bloom.BloomFilter,
 	tokenFilter *bloom.BloomFilter,
 	fieldTokenFilter *bloom.BloomFilter,
-	group *BloomGroup,
+	expression *BloomExpression,
 ) bool {
-	if len(group.Conditions) == 0 {
-		return true // Empty group matches everything, since we can't disqualify it
+	if expression == nil {
+		return true
 	}
 
-	if group.Combinator == CombinatorOR {
-		for i := range group.Conditions {
-			if b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, &group.Conditions[i]) {
+	switch expression.expressionType {
+	case bloomExpressionCondition:
+		if expression.condition == nil {
+			return true
+		}
+		return b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, expression.condition)
+	case bloomExpressionOr:
+		if len(expression.children) == 0 {
+			return false
+		}
+		for i := range expression.children {
+			if b.evaluateBloomExpression(fieldFilter, tokenFilter, fieldTokenFilter, &expression.children[i]) {
 				return true
 			}
 		}
 		return false
-	}
-
-	// AND default
-	for i := range group.Conditions {
-		if !b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, &group.Conditions[i]) {
-			return false
+	case bloomExpressionAnd:
+		for i := range expression.children {
+			if !b.evaluateBloomExpression(fieldFilter, tokenFilter, fieldTokenFilter, &expression.children[i]) {
+				return false
+			}
 		}
+		return true
+	default:
+		return false
 	}
-	return true
 }
 
 // evaluateBloomCondition tests if bloom filters match a single bloom condition

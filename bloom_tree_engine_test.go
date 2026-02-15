@@ -326,37 +326,37 @@ func TestEvaluateBloomFilters(t *testing.T) {
 		},
 		{
 			name:     "field exists should return true",
-			query:    NewQueryWithGroupCombinator(CombinatorAND).Field("user.name").Build().Bloom,
+			query:    NewQuery().Field("user.name").Build().Bloom,
 			expected: true,
 		},
 		{
 			name:     "field does not exist should return false",
-			query:    NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent.field").Build().Bloom,
+			query:    NewQuery().Field("nonexistent.field").Build().Bloom,
 			expected: false,
 		},
 		{
 			name:     "token exists should return true",
-			query:    NewQueryWithGroupCombinator(CombinatorAND).Token("alice").Build().Bloom,
+			query:    NewQuery().Token("alice").Build().Bloom,
 			expected: true,
 		},
 		{
 			name:     "field-token exists should return true",
-			query:    NewQueryWithGroupCombinator(CombinatorAND).FieldToken("user.name", "alice").Build().Bloom,
+			query:    NewQuery().FieldToken("user.name", "alice").Build().Bloom,
 			expected: true,
 		},
 		{
 			name:     "OR condition with one match should return true",
-			query:    NewQueryWithGroupCombinator(CombinatorAND).Or().Field("nonexistent.field").Field("user.name").Build().Bloom,
+			query:    NewQuery().Match(Or(Field("nonexistent.field"), Field("user.name"))).Build().Bloom,
 			expected: true,
 		},
 		{
 			name:     "AND condition with one mismatch should return false",
-			query:    NewQueryWithGroupCombinator(CombinatorAND).And().Field("nonexistent.field").Field("user.name").Build().Bloom,
+			query:    NewQuery().Match(And(Field("nonexistent.field"), Field("user.name"))).Build().Bloom,
 			expected: false,
 		},
 		{
 			name:     "multiple groups with OR combinator should return true",
-			query:    NewQueryWithGroupCombinator(CombinatorOR).And().Field("nonexistent.field").And().FieldToken("user.name", "alice").Build().Bloom,
+			query:    NewQuery().Match(Or(Field("nonexistent.field"), FieldToken("user.name", "alice"))).Build().Bloom,
 			expected: true,
 		},
 	}
@@ -442,31 +442,31 @@ func TestBloomSearchEngineQueryEndToEndUncompressed(t *testing.T) {
 	}{
 		{
 			name:                "field search for 'level' should match both rows",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("level").Build(),
+			query:               NewQuery().Field("level").Build(),
 			expectedResultCount: 2,
 			expectedRows:        testRows, // Both rows have 'level' field
 		},
 		{
 			name:                "token search for 'alice' should match first row",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("alice").Build(),
+			query:               NewQuery().Token("alice").Build(),
 			expectedResultCount: 1,
 			expectedRows:        []map[string]any{testRows[0]}, // Only first row has 'Alice' (tokenized as 'alice')
 		},
 		{
 			name:                "field-token search for 'level:error' should match first row",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error").Build(),
+			query:               NewQuery().FieldToken("level", "error").Build(),
 			expectedResultCount: 1,
 			expectedRows:        []map[string]any{testRows[0]}, // Only first row has level=error
 		},
 		{
 			name:                "field search for nonexistent field should not match",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent").Build(),
+			query:               NewQuery().Field("nonexistent").Build(),
 			expectedResultCount: 0,
 			expectedRows:        []map[string]any{},
 		},
 		{
 			name:                "token search for nonexistent token should not match",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent").Build(),
+			query:               NewQuery().Token("nonexistent").Build(),
 			expectedResultCount: 0,
 			expectedRows:        []map[string]any{},
 		},
@@ -614,31 +614,31 @@ func TestBloomSearchEngineQueryEndToEndZstd(t *testing.T) {
 	}{
 		{
 			name:                "field search for 'level' should match both rows",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("level").Build(),
+			query:               NewQuery().Field("level").Build(),
 			expectedResultCount: 2,
 			expectedRows:        testRows, // Both rows have 'level' field
 		},
 		{
 			name:                "token search for 'alice' should match first row",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("alice").Build(),
+			query:               NewQuery().Token("alice").Build(),
 			expectedResultCount: 1,
 			expectedRows:        []map[string]any{testRows[0]}, // Only first row has 'Alice' (tokenized as 'alice')
 		},
 		{
 			name:                "field-token search for 'level:error' should match first row",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error").Build(),
+			query:               NewQuery().FieldToken("level", "error").Build(),
 			expectedResultCount: 1,
 			expectedRows:        []map[string]any{testRows[0]}, // Only first row has level=error
 		},
 		{
 			name:                "field search for nonexistent field should not match",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent").Build(),
+			query:               NewQuery().Field("nonexistent").Build(),
 			expectedResultCount: 0,
 			expectedRows:        []map[string]any{},
 		},
 		{
 			name:                "token search for nonexistent token should not match",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent").Build(),
+			query:               NewQuery().Token("nonexistent").Build(),
 			expectedResultCount: 0,
 			expectedRows:        []map[string]any{},
 		},
@@ -786,31 +786,31 @@ func TestBloomSearchEngineQueryEndToEndSnappy(t *testing.T) {
 	}{
 		{
 			name:                "field search for 'level' should match both rows",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("level").Build(),
+			query:               NewQuery().Field("level").Build(),
 			expectedResultCount: 2,
 			expectedRows:        testRows, // Both rows have 'level' field
 		},
 		{
 			name:                "token search for 'alice' should match first row",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("alice").Build(),
+			query:               NewQuery().Token("alice").Build(),
 			expectedResultCount: 1,
 			expectedRows:        []map[string]any{testRows[0]}, // Only first row has 'Alice' (tokenized as 'alice')
 		},
 		{
 			name:                "field-token search for 'level:error' should match first row",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error").Build(),
+			query:               NewQuery().FieldToken("level", "error").Build(),
 			expectedResultCount: 1,
 			expectedRows:        []map[string]any{testRows[0]}, // Only first row has level=error
 		},
 		{
 			name:                "field search for nonexistent field should not match",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent").Build(),
+			query:               NewQuery().Field("nonexistent").Build(),
 			expectedResultCount: 0,
 			expectedRows:        []map[string]any{},
 		},
 		{
 			name:                "token search for nonexistent token should not match",
-			query:               NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent").Build(),
+			query:               NewQuery().Token("nonexistent").Build(),
 			expectedResultCount: 0,
 			expectedRows:        []map[string]any{},
 		},
@@ -1035,55 +1035,55 @@ func TestBloomSearchEngineMergeEndToEndUncompressed(t *testing.T) {
 
 	// All rows have 'level' field
 	runQueryTest(t, engine, ctx, "field search for 'level' should match all rows",
-		NewQueryWithGroupCombinator(CombinatorAND).Field("level"),
+		NewQuery().Field("level"),
 		len(allTestData), allTestData)
 
 	// Only Alice and Eve have tokens that include 'alice' and 'eve'
 	runQueryTest(t, engine, ctx, "token search for 'alice' should match first row",
-		NewQueryWithGroupCombinator(CombinatorAND).Token("alice"),
+		NewQuery().Token("alice"),
 		1, []map[string]any{batch1[0]})
 
 	// Alice and Diana have level=error
 	expectedErrorRows := []map[string]any{batch1[0], batch2[1]}
 	runQueryTest(t, engine, ctx, "field-token search for 'level:error' should match error rows",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error"),
+		NewQuery().FieldToken("level", "error"),
 		2, expectedErrorRows)
 
 	// Auth service appears in batch1[0] and batch2[0]
 	expectedAuthRows := []map[string]any{batch1[0], batch2[0]}
 	runQueryTest(t, engine, ctx, "field-token search for 'service:auth' should match auth rows",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "auth"),
+		NewQuery().FieldToken("service", "auth"),
 		2, expectedAuthRows)
 
 	// Test queries targeting data from the single unmergeable file (batch 4)
 	runQueryTest(t, engine, ctx, "token search for 'grace' should match single file row",
-		NewQueryWithGroupCombinator(CombinatorAND).Token("grace"),
+		NewQuery().Token("grace"),
 		1, []map[string]any{batch4[0]})
 
 	runQueryTest(t, engine, ctx, "token search for 'henry' should match single file row",
-		NewQueryWithGroupCombinator(CombinatorAND).Token("henry"),
+		NewQuery().Token("henry"),
 		1, []map[string]any{batch4[1]})
 
 	runQueryTest(t, engine, ctx, "field-token search for 'service:monitoring' should match single file row",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "monitoring"),
+		NewQuery().FieldToken("service", "monitoring"),
 		1, []map[string]any{batch4[0]})
 
 	runQueryTest(t, engine, ctx, "field-token search for 'service:logging' should match single file row",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "logging"),
+		NewQuery().FieldToken("service", "logging"),
 		1, []map[string]any{batch4[1]})
 
 	// Test cross-file queries that should match data from both merged and single files
 	runQueryTest(t, engine, ctx, "field-token search for 'level:warn' should match rows from merged and single files",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "warn"),
+		NewQuery().FieldToken("level", "warn"),
 		2, []map[string]any{batch2[0], batch4[0]}) // Charlie and Grace
 
 	// Test nonexistent queries
 	runQueryTest(t, engine, ctx, "field search for nonexistent field should not match",
-		NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent"),
+		NewQuery().Field("nonexistent"),
 		0, []map[string]any{})
 
 	runQueryTest(t, engine, ctx, "token search for nonexistent token should not match",
-		NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent"),
+		NewQuery().Token("nonexistent"),
 		0, []map[string]any{})
 
 	// Now perform merge
@@ -1102,53 +1102,53 @@ func TestBloomSearchEngineMergeEndToEndUncompressed(t *testing.T) {
 
 	// All rows should still have 'level' field
 	runQueryTest(t, engine, ctx, "AFTER MERGE: field search for 'level' should match all rows",
-		NewQueryWithGroupCombinator(CombinatorAND).Field("level"),
+		NewQuery().Field("level"),
 		len(allTestData), allTestData)
 
 	// Alice should still be found
 	runQueryTest(t, engine, ctx, "AFTER MERGE: token search for 'alice' should match first row",
-		NewQueryWithGroupCombinator(CombinatorAND).Token("alice"),
+		NewQuery().Token("alice"),
 		1, []map[string]any{batch1[0]})
 
 	// Error level rows should still match
 	runQueryTest(t, engine, ctx, "AFTER MERGE: field-token search for 'level:error' should match error rows",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "error"),
+		NewQuery().FieldToken("level", "error"),
 		2, expectedErrorRows)
 
 	// Auth service rows should still match
 	runQueryTest(t, engine, ctx, "AFTER MERGE: field-token search for 'service:auth' should match auth rows",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "auth"),
+		NewQuery().FieldToken("service", "auth"),
 		2, expectedAuthRows)
 
 	// Test that single file data is still accessible after merge
 	runQueryTest(t, engine, ctx, "AFTER MERGE: token search for 'grace' should match single file row",
-		NewQueryWithGroupCombinator(CombinatorAND).Token("grace"),
+		NewQuery().Token("grace"),
 		1, []map[string]any{batch4[0]})
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: token search for 'henry' should match single file row",
-		NewQueryWithGroupCombinator(CombinatorAND).Token("henry"),
+		NewQuery().Token("henry"),
 		1, []map[string]any{batch4[1]})
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: field-token search for 'service:monitoring' should match single file row",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "monitoring"),
+		NewQuery().FieldToken("service", "monitoring"),
 		1, []map[string]any{batch4[0]})
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: field-token search for 'service:logging' should match single file row",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("service", "logging"),
+		NewQuery().FieldToken("service", "logging"),
 		1, []map[string]any{batch4[1]})
 
 	// Test cross-file queries still work after merge
 	runQueryTest(t, engine, ctx, "AFTER MERGE: field-token search for 'level:warn' should match rows from merged and single files",
-		NewQueryWithGroupCombinator(CombinatorAND).FieldToken("level", "warn"),
+		NewQuery().FieldToken("level", "warn"),
 		2, []map[string]any{batch2[0], batch4[0]}) // Charlie and Grace
 
 	// Nonexistent queries should still return nothing
 	runQueryTest(t, engine, ctx, "AFTER MERGE: field search for nonexistent field should not match",
-		NewQueryWithGroupCombinator(CombinatorAND).Field("nonexistent"),
+		NewQuery().Field("nonexistent"),
 		0, []map[string]any{})
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: token search for nonexistent token should not match",
-		NewQueryWithGroupCombinator(CombinatorAND).Token("nonexistent"),
+		NewQuery().Token("nonexistent"),
 		0, []map[string]any{})
 
 	t.Log("=== All tests passed! Merge operation preserved data integrity ===")
@@ -1281,64 +1281,68 @@ func TestBloomSearchEngineMergeWithPartitionsAndMinMax(t *testing.T) {
 	// Test partition-specific queries
 	authPartitionRows := []map[string]any{batch1[0], batch1[2], batch2[0], batch2[2], batch4[0]} // auth/user service rows
 	runQueryTest(t, engine, ctx, "Partition query: auth_partition should match auth/user service rows",
-		NewQueryWithGroupCombinator(CombinatorAND).AddPartitionCondition(PartitionEquals("auth_partition")),
+		NewQuery().MatchPrefilter(Partition(PartitionEquals("auth_partition"))),
 		len(authPartitionRows), authPartitionRows)
 
 	financialPartitionRows := []map[string]any{batch1[1], batch2[1], batch4[1]} // payment/billing service rows
 	runQueryTest(t, engine, ctx, "Partition query: financial_partition should match payment/billing service rows",
-		NewQueryWithGroupCombinator(CombinatorAND).AddPartitionCondition(PartitionEquals("financial_partition")),
+		NewQuery().MatchPrefilter(Partition(PartitionEquals("financial_partition"))),
 		len(financialPartitionRows), financialPartitionRows)
 
 	apiPartitionRows := []map[string]any{batch3[0], batch3[1], batch3[2]} // api/gateway service rows
 	runQueryTest(t, engine, ctx, "Partition query: api_partition should match api/gateway service rows",
-		NewQueryWithGroupCombinator(CombinatorAND).AddPartitionCondition(PartitionEquals("api_partition")),
+		NewQuery().MatchPrefilter(Partition(PartitionEquals("api_partition"))),
 		len(apiPartitionRows), apiPartitionRows)
 
 	otherPartitionRows := []map[string]any{batch4[2]} // monitoring service row
 	runQueryTest(t, engine, ctx, "Partition query: other_partition should match monitoring service row",
-		NewQueryWithGroupCombinator(CombinatorAND).AddPartitionCondition(PartitionEquals("other_partition")),
+		NewQuery().MatchPrefilter(Partition(PartitionEquals("other_partition"))),
 		len(otherPartitionRows), otherPartitionRows)
 
 	// Test MinMax index range queries
 	// NOTE: MinMax indexes work at the block level, so queries might return more results
 	// than expected if blocks contain data outside the exact query range
 	runQueryTest(t, engine, ctx, "MinMax query: timestamp <= 1200 should match early rows (may include more due to block-level MinMax)",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("timestamp", NumericLessThanEqual(1200)),
+		NewQuery().MatchPrefilter(MinMax("timestamp", NumericLessThanEqual(1200))),
 		-1, nil) // Skip validation due to block-level MinMax behavior
 
 	midTimestampRows := []map[string]any{batch2[0], batch2[1], batch2[2]} // timestamp between 2000-2200
 	runQueryTest(t, engine, ctx, "MinMax query: timestamp between 2000-2200 should match mid rows",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("timestamp", NumericBetween(2000, 2200)),
+		NewQuery().MatchPrefilter(MinMax("timestamp", NumericBetween(2000, 2200))),
 		len(midTimestampRows), midTimestampRows)
 
 	runQueryTest(t, engine, ctx, "MinMax query: response_time <= 30 should match fast responses (may include more due to block-level MinMax)",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("response_time", NumericLessThanEqual(30)),
+		NewQuery().MatchPrefilter(MinMax("response_time", NumericLessThanEqual(30))),
 		-1, nil) // Skip validation due to block-level MinMax behavior
 
 	slowResponseRows := []map[string]any{batch2[1], batch4[0], batch4[2]} // response_time >= 200
 	runQueryTest(t, engine, ctx, "MinMax query: response_time >= 200 should match slow responses",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("response_time", NumericGreaterThanEqual(200)),
+		NewQuery().MatchPrefilter(MinMax("response_time", NumericGreaterThanEqual(200))),
 		len(slowResponseRows), slowResponseRows)
 
 	// Test combined partition + MinMax queries
 	runQueryTest(t, engine, ctx, "Combined query: auth_partition + early timestamp should match auth early rows (may include more due to block-level MinMax)",
-		NewQueryWithGroupCombinator(CombinatorAND).
-			AddPartitionCondition(PartitionEquals("auth_partition")).
-			AddMinMaxCondition("timestamp", NumericLessThanEqual(1200)),
+		NewQuery().
+			MatchPrefilter(PrefilterAnd(
+				Partition(PartitionEquals("auth_partition")),
+				MinMax("timestamp", NumericLessThanEqual(1200)),
+			)),
 		-1, nil) // Skip validation due to block-level MinMax behavior
 
 	financialSlowRows := []map[string]any{batch2[1]} // financial partition + slow response
 	runQueryTest(t, engine, ctx, "Combined query: financial_partition + slow response should match billing row",
-		NewQueryWithGroupCombinator(CombinatorAND).
-			AddPartitionCondition(PartitionEquals("financial_partition")).
-			AddMinMaxCondition("response_time", NumericGreaterThanEqual(200)),
+		NewQuery().
+			MatchPrefilter(PrefilterAnd(
+				Partition(PartitionEquals("financial_partition")),
+				MinMax("response_time", NumericGreaterThanEqual(200)),
+			)),
 		len(financialSlowRows), financialSlowRows)
 
 	// Test bloom filter queries combined with partitions/minmax
 	authInfoRows := []map[string]any{batch1[0], batch2[0], batch2[2]} // auth partition + info level
 	runQueryTest(t, engine, ctx, "Bloom + partition query: auth_partition + info level",
-		NewQueryWithGroupCombinator(CombinatorAND).
-			AddPartitionCondition(PartitionEquals("auth_partition")).
+		NewQuery().
+			MatchPrefilter(Partition(PartitionEquals("auth_partition"))).
 			FieldToken("level", "info"),
 		len(authInfoRows), authInfoRows)
 
@@ -1358,19 +1362,19 @@ func TestBloomSearchEngineMergeWithPartitionsAndMinMax(t *testing.T) {
 
 	// Test partition-specific queries after merge
 	runQueryTest(t, engine, ctx, "AFTER MERGE: Partition query: auth_partition should match auth/user service rows",
-		NewQueryWithGroupCombinator(CombinatorAND).AddPartitionCondition(PartitionEquals("auth_partition")),
+		NewQuery().MatchPrefilter(Partition(PartitionEquals("auth_partition"))),
 		len(authPartitionRows), authPartitionRows)
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: Partition query: financial_partition should match payment/billing service rows",
-		NewQueryWithGroupCombinator(CombinatorAND).AddPartitionCondition(PartitionEquals("financial_partition")),
+		NewQuery().MatchPrefilter(Partition(PartitionEquals("financial_partition"))),
 		len(financialPartitionRows), financialPartitionRows)
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: Partition query: api_partition should match api/gateway service rows",
-		NewQueryWithGroupCombinator(CombinatorAND).AddPartitionCondition(PartitionEquals("api_partition")),
+		NewQuery().MatchPrefilter(Partition(PartitionEquals("api_partition"))),
 		len(apiPartitionRows), apiPartitionRows)
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: Partition query: other_partition should match monitoring service row",
-		NewQueryWithGroupCombinator(CombinatorAND).AddPartitionCondition(PartitionEquals("other_partition")),
+		NewQuery().MatchPrefilter(Partition(PartitionEquals("other_partition"))),
 		len(otherPartitionRows), otherPartitionRows)
 
 	// Test MinMax index range queries after merge
@@ -1380,50 +1384,54 @@ func TestBloomSearchEngineMergeWithPartitionsAndMinMax(t *testing.T) {
 	// After merge, the merged MinMax indexes will have expanded ranges,
 	// so we need to account for the fact that more data might match
 	runQueryTest(t, engine, ctx, "AFTER MERGE: MinMax query: timestamp <= 1200 should match early rows and possibly more due to merged ranges",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("timestamp", NumericLessThanEqual(1200)),
+		NewQuery().MatchPrefilter(MinMax("timestamp", NumericLessThanEqual(1200))),
 		-1, nil) // Use -1 to skip count validation since merging can expand matches
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: MinMax query: timestamp between 2000-2200 should match mid rows and possibly more due to merged ranges",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("timestamp", NumericBetween(2000, 2200)),
+		NewQuery().MatchPrefilter(MinMax("timestamp", NumericBetween(2000, 2200))),
 		-1, nil) // Use -1 to skip count validation since merging can expand matches
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: MinMax query: response_time <= 30 should match fast responses and possibly more due to merged ranges",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("response_time", NumericLessThanEqual(30)),
+		NewQuery().MatchPrefilter(MinMax("response_time", NumericLessThanEqual(30))),
 		-1, nil) // Use -1 to skip count validation since merging can expand matches
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: MinMax query: response_time >= 200 should match slow responses and possibly more due to merged ranges",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("response_time", NumericGreaterThanEqual(200)),
+		NewQuery().MatchPrefilter(MinMax("response_time", NumericGreaterThanEqual(200))),
 		-1, nil) // Use -1 to skip count validation since merging can expand matches
 
 	// Test combined partition + MinMax queries after merge
 	runQueryTest(t, engine, ctx, "AFTER MERGE: Combined query: auth_partition + early timestamp should match auth early rows and possibly more due to merged ranges",
-		NewQueryWithGroupCombinator(CombinatorAND).
-			AddPartitionCondition(PartitionEquals("auth_partition")).
-			AddMinMaxCondition("timestamp", NumericLessThanEqual(1200)),
+		NewQuery().
+			MatchPrefilter(PrefilterAnd(
+				Partition(PartitionEquals("auth_partition")),
+				MinMax("timestamp", NumericLessThanEqual(1200)),
+			)),
 		-1, nil) // Use -1 to skip count validation since merging can expand matches
 
 	runQueryTest(t, engine, ctx, "AFTER MERGE: Combined query: financial_partition + slow response should match billing row and possibly more due to merged ranges",
-		NewQueryWithGroupCombinator(CombinatorAND).
-			AddPartitionCondition(PartitionEquals("financial_partition")).
-			AddMinMaxCondition("response_time", NumericGreaterThanEqual(200)),
+		NewQuery().
+			MatchPrefilter(PrefilterAnd(
+				Partition(PartitionEquals("financial_partition")),
+				MinMax("response_time", NumericGreaterThanEqual(200)),
+			)),
 		-1, nil) // Use -1 to skip count validation since merging can expand matches
 
 	// Test bloom filter queries combined with partitions/minmax after merge
 	runQueryTest(t, engine, ctx, "AFTER MERGE: Bloom + partition query: auth_partition + info level",
-		NewQueryWithGroupCombinator(CombinatorAND).
-			AddPartitionCondition(PartitionEquals("auth_partition")).
+		NewQuery().
+			MatchPrefilter(Partition(PartitionEquals("auth_partition"))).
 			FieldToken("level", "info"),
 		len(authInfoRows), authInfoRows)
 
 	// Test edge cases with minmax indexes after merge
 	// Query for timestamp range that should expand due to merging
 	runQueryTest(t, engine, ctx, "AFTER MERGE: MinMax query: expanded timestamp range 500-2500 should include merged ranges",
-		NewQueryWithGroupCombinator(CombinatorAND).AddMinMaxCondition("timestamp", NumericBetween(500, 2500)),
+		NewQuery().MatchPrefilter(MinMax("timestamp", NumericBetween(500, 2500))),
 		-1, nil) // Skip validation since merging expands ranges
 
 	// Test that all data is still accessible
 	runQueryTest(t, engine, ctx, "AFTER MERGE: All data should still be accessible",
-		NewQueryWithGroupCombinator(CombinatorAND).Field("id"),
+		NewQuery().Field("id"),
 		len(allTestData), allTestData)
 
 	t.Log("=== All partition and MinMax tests passed! Merge operation preserved data integrity ===")
@@ -1559,7 +1567,7 @@ func TestBloomSearchEngineMergeDifferentCompressionConfigs(t *testing.T) {
 	}
 
 	runQueryTest(t, finalEngine, ctx, "All data should be accessible after merge",
-		NewQueryWithGroupCombinator(CombinatorAND).Field("name"),
+		NewQuery().Field("name"),
 		6, allData)
 
 	t.Log("SUCCESS: Files with different compression configs (None, Zstd, Snappy) were merged successfully!")

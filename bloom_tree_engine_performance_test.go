@@ -323,18 +323,18 @@ func TestQueryPerformance(t *testing.T) {
 	}{
 		{
 			name:        "field_match",
-			query:       NewQueryWithGroupCombinator(CombinatorAND).Field("SbdXwyPEKen").Build(),
+			query:       NewQuery().Field("SbdXwyPEKen").Build(),
 			description: "Match a field",
 		},
 		{
 			name:        "token_match",
-			query:       NewQueryWithGroupCombinator(CombinatorAND).Token("apple").Build(),
+			query:       NewQuery().Token("apple").Build(),
 			description: "Match a token",
 		},
 		{
 			name: "field_token_match",
-			// query: NewQueryWithGroupCombinator(CombinatorAND).FieldToken("loJ7iQtrw", "n0DQx").Build(),
-			query:       NewQueryWithGroupCombinator(CombinatorAND).FieldToken("b9DVOMloi", "apple").Build(),
+			// query: NewQuery().FieldToken("loJ7iQtrw", "n0DQx").Build(),
+			query:       NewQuery().FieldToken("b9DVOMloi", "apple").Build(),
 			description: "Match a field:token",
 		},
 	}
