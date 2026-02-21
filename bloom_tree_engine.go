@@ -1006,31 +1006,52 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 		}
 	}
 
-	var allJobs []dataBlockJob
+	totalJobs := 0
 	for _, matchingFile := range matchingFiles {
-		for _, blockMetadata := range matchingFile.Metadata.DataBlocks {
-			allJobs = append(allJobs, dataBlockJob{
-				filePointer:   matchingFile.PointerBytes,
-				blockMetadata: blockMetadata,
-			})
-		}
+		totalJobs += len(matchingFile.Metadata.DataBlocks)
 	}
+
+	if totalJobs == 0 {
+		close(resultChan)
+		return nil
+	}
+
+	workerCount := min(b.config.MaxQueryConcurrency, totalJobs)
+	jobs := make(chan dataBlockJob, workerCount)
 
 	var wg sync.WaitGroup
 	workerCtx, workerCancel := context.WithCancel(ctx)
-	for _, job := range allJobs {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func(job dataBlockJob) {
+		go func() {
 			defer wg.Done()
 
-			if err := SendWithContext(workerCtx, b.querySemaphore, struct{}{}); err != nil {
-				return
-			}
-			defer func() { <-b.querySemaphore }()
+			for job := range jobs {
+				if err := SendWithContext(workerCtx, b.querySemaphore, struct{}{}); err != nil {
+					return
+				}
 
-			b.processDataBlock(workerCtx, job, resultChan, errorChan, rowBloomQuery, pruneBloomQuery, compiledRegexQuery, statsChan)
-		}(job)
+				b.processDataBlock(workerCtx, job, resultChan, errorChan, rowBloomQuery, pruneBloomQuery, compiledRegexQuery, statsChan)
+				<-b.querySemaphore
+			}
+		}()
 	}
+
+	go func() {
+		defer close(jobs)
+
+		for _, matchingFile := range matchingFiles {
+			for _, blockMetadata := range matchingFile.Metadata.DataBlocks {
+				job := dataBlockJob{
+					filePointer:   matchingFile.PointerBytes,
+					blockMetadata: blockMetadata,
+				}
+				if err := SendWithContext(workerCtx, jobs, job); err != nil {
+					return
+				}
+			}
+		}
+	}()
 
 	// Close result channel when all workers are done
 	go func() {

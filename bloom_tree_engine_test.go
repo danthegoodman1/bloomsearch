@@ -1745,6 +1745,86 @@ doneStats:
 	}
 }
 
+func TestBloomSearchEngineQueryProcessesAllBlocksWithBoundedConcurrency(t *testing.T) {
+	testDir := "./test_data/query_test_bounded_workers"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	dataStore := NewFileSystemDataStore(testDir)
+	metaStore := dataStore
+
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 1
+	config.MaxBufferedBytes = 1024 * 1024
+	config.MaxBufferedTime = 10 * time.Second
+	config.FileBloomExpectedItems = 100
+	config.BloomFalsePositiveRate = 0.01
+	config.RowDataCompression = CompressionNone
+	config.MaxQueryConcurrency = 2
+
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	ctx := context.Background()
+	const totalRows = 40
+
+	for i := 0; i < totalRows; i++ {
+		row := map[string]any{
+			"id":      float64(i),
+			"service": "workerpool",
+		}
+		flushAndWait(t, engine, ctx, []map[string]any{row}, fmt.Sprintf("bounded worker row %d", i))
+	}
+
+	maybeFiles, err := dataStore.GetMaybeFilesForQuery(ctx, nil)
+	if err != nil {
+		t.Fatalf("Failed to read metadata for verification: %v", err)
+	}
+
+	totalBlocks := 0
+	for _, maybeFile := range maybeFiles {
+		totalBlocks += len(maybeFile.Metadata.DataBlocks)
+	}
+	if totalBlocks <= config.MaxQueryConcurrency {
+		t.Fatalf("test setup invalid: expected more blocks (%d) than MaxQueryConcurrency (%d)", totalBlocks, config.MaxQueryConcurrency)
+	}
+
+	resultChan := make(chan map[string]any, totalRows)
+	errorChan := make(chan error, totalRows)
+	statsChan := make(chan BlockStats, totalRows)
+
+	if err := engine.Query(ctx, NewQuery().Build(), resultChan, errorChan, statsChan); err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+
+	resultCount := 0
+	for range resultChan {
+		resultCount++
+	}
+
+	if resultCount != totalRows {
+		t.Fatalf("Expected %d results but got %d", totalRows, resultCount)
+	}
+
+	select {
+	case queryErr := <-errorChan:
+		if queryErr != nil {
+			t.Fatalf("Query returned error: %v", queryErr)
+		}
+	default:
+	}
+}
+
 type blockingFirstFlushWriteStore struct {
 	base               *FileSystemDataStore
 	mu                 sync.Mutex
