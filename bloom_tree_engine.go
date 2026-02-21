@@ -115,6 +115,7 @@ func (r *ingestRequest) reset() {
 type flushRequest struct {
 	partitionBuffers map[string]*partitionBuffer
 	doneChans        []chan error
+	fileBloomFilters BloomFilters
 }
 
 type BloomSearchEngine struct {
@@ -130,10 +131,6 @@ type BloomSearchEngine struct {
 	wg          sync.WaitGroup
 
 	querySemaphore chan struct{}
-
-	fileFieldBloomFilter      *bloom.BloomFilter
-	fileTokenBloomFilter      *bloom.BloomFilter
-	fileFieldTokenBloomFilter *bloom.BloomFilter
 }
 
 type BlockStats struct {
@@ -269,11 +266,13 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		cancel: cancel,
 
 		querySemaphore: make(chan struct{}, config.MaxQueryConcurrency),
-
-		fileFieldBloomFilter:      bloom.NewWithEstimates(config.FileBloomExpectedItems, config.BloomFalsePositiveRate),
-		fileTokenBloomFilter:      bloom.NewWithEstimates(config.FileBloomExpectedItems, config.BloomFalsePositiveRate),
-		fileFieldTokenBloomFilter: bloom.NewWithEstimates(config.FileBloomExpectedItems, config.BloomFalsePositiveRate),
 	}, nil
+}
+
+func (b *BloomSearchEngine) newFileLevelBloomFilters() (*bloom.BloomFilter, *bloom.BloomFilter, *bloom.BloomFilter) {
+	return bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate),
+		bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate),
+		bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
 }
 
 // Start begins the ingestion and flush workers
@@ -353,6 +352,7 @@ func (b *BloomSearchEngine) ingestWorker() {
 	bufferedRowCount := 0
 	bufferedBytes := 0
 	var bufferStartTime time.Time
+	fileFieldBloomFilter, fileTokenBloomFilter, fileFieldTokenBloomFilter := b.newFileLevelBloomFilters()
 
 	// Create a ticker for periodic time-based flush checks
 	ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
@@ -364,23 +364,61 @@ func (b *BloomSearchEngine) ingestWorker() {
 			fmt.Println("ingestWorker context done")
 			// Flush any remaining buffered data before exiting
 			if bufferedRowCount > 0 {
-				b.flushBufferedData(partitionBuffers, &doneChans, &bufferedRowCount, &bufferedBytes, &bufferStartTime)
+				b.flushBufferedData(
+					partitionBuffers,
+					&doneChans,
+					&bufferedRowCount,
+					&bufferedBytes,
+					&bufferStartTime,
+					&fileFieldBloomFilter,
+					&fileTokenBloomFilter,
+					&fileFieldTokenBloomFilter,
+				)
 			}
 			return
 		case req := <-b.ingestChan:
 			// Process the batch of rows
-			b.processIngestRequest(b.ctx, req, partitionBuffers, &doneChans, &bufferedRowCount, &bufferedBytes, &bufferStartTime)
+			b.processIngestRequest(
+				b.ctx,
+				req,
+				partitionBuffers,
+				&doneChans,
+				&bufferedRowCount,
+				&bufferedBytes,
+				&bufferStartTime,
+				&fileFieldBloomFilter,
+				&fileTokenBloomFilter,
+				&fileFieldTokenBloomFilter,
+			)
 		case <-ticker.C:
 			// Check for time-based flush
 			if bufferedRowCount > 0 && !bufferStartTime.IsZero() && time.Since(bufferStartTime) >= b.config.MaxBufferedTime {
-				b.flushBufferedData(partitionBuffers, &doneChans, &bufferedRowCount, &bufferedBytes, &bufferStartTime)
+				b.flushBufferedData(
+					partitionBuffers,
+					&doneChans,
+					&bufferedRowCount,
+					&bufferedBytes,
+					&bufferStartTime,
+					&fileFieldBloomFilter,
+					&fileTokenBloomFilter,
+					&fileFieldTokenBloomFilter,
+				)
 			}
 		}
 	}
 }
 
 // flushBufferedData flushes the current buffered data and resets the buffer state
-func (b *BloomSearchEngine) flushBufferedData(partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
+func (b *BloomSearchEngine) flushBufferedData(
+	partitionBuffers map[string]*partitionBuffer,
+	doneChans *[]chan error,
+	bufferedRowCount *int,
+	bufferedBytes *int,
+	bufferStartTime *time.Time,
+	fileFieldBloomFilter **bloom.BloomFilter,
+	fileTokenBloomFilter **bloom.BloomFilter,
+	fileFieldTokenBloomFilter **bloom.BloomFilter,
+) {
 	if len(partitionBuffers) == 0 {
 		return
 	}
@@ -393,7 +431,15 @@ func (b *BloomSearchEngine) flushBufferedData(partitionBuffers map[string]*parti
 	doneChannsCopy := make([]chan error, len(*doneChans))
 	copy(doneChannsCopy, *doneChans)
 
-	b.triggerFlush(partitionBuffersCopy, doneChannsCopy)
+	b.triggerFlush(
+		partitionBuffersCopy,
+		doneChannsCopy,
+		BloomFilters{
+			FieldBloomFilter:      *fileFieldBloomFilter,
+			TokenBloomFilter:      *fileTokenBloomFilter,
+			FieldTokenBloomFilter: *fileFieldTokenBloomFilter,
+		},
+	)
 
 	// Reset local state
 	for k := range partitionBuffers {
@@ -403,12 +449,21 @@ func (b *BloomSearchEngine) flushBufferedData(partitionBuffers map[string]*parti
 	*bufferedRowCount = 0
 	*bufferedBytes = 0
 	*bufferStartTime = time.Time{}
-
-	// Note: Don't reset file-level bloom filters here since the flush worker needs them
-	// They will be reset in handleFlush after the flush completes
+	*fileFieldBloomFilter, *fileTokenBloomFilter, *fileFieldTokenBloomFilter = b.newFileLevelBloomFilters()
 }
 
-func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *ingestRequest, partitionBuffers map[string]*partitionBuffer, doneChans *[]chan error, bufferedRowCount *int, bufferedBytes *int, bufferStartTime *time.Time) {
+func (b *BloomSearchEngine) processIngestRequest(
+	ctx context.Context,
+	req *ingestRequest,
+	partitionBuffers map[string]*partitionBuffer,
+	doneChans *[]chan error,
+	bufferedRowCount *int,
+	bufferedBytes *int,
+	bufferStartTime *time.Time,
+	fileFieldBloomFilter **bloom.BloomFilter,
+	fileTokenBloomFilter **bloom.BloomFilter,
+	fileFieldTokenBloomFilter **bloom.BloomFilter,
+) {
 	// Process the request and return to pool at the end
 	defer func() {
 		req.reset()
@@ -420,7 +475,16 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 		if *bufferedRowCount > 0 {
 			// Add the force flush doneChan to the list before flushing
 			*doneChans = append(*doneChans, req.doneChan)
-			b.flushBufferedData(partitionBuffers, doneChans, bufferedRowCount, bufferedBytes, bufferStartTime)
+			b.flushBufferedData(
+				partitionBuffers,
+				doneChans,
+				bufferedRowCount,
+				bufferedBytes,
+				bufferStartTime,
+				fileFieldBloomFilter,
+				fileTokenBloomFilter,
+				fileFieldTokenBloomFilter,
+			)
 		} else {
 			// No buffered data, signal completion immediately
 			TryWriteToChannels([]chan error{req.doneChan}, nil)
@@ -481,7 +545,7 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 			for _, field := range uniqueFields {
 				partitionBuffer.fieldBloomFilter.AddString(field.Path)
 				// Also add to file-level bloom filters
-				b.fileFieldBloomFilter.AddString(field.Path)
+				(*fileFieldBloomFilter).AddString(field.Path)
 
 				for _, value := range field.Values {
 					tokens := b.config.Tokenizer(value)
@@ -489,8 +553,8 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 						partitionBuffer.tokenBloomFilter.AddString(token)
 						partitionBuffer.fieldTokenBloomFilter.AddString(makeFieldTokenKey(field.Path, token))
 						// Also add to file-level bloom filters
-						b.fileTokenBloomFilter.AddString(token)
-						b.fileFieldTokenBloomFilter.AddString(makeFieldTokenKey(field.Path, token))
+						(*fileTokenBloomFilter).AddString(token)
+						(*fileFieldTokenBloomFilter).AddString(makeFieldTokenKey(field.Path, token))
 					}
 				}
 			}
@@ -592,14 +656,24 @@ func (b *BloomSearchEngine) processIngestRequest(ctx context.Context, req *inges
 			fmt.Printf("  Partition '%s': %d rows, %d bytes\n",
 				partitionID, partition.rowCount, partition.buffer.Len())
 		}
-		b.flushBufferedData(partitionBuffers, doneChans, bufferedRowCount, bufferedBytes, bufferStartTime)
+		b.flushBufferedData(
+			partitionBuffers,
+			doneChans,
+			bufferedRowCount,
+			bufferedBytes,
+			bufferStartTime,
+			fileFieldBloomFilter,
+			fileTokenBloomFilter,
+			fileFieldTokenBloomFilter,
+		)
 	}
 }
 
-func (b *BloomSearchEngine) triggerFlush(partitionBuffers map[string]*partitionBuffer, doneChans []chan error) {
+func (b *BloomSearchEngine) triggerFlush(partitionBuffers map[string]*partitionBuffer, doneChans []chan error, fileBloomFilters BloomFilters) {
 	flushReq := flushRequest{
 		partitionBuffers: partitionBuffers,
 		doneChans:        doneChans,
+		fileBloomFilters: fileBloomFilters,
 	}
 
 	// Send to flush worker (non-blocking)
@@ -628,11 +702,7 @@ func (b *BloomSearchEngine) flushWorker() {
 
 func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 	fileMetadata := FileMetadata{
-		BloomFilters: BloomFilters{
-			FieldBloomFilter:      b.fileFieldBloomFilter,
-			TokenBloomFilter:      b.fileTokenBloomFilter,
-			FieldTokenBloomFilter: b.fileFieldTokenBloomFilter,
-		},
+		BloomFilters:           flushReq.fileBloomFilters,
 		BloomExpectedItems:     b.config.FileBloomExpectedItems,
 		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
 		DataBlocks:             make([]DataBlockMetadata, 0),
@@ -723,11 +793,6 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to store file metadata: %w", err))
 		return
 	}
-
-	// Reset file-level bloom filters for the next file (now that flush is complete)
-	b.fileFieldBloomFilter = bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
-	b.fileTokenBloomFilter = bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
-	b.fileFieldTokenBloomFilter = bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
 
 	TryWriteToChannels(flushReq.doneChans, nil)
 }

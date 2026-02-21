@@ -7,8 +7,10 @@ package bloomsearch
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1740,5 +1742,204 @@ doneStats:
 	}
 	if len(stats) != 1 {
 		t.Fatalf("expected only one block to be processed due regex field pruning, got %d", len(stats))
+	}
+}
+
+type blockingFirstFlushWriteStore struct {
+	base               *FileSystemDataStore
+	mu                 sync.Mutex
+	createCount        int
+	firstWriteStarted  chan struct{}
+	unblockFirstWriter chan struct{}
+}
+
+func newBlockingFirstFlushWriteStore(rootDir string) *blockingFirstFlushWriteStore {
+	return &blockingFirstFlushWriteStore{
+		base:               NewFileSystemDataStore(rootDir),
+		firstWriteStarted:  make(chan struct{}),
+		unblockFirstWriter: make(chan struct{}),
+	}
+}
+
+func (s *blockingFirstFlushWriteStore) CreateFile(ctx context.Context) (io.WriteCloser, []byte, error) {
+	writer, pointerBytes, err := s.base.CreateFile(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s.mu.Lock()
+	s.createCount++
+	createNumber := s.createCount
+	s.mu.Unlock()
+
+	if createNumber != 1 {
+		return writer, pointerBytes, nil
+	}
+
+	return &blockingWriteCloser{
+		writer:        writer,
+		startedSignal: s.firstWriteStarted,
+		unblockSignal: s.unblockFirstWriter,
+	}, pointerBytes, nil
+}
+
+func (s *blockingFirstFlushWriteStore) OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error) {
+	return s.base.OpenFile(ctx, filePointerBytes)
+}
+
+func (s *blockingFirstFlushWriteStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
+	return s.base.GetMaybeFilesForQuery(ctx, query)
+}
+
+func (s *blockingFirstFlushWriteStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {
+	return s.base.Update(ctx, writes, deletes)
+}
+
+type blockingWriteCloser struct {
+	writer        io.WriteCloser
+	startedSignal chan struct{}
+	unblockSignal <-chan struct{}
+	once          sync.Once
+}
+
+func (w *blockingWriteCloser) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		close(w.startedSignal)
+		<-w.unblockSignal
+	})
+	return w.writer.Write(p)
+}
+
+func (w *blockingWriteCloser) Close() error {
+	return w.writer.Close()
+}
+
+func TestBloomSearchEngineFileLevelBloomRetainsInFlightRowsAcrossFlushes(t *testing.T) {
+	testDir := "./test_data/query_test_file_level_bloom_lost_rows"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	dataStore := newBlockingFirstFlushWriteStore(testDir)
+	metaStore := dataStore
+
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 1000
+	config.MaxBufferedBytes = 1024 * 1024
+	config.MaxBufferedTime = 1 * time.Hour
+	config.FileBloomExpectedItems = 100
+	config.BloomFalsePositiveRate = 0.01
+	config.RowDataCompression = CompressionNone
+
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(ctx)
+	}()
+
+	ctx := context.Background()
+	token := "inflightlosttoken"
+
+	if err := engine.IngestRows(ctx, []map[string]any{
+		{"id": 1.0, "message": "first_row"},
+	}, nil); err != nil {
+		t.Fatalf("Failed to ingest first row: %v", err)
+	}
+
+	firstFlushErrChan := make(chan error, 1)
+	go func() {
+		firstFlushErrChan <- engine.Flush(ctx)
+	}()
+
+	select {
+	case <-dataStore.firstWriteStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timed out waiting for first flush to begin writing")
+	}
+
+	if err := engine.IngestRows(ctx, []map[string]any{
+		{"id": 2.0, "message": token},
+	}, nil); err != nil {
+		t.Fatalf("Failed to ingest second row: %v", err)
+	}
+
+	secondFlushErrChan := make(chan error, 1)
+	go func() {
+		secondFlushErrChan <- engine.Flush(ctx)
+	}()
+
+	close(dataStore.unblockFirstWriter)
+
+	select {
+	case err := <-firstFlushErrChan:
+		if err != nil {
+			t.Fatalf("First flush failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timed out waiting for first flush completion")
+	}
+
+	select {
+	case err := <-secondFlushErrChan:
+		if err != nil {
+			t.Fatalf("Second flush failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timed out waiting for second flush completion")
+	}
+
+	queryAllResults := make(chan map[string]any, 10)
+	queryAllErrors := make(chan error, 10)
+	queryAllStats := make(chan BlockStats, 10)
+	if err := engine.Query(ctx, NewQuery().Build(), queryAllResults, queryAllErrors, queryAllStats); err != nil {
+		t.Fatalf("Failed to start all-rows query: %v", err)
+	}
+
+	allRows := make([]map[string]any, 0, 2)
+	for row := range queryAllResults {
+		allRows = append(allRows, row)
+	}
+	select {
+	case queryErr := <-queryAllErrors:
+		if queryErr != nil {
+			t.Fatalf("All-rows query failed: %v", queryErr)
+		}
+	default:
+	}
+
+	if len(allRows) != 2 {
+		t.Fatalf("Expected 2 total rows after two flushes, got %d", len(allRows))
+	}
+
+	tokenQueryResults := make(chan map[string]any, 10)
+	tokenQueryErrors := make(chan error, 10)
+	tokenQueryStats := make(chan BlockStats, 10)
+	if err := engine.Query(ctx, NewQuery().Token(token).Build(), tokenQueryResults, tokenQueryErrors, tokenQueryStats); err != nil {
+		t.Fatalf("Failed to start token query: %v", err)
+	}
+
+	var tokenRows []map[string]any
+	for row := range tokenQueryResults {
+		tokenRows = append(tokenRows, row)
+	}
+	select {
+	case queryErr := <-tokenQueryErrors:
+		if queryErr != nil {
+			t.Fatalf("Token query failed: %v", queryErr)
+		}
+	default:
+	}
+
+	if len(tokenRows) != 1 {
+		t.Fatalf("Expected token query to return 1 row after bloom filter fix, got %d", len(tokenRows))
+	}
+	if tokenRows[0]["id"] != 2.0 {
+		t.Fatalf("Expected token query to return row id=2.0, got %v", tokenRows[0]["id"])
 	}
 }
