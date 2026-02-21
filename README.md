@@ -8,7 +8,7 @@ BloomSearch provides extremely low memory usage and low cold-start searches thro
 - **Pluggable storage**: DataStore and MetaStore interfaces for any backend (can be same or separate)
 - **Fast filtering**: Hierarchical pruning via partitions, minmax indexes, and bloom filters
 - **Flexible queries**: Search by `field`, `token`, or `field:token` with AND/OR combinators
-- **Disaggregated storage and compute**: Unbound ingest and query throughput
+- **Disaggregated storage and compute**: Decoupled resources allow for asymmetric scaling
 
 Perfect for logs, JSON documents, and high-cardinality keyword search.
 
