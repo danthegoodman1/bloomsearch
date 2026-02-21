@@ -492,7 +492,7 @@ func (b *BloomSearchEngine) processIngestRequest(
 			)
 		} else {
 			// No buffered data, signal completion immediately
-			TryWriteToChannels([]chan error{req.doneChan}, nil)
+			SendOptionalWithContext(ctx, req.doneChan, nil)
 		}
 		return
 	}
@@ -524,7 +524,7 @@ func (b *BloomSearchEngine) processIngestRequest(
 			var err error
 			partitionBuffers[partitionID].compressionEncoders, err = b.createCompressionWriter(&partitionBuffers[partitionID].buffer)
 			if err != nil {
-				SendWithContext(ctx, req.doneChan, fmt.Errorf("failed to create compression writer: %w", err))
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to create compression writer: %w", err))
 				return
 			}
 
@@ -586,13 +586,13 @@ func (b *BloomSearchEngine) processIngestRequest(
 			// Serialize and store the row
 			rowBytes, err := json.Marshal(row)
 			if err != nil {
-				SendWithContext(ctx, req.doneChan, fmt.Errorf("failed to serialize row: %w", err))
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to serialize row: %w", err))
 				return
 			}
 
 			// Check if row is too large for uint32 length prefix
 			if len(rowBytes) > 0xFFFFFFFF {
-				SendWithContext(ctx, req.doneChan, fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF))
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF))
 				return
 			}
 
@@ -736,7 +736,7 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 	if err != nil {
 		fmt.Println("failed to create file: %w", err)
 		// Write error to all done channels
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to create file: %w", err))
+		SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to create file: %w", err))
 		return
 	}
 
@@ -747,7 +747,7 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		// Finalize compression encoders before writing
 		var compressedData []byte
 		if err := partitionBuffer.compressionEncoders.finalizeCompression(); err != nil {
-			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to finalize compression: %w", err))
+			SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to finalize compression: %w", err))
 			return
 		}
 		compressedData = partitionBuffer.buffer.Bytes()
@@ -761,7 +761,7 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		// Write bloom filters and hash
 		_, _, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, dataBlockBloomFilters)
 		if err != nil {
-			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write bloom filters: %w", err))
+			SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to write bloom filters: %w", err))
 			return
 		}
 
@@ -771,7 +771,7 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		// Write the row data buffer
 		if _, err := writer.Write(compressedData); err != nil {
 			// Write error to all done channels
-			TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write data block: %w", err))
+			SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to write data block: %w", err))
 			return
 		}
 
@@ -798,12 +798,12 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 
 	// Write final metadata to data store and footer
 	if err := b.writeFileMetadataAndFooter(writer, &fileMetadata); err != nil {
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to write file metadata and footer: %w", err))
+		SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to write file metadata and footer: %w", err))
 		return
 	}
 
 	if err := writer.Close(); err != nil {
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to close file writer: %w", err))
+		SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to close file writer: %w", err))
 		return
 	}
 
@@ -813,11 +813,11 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 			FilePointerBytes: filePointerBytes,
 		},
 	}, nil); err != nil {
-		TryWriteToChannels(flushReq.doneChans, fmt.Errorf("failed to store file metadata: %w", err))
+		SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to store file metadata: %w", err))
 		return
 	}
 
-	TryWriteToChannels(flushReq.doneChans, nil)
+	SendToChannelsWithContext(b.ctx, flushReq.doneChans, nil)
 }
 
 // evaluateBloomFilters tests if bloom filters match the bloom query

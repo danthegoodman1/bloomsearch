@@ -25,6 +25,24 @@ func TryWriteToChannels[T any](channels []chan T, value T) {
 	}
 }
 
+// SendOptionalWithContext sends to a channel if it is non-nil.
+func SendOptionalWithContext[T any](ctx context.Context, ch chan<- T, value T) error {
+	if ch == nil {
+		return nil
+	}
+	return SendWithContext(ctx, ch, value)
+}
+
+// SendToChannelsWithContext sends to each non-nil channel, blocking per channel until sent or context cancellation.
+func SendToChannelsWithContext[T any](ctx context.Context, channels []chan T, value T) error {
+	for _, ch := range channels {
+		if err := SendOptionalWithContext(ctx, ch, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SendWithContext attempts to send a value to a channel while respecting context cancellation.
 // Returns an error if the context is done before the send completes.
 func SendWithContext[T any](ctx context.Context, ch chan<- T, value T) error {

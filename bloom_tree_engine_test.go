@@ -291,6 +291,94 @@ func TestBloomTreeEngineFlushMaxTime(t *testing.T) {
 	}
 }
 
+func TestIngestRowsUnbufferedDoneChannelDelivery(t *testing.T) {
+	testDir := "./test_data/ingest_unbuffered_done_channel"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	dataStore := NewFileSystemDataStore(testDir)
+	metaStore := dataStore
+
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 1
+	config.MaxBufferedBytes = 1024 * 1024
+	config.MaxBufferedTime = 10 * time.Second
+	config.RowDataCompression = CompressionNone
+
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(stopCtx)
+	}()
+
+	doneChan := make(chan error) // intentionally unbuffered
+	ctx := context.Background()
+	if err := engine.IngestRows(ctx, []map[string]any{{"id": 1.0, "message": "unbuffered done channel"}}, doneChan); err != nil {
+		t.Fatalf("Failed to ingest rows: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		entries, err := os.ReadDir(testDir)
+		if err != nil {
+			t.Fatalf("Failed to read test directory while waiting for flush: %v", err)
+		}
+
+		footerWritten := false
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".dat") {
+				continue
+			}
+
+			filePath := testDir + "/" + entry.Name()
+			file, err := os.Open(filePath)
+			if err != nil {
+				continue
+			}
+
+			stat, err := file.Stat()
+			if err == nil && stat.Size() >= int64(len(MagicBytes)) {
+				magicBytes := make([]byte, len(MagicBytes))
+				if _, err := file.ReadAt(magicBytes, stat.Size()-int64(len(MagicBytes))); err == nil && string(magicBytes) == MagicBytes {
+					footerWritten = true
+				}
+			}
+			file.Close()
+
+			if footerWritten {
+				break
+			}
+		}
+
+		if footerWritten {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Timed out waiting for flush file footer to be written")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Give the flush worker time to attempt done-channel delivery before we start receiving.
+	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case err := <-doneChan:
+		if err != nil {
+			t.Fatalf("Expected nil flush result, got error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timed out waiting for done channel signal")
+	}
+}
+
 func TestEvaluateBloomFilters(t *testing.T) {
 	// Create a simple engine for testing
 	config := DefaultBloomSearchEngineConfig()
