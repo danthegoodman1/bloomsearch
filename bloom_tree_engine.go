@@ -1344,6 +1344,12 @@ func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 			return nil, fmt.Errorf("failed to update metastore after merge: %w", err)
 		}
 		fmt.Printf("Metastore update completed successfully\n")
+
+		for _, deleteOp := range deleteOps {
+			if err := b.dataStore.TombstoneFile(ctx, deleteOp.FilePointerBytes); err != nil {
+				return nil, fmt.Errorf("failed to tombstone data file after metadata update: %w", err)
+			}
+		}
 	}
 
 	// Calculate final statistics

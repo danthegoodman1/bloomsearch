@@ -48,6 +48,13 @@ func (fs *FileSystemDataStore) CreateFile(ctx context.Context) (io.WriteCloser, 
 	return file, []byte(filePath), nil
 }
 
+func (fs *FileSystemDataStore) TombstoneFile(ctx context.Context, filePointerBytes []byte) error {
+	if err := os.Remove(string(filePointerBytes)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // readFileMetadata reads the file metadata from a bloom file
 func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata, error) {
 	file, err := os.Open(filePath)

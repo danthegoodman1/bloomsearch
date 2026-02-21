@@ -1575,6 +1575,101 @@ func TestBloomSearchEngineMergeDifferentCompressionConfigs(t *testing.T) {
 	t.Log("SUCCESS: Files with different compression configs (None, Zstd, Snappy) were merged successfully!")
 }
 
+type tombstoneTrackingDataStore struct {
+	base       *FileSystemDataStore
+	mu         sync.Mutex
+	tombstoned []string
+}
+
+func newTombstoneTrackingDataStore(base *FileSystemDataStore) *tombstoneTrackingDataStore {
+	return &tombstoneTrackingDataStore{
+		base: base,
+	}
+}
+
+func (s *tombstoneTrackingDataStore) CreateFile(ctx context.Context) (io.WriteCloser, []byte, error) {
+	return s.base.CreateFile(ctx)
+}
+
+func (s *tombstoneTrackingDataStore) OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error) {
+	return s.base.OpenFile(ctx, filePointerBytes)
+}
+
+func (s *tombstoneTrackingDataStore) TombstoneFile(ctx context.Context, filePointerBytes []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tombstoned = append(s.tombstoned, string(filePointerBytes))
+	return nil
+}
+
+func (s *tombstoneTrackingDataStore) TombstonedFiles() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	files := make([]string, len(s.tombstoned))
+	copy(files, s.tombstoned)
+	return files
+}
+
+func TestBloomSearchEngineMergeTombstonesDeletedFiles(t *testing.T) {
+	testDir := "./test_data/merge_test_tombstones_deleted_files"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	metaStore := NewFileSystemDataStore(testDir)
+	dataStore := newTombstoneTrackingDataStore(metaStore)
+
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 1
+	config.MaxBufferedBytes = 1024 * 1024
+	config.MaxBufferedTime = 10 * time.Second
+	config.RowDataCompression = CompressionNone
+
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(stopCtx)
+	}()
+
+	ctx := context.Background()
+	flushAndWait(t, engine, ctx, []map[string]any{{"id": 1.0, "service": "merge"}}, "tombstone row 1")
+	flushAndWait(t, engine, ctx, []map[string]any{{"id": 2.0, "service": "merge"}}, "tombstone row 2")
+
+	maybeFilesBeforeMerge, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+	if err != nil {
+		t.Fatalf("Failed to get files before merge: %v", err)
+	}
+	if len(maybeFilesBeforeMerge) != 2 {
+		t.Fatalf("Expected exactly 2 files before merge, got %d", len(maybeFilesBeforeMerge))
+	}
+
+	expectedTombstones := map[string]bool{}
+	for _, maybeFile := range maybeFilesBeforeMerge {
+		expectedTombstones[string(maybeFile.PointerBytes)] = true
+	}
+
+	if _, err := engine.Merge(ctx); err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	tombstonedFiles := dataStore.TombstonedFiles()
+	if len(tombstonedFiles) != len(expectedTombstones) {
+		t.Fatalf("Expected %d tombstoned files, got %d", len(expectedTombstones), len(tombstonedFiles))
+	}
+
+	for _, filePointer := range tombstonedFiles {
+		if !expectedTombstones[filePointer] {
+			t.Fatalf("Unexpected tombstoned file pointer: %s", filePointer)
+		}
+	}
+}
+
 func TestBloomSearchEngineQueryRegexFinalStageAndOr(t *testing.T) {
 	testDir := "./test_data/query_test_regex_final_stage"
 	if err := os.RemoveAll(testDir); err != nil {
@@ -1865,6 +1960,10 @@ func (s *blockingFirstFlushWriteStore) CreateFile(ctx context.Context) (io.Write
 
 func (s *blockingFirstFlushWriteStore) OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error) {
 	return s.base.OpenFile(ctx, filePointerBytes)
+}
+
+func (s *blockingFirstFlushWriteStore) TombstoneFile(ctx context.Context, filePointerBytes []byte) error {
+	return s.base.TombstoneFile(ctx, filePointerBytes)
 }
 
 func (s *blockingFirstFlushWriteStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {

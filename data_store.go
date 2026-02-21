@@ -15,6 +15,10 @@ type DataStore interface {
 
 	// OpenFile opens a file for reading.
 	OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error)
+
+	// TombstoneFile marks a file as no longer referenced by metadata.
+	// Implementations decide when physical garbage collection occurs.
+	TombstoneFile(ctx context.Context, filePointerBytes []byte) error
 }
 
 // TESTING
@@ -30,6 +34,10 @@ func (n *NullDataStore) OpenFile(ctx context.Context, filePointerBytes []byte) (
 
 func (n *NullDataStore) CreateFile(ctx context.Context) (io.WriteCloser, []byte, error) {
 	return nil, nil, nil
+}
+
+func (n *NullDataStore) TombstoneFile(ctx context.Context, filePointerBytes []byte) error {
+	return nil
 }
 
 func init() {
