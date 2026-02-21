@@ -237,7 +237,7 @@ func TimePartition(row map[string]any) string {
 config.PartitionFunc = TimePartition
 ```
 
-Partitions are optional. When querying with partition conditions, files without partition IDs are always included to avoid missing data.
+Partitions are optional at ingest. With strict prefilter semantics, queries with partition conditions exclude files/blocks without partition IDs.
 
 #### MinMax Indexes
 
@@ -260,7 +260,7 @@ query := NewQuery().
 
 Use `MatchPrefilter(...)` with `PrefilterAnd(...)` / `PrefilterOr(...)` for prefilter logic.
 
-MinMax indexes are optional. When querying with range conditions, files without minmax indexes are always included to avoid missing data.
+MinMax indexes are optional at ingest. With strict prefilter semantics, queries with MinMax conditions exclude files/blocks without matching minmax metadata.
 
 ### Merging
 

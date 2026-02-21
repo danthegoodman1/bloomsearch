@@ -406,6 +406,10 @@ func evaluatePrefilterCondition(metadata *DataBlockMetadata, condition *Prefilte
 		if condition.partitionCondition == nil {
 			return true
 		}
+		// Strict prefilter semantics: if partition metadata is missing, this block cannot satisfy partition conditions.
+		if metadata.PartitionID == "" {
+			return false
+		}
 		return EvaluateStringCondition(metadata.PartitionID, *condition.partitionCondition)
 	case prefilterConditionMinMax:
 		if condition.minMaxCondition == nil {

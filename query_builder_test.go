@@ -138,6 +138,34 @@ func TestMatchPrefilterSupportsOrAndBetweenPartitionAndMinMax(t *testing.T) {
 	}
 }
 
+func TestPrefilterPartitionConditionRejectsMissingPartitionMetadata(t *testing.T) {
+	query := NewQuery().
+		MatchPrefilter(Partition(PartitionNotEquals("auth_partition"))).
+		Build()
+
+	missingPartitionMetadata := &DataBlockMetadata{
+		PartitionID: "",
+	}
+
+	if EvaluateDataBlockMetadata(missingPartitionMetadata, query.Prefilter) {
+		t.Fatalf("expected strict partition prefilter to reject missing partition metadata")
+	}
+}
+
+func TestPrefilterMinMaxConditionRejectsMissingMinMaxMetadata(t *testing.T) {
+	query := NewQuery().
+		MatchPrefilter(MinMax("timestamp", NumericGreaterThanEqual(1000))).
+		Build()
+
+	missingMinMaxMetadata := &DataBlockMetadata{
+		PartitionID: "auth_partition",
+	}
+
+	if EvaluateDataBlockMetadata(missingMinMaxMetadata, query.Prefilter) {
+		t.Fatalf("expected strict minmax prefilter to reject missing minmax metadata")
+	}
+}
+
 func TestNewQuerySupportsImplicitRegexAndExpression(t *testing.T) {
 	query := NewQuery().
 		FieldRegex("service", "^pay").
