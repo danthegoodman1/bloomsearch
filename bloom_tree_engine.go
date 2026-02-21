@@ -1835,12 +1835,15 @@ func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*d
 		return nil, fmt.Errorf("failed to write bloom filters: %w", err)
 	}
 
-	// Prepare compressed row data
-	var compressedData bytes.Buffer
+	// Stream compressed row data directly to the output writer while tracking bytes and checksum.
+	rowDataCounter := &countingWriter{writer: writer}
+	rowDataHasher := crc32.New(crc32cTable)
+	rowDataDest := io.MultiWriter(rowDataCounter, rowDataHasher)
+
 	uncompressedSize := 0
 	rowCount := 0
 
-	compressionEncoders, err := b.createCompressionWriter(&compressedData)
+	compressionEncoders, err := b.createCompressionWriter(rowDataDest)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create compression writer: %w", err)
 	}
@@ -1895,13 +1898,8 @@ func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*d
 		return nil, fmt.Errorf("failed to finalize compression: %w", err)
 	}
 
-	// Calculate hash and write compressed data
-	rowDataHash := crc32.Checksum(compressedData.Bytes(), crc32cTable)
-	if _, err := writer.Write(compressedData.Bytes()); err != nil {
-		return nil, fmt.Errorf("failed to write compressed row data: %w", err)
-	}
-
-	totalSize := bloomFiltersSize + compressedData.Len()
+	rowDataHash := rowDataHasher.Sum32()
+	totalSize := bloomFiltersSize + rowDataCounter.count
 
 	return &DataBlockMetadata{
 		PartitionID:            partitionID,
@@ -1916,6 +1914,18 @@ func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*d
 		BloomExpectedItems:     uint(b.config.MaxRowGroupRows),
 		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
 	}, nil
+}
+
+// countingWriter tracks streamed compressed row bytes for block metadata sizing.
+type countingWriter struct {
+	writer io.Writer
+	count  int
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	w.count += n
+	return n, err
 }
 
 // dataBlockRowReader provides streaming access to rows from a data block

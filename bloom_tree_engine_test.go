@@ -1575,6 +1575,105 @@ func TestBloomSearchEngineMergeDifferentCompressionConfigs(t *testing.T) {
 	t.Log("SUCCESS: Files with different compression configs (None, Zstd, Snappy) were merged successfully!")
 }
 
+func TestBloomSearchEngineMergeStreamingOutputCompression(t *testing.T) {
+	testCases := []struct {
+		name        string
+		compression CompressionType
+	}{
+		{name: "none", compression: CompressionNone},
+		{name: "snappy", compression: CompressionSnappy},
+		{name: "zstd", compression: CompressionZstd},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testDir := fmt.Sprintf("./test_data/merge_streaming_output_%s", tc.name)
+			if err := os.RemoveAll(testDir); err != nil {
+				t.Fatalf("Failed to clean up test directory: %v", err)
+			}
+
+			dataStore := NewFileSystemDataStore(testDir)
+			metaStore := dataStore
+
+			config := DefaultBloomSearchEngineConfig()
+			config.MaxBufferedRows = 1
+			config.MaxBufferedBytes = 1024 * 1024
+			config.MaxBufferedTime = 10 * time.Second
+			config.RowDataCompression = tc.compression
+
+			engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+			if err != nil {
+				t.Fatalf("Failed to create engine: %v", err)
+			}
+
+			engine.Start()
+			defer func() {
+				stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				engine.Stop(stopCtx)
+			}()
+
+			ctx := context.Background()
+			flushAndWait(t, engine, ctx, []map[string]any{{"id": 1.0, "service": "merge"}}, "streaming output row 1")
+			flushAndWait(t, engine, ctx, []map[string]any{{"id": 2.0, "service": "merge"}}, "streaming output row 2")
+
+			beforeMergeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+			if err != nil {
+				t.Fatalf("Failed to read files before merge: %v", err)
+			}
+			if len(beforeMergeFiles) != 2 {
+				t.Fatalf("Expected 2 files before merge, got %d", len(beforeMergeFiles))
+			}
+
+			if _, err := engine.Merge(ctx); err != nil {
+				t.Fatalf("Merge failed: %v", err)
+			}
+
+			afterMergeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+			if err != nil {
+				t.Fatalf("Failed to read files after merge: %v", err)
+			}
+			if len(afterMergeFiles) != 1 {
+				t.Fatalf("Expected 1 file after merge, got %d", len(afterMergeFiles))
+			}
+			if len(afterMergeFiles[0].Metadata.DataBlocks) != 1 {
+				t.Fatalf("Expected 1 merged data block, got %d", len(afterMergeFiles[0].Metadata.DataBlocks))
+			}
+
+			mergedBlock := afterMergeFiles[0].Metadata.DataBlocks[0]
+			if mergedBlock.Compression != tc.compression {
+				t.Fatalf("Expected merged block compression %s, got %s", tc.compression, mergedBlock.Compression)
+			}
+			if mergedBlock.RowDataHash == 0 {
+				t.Fatal("Expected merged block to include row data hash")
+			}
+
+			resultChan := make(chan map[string]any, 10)
+			errorChan := make(chan error, 10)
+			statsChan := make(chan BlockStats, 10)
+			if err := engine.Query(ctx, NewQuery().Field("id").Build(), resultChan, errorChan, statsChan); err != nil {
+				t.Fatalf("Query failed: %v", err)
+			}
+
+			resultCount := 0
+			for range resultChan {
+				resultCount++
+			}
+			if resultCount != 2 {
+				t.Fatalf("Expected 2 merged query results, got %d", resultCount)
+			}
+
+			select {
+			case queryErr := <-errorChan:
+				if queryErr != nil {
+					t.Fatalf("Query returned error: %v", queryErr)
+				}
+			default:
+			}
+		})
+	}
+}
+
 type tombstoneTrackingDataStore struct {
 	base       *FileSystemDataStore
 	mu         sync.Mutex
