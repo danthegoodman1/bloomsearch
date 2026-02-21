@@ -1943,3 +1943,87 @@ func TestBloomSearchEngineFileLevelBloomRetainsInFlightRowsAcrossFlushes(t *test
 		t.Fatalf("Expected token query to return row id=2.0, got %v", tokenRows[0]["id"])
 	}
 }
+
+func TestBloomSearchEngineStopFlushesPendingBufferedRows(t *testing.T) {
+	testDir := "./test_data/stop_drops_pending_flush"
+	if err := os.RemoveAll(testDir); err != nil {
+		t.Fatalf("Failed to clean up test directory: %v", err)
+	}
+
+	dataStore := NewFileSystemDataStore(testDir)
+	metaStore := dataStore
+
+	tokenizerEntered := make(chan struct{})
+	releaseTokenizer := make(chan struct{})
+	var blockOnce sync.Once
+
+	config := DefaultBloomSearchEngineConfig()
+	config.MaxBufferedRows = 10_000
+	config.MaxBufferedBytes = 1024 * 1024 * 1024
+	config.MaxBufferedTime = 1 * time.Hour
+	config.RowDataCompression = CompressionNone
+	config.Tokenizer = func(value any) []string {
+		blockOnce.Do(func() {
+			close(tokenizerEntered)
+			<-releaseTokenizer
+		})
+		return BasicWhitespaceLowerTokenizer(value)
+	}
+
+	engine, err := NewBloomSearchEngine(config, metaStore, dataStore)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+
+	engine.Start()
+
+	ctx := context.Background()
+	if err := engine.IngestRows(ctx, []map[string]any{
+		{"id": 1.0, "message": "pending_flush_row"},
+	}, nil); err != nil {
+		t.Fatalf("Failed to ingest row: %v", err)
+	}
+
+	select {
+	case <-tokenizerEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timed out waiting for ingest worker to enter tokenizer")
+	}
+
+	stopResult := make(chan error, 1)
+	go func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stopResult <- engine.Stop(stopCtx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(releaseTokenizer)
+
+	select {
+	case stopErr := <-stopResult:
+		if stopErr != nil {
+			t.Fatalf("Stop failed: %v", stopErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timed out waiting for Stop to complete")
+	}
+
+	if got := len(engine.flushChan); got != 0 {
+		t.Fatalf("Expected no pending flush requests after stop, got %d", got)
+	}
+
+	maybeFiles, err := dataStore.GetMaybeFilesForQuery(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Failed to read files after stop: %v", err)
+	}
+	if len(maybeFiles) != 1 {
+		t.Fatalf("Expected 1 flushed file after stop, got %d", len(maybeFiles))
+	}
+	if len(maybeFiles[0].Metadata.DataBlocks) != 1 {
+		t.Fatalf("Expected 1 data block in flushed file, got %d", len(maybeFiles[0].Metadata.DataBlocks))
+	}
+	if maybeFiles[0].Metadata.DataBlocks[0].Rows != 1 {
+		t.Fatalf("Expected flushed data block to contain 1 row, got %d", maybeFiles[0].Metadata.DataBlocks[0].Rows)
+	}
+}

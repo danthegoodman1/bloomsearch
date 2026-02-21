@@ -129,6 +129,7 @@ type BloomSearchEngine struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
+	ingestDone  chan struct{}
 
 	querySemaphore chan struct{}
 }
@@ -266,6 +267,7 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		cancel: cancel,
 
 		querySemaphore: make(chan struct{}, config.MaxQueryConcurrency),
+		ingestDone:     make(chan struct{}),
 	}, nil
 }
 
@@ -344,7 +346,10 @@ func (b *BloomSearchEngine) Flush(ctx context.Context) error {
 }
 
 func (b *BloomSearchEngine) ingestWorker() {
-	defer b.wg.Done()
+	defer func() {
+		close(b.ingestDone)
+		b.wg.Done()
+	}()
 
 	// Local state owned by the ingestion actor
 	partitionBuffers := make(map[string]*partitionBuffer)
@@ -689,13 +694,31 @@ func (b *BloomSearchEngine) triggerFlush(partitionBuffers map[string]*partitionB
 func (b *BloomSearchEngine) flushWorker() {
 	defer b.wg.Done()
 
+	shuttingDown := false
 	for {
+		if !shuttingDown {
+			select {
+			case <-b.ctx.Done():
+				shuttingDown = true
+			case flushReq := <-b.flushChan:
+				b.handleFlush(flushReq)
+			}
+			continue
+		}
+
 		select {
-		case <-b.ctx.Done():
-			fmt.Println("flushWorker context done")
-			return
 		case flushReq := <-b.flushChan:
 			b.handleFlush(flushReq)
+		case <-b.ingestDone:
+			for {
+				select {
+				case flushReq := <-b.flushChan:
+					b.handleFlush(flushReq)
+				default:
+					fmt.Println("flushWorker context done")
+					return
+				}
+			}
 		}
 	}
 }
