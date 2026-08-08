@@ -407,7 +407,9 @@ query := NewQuery().
 results, err := engine.Query(ctx, query)
 ```
 
-Candidate files stream from the MetaStore iterator through a bounded pipeline: a file stage pulls one file at a time, enforces strict prefilter semantics itself (re-filtering whatever the MetaStore yields), tests the file-level bloom filters, and releases them immediately after, so per-query memory does not scale with the candidate-file count or filter size. Each surviving data block becomes a job for a bounded worker pool — up to `MaxQueryConcurrency` blocks across *all* queries process concurrently — and a query without bloom conditions skips reading block filter sections entirely.
+Candidate files stream from the MetaStore iterator through a bounded pipeline: a file stage pulls one file at a time, enforces strict prefilter semantics itself (re-filtering whatever the MetaStore yields), tests the file-level bloom filters, and releases them immediately after, so per-query memory does not scale with the candidate-file count or filter size. Each surviving file's data block filters are then evaluated as one forward pass over a single reused DataStore handle — one open and one read per block filter section, rather than an open and a seek per block — and only the blocks that survive become row-scan jobs. Block scans borrow handles back from a per-query, per-file pool, so a query's opens scale with its candidate files rather than with their data blocks; the pool closes every handle when the query winds down. A query without bloom conditions skips reading block filter sections entirely.
+
+Both stages draw on the same bounded budget: up to `MaxQueryConcurrency` block scans and filter passes across *all* queries run concurrently. Filter evaluation is per file and block scans stay per block, so a query over one large file still scans its surviving blocks concurrently.
 
 When regex filters are present, the engine compiles patterns once per query and derives a field-existence bloom guard for earlier file/block pruning. Row verification is compiled once per query into a single-walk matcher.
 

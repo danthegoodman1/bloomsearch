@@ -4,25 +4,55 @@ package bloomsearch
 // behind the Results cursor (query_results.go).
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"io"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bits-and-blooms/bloom/v3"
 )
 
-// dataBlockJob represents a job to process a data block
+// dataBlockJob is a scan job for one data block whose filters did not
+// disqualify it (see evaluateBlockFilters). filterDuration is the time the file
+// stage spent reading and evaluating this block's filter section, carried along
+// so the block's BlockStats.Duration still accounts for the whole block.
 type dataBlockJob struct {
-	filePointer   []byte
-	blockMetadata DataBlockMetadata
+	filePointer    []byte
+	blockMetadata  DataBlockMetadata
+	filterDuration time.Duration
 }
 
-// BlockStats describes one block job of a query. RowsProcessed and
+// fileFilterJob is one candidate file's block filter evaluation: the file
+// passed the prefilter and the file-level bloom test, and its blocks' filter
+// sections have yet to be read.
+type fileFilterJob struct {
+	filePointer []byte
+	blocks      []DataBlockMetadata
+}
+
+// blockScanCandidate is one block that survived filter evaluation, as an index
+// into the evaluated block slice. The survivors are carried as indexes rather
+// than as copied metadata so a file worker's own state stays a small multiple of
+// the file's block count, on top of the block metadata the MetaStore yielded.
+type blockScanCandidate struct {
+	index          int
+	filterDuration time.Duration
+}
+
+// BlockStats describes one candidate data block of a query. RowsProcessed and
 // BytesProcessed report what the scan actually read — rows and uncompressed
 // row bytes (length prefix included) — so a bloom-skipped block reports zero.
 // TotalRows and TotalBytes are the block's metadata totals (TotalBytes is the
 // on-disk block size, bloom filters included).
+//
+// Duration is the time the block cost the query, which is where its work
+// happened: reading and evaluating the block's filter section for a block
+// pruned by its filters, and that plus the row data read and scan for a block
+// that was scanned. It excludes time the block spent queued between the two.
 type BlockStats struct {
 	FilePointer        []byte
 	BlockOffset        int
@@ -121,11 +151,17 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 	return
 }
 
-// queryJobBuffer is the block-job channel's buffer. It only smooths the
-// hand-off between the file stage and the block workers; the total number of
-// candidate files buffered anywhere in a query is bounded by the worker count
-// plus this constant, never by the candidate count.
-const queryJobBuffer = 16
+const (
+	// queryJobBuffer is the block-job channel's buffer. It only smooths the
+	// hand-off between the file workers and the block workers.
+	queryJobBuffer = 16
+
+	// queryFileJobBuffer is the file-job channel's buffer. It stays small
+	// because each file job carries a whole file's block metadata: the
+	// candidate files in flight anywhere in a query are bounded by the worker
+	// counts plus these constants, never by the candidate count.
+	queryFileJobBuffer = 4
+)
 
 // Query starts a query and returns a Results cursor streaming the matching
 // rows. Only pre-iteration setup (regex compilation) can fail fast with
@@ -134,14 +170,23 @@ const queryJobBuffer = 16
 // cursor, which the engine fully owns (see Results for the iteration, error,
 // cancellation, and stats contracts).
 //
-// Candidate files stream from the MetaStore iterator through a bounded
-// pipeline: a file stage pulls one file at a time, prunes it, and fans its
-// data blocks out to the block workers, so per-query memory scales with the
-// in-flight window (worker count plus constant channel buffers), not with
-// the candidate-file count. A MetaStore error mid-iteration stops further
-// pulls but lets already-dispatched block jobs finish and deliver their
-// rows; the error surfaces from Results.Err joined with any block errors —
-// the same partial-results philosophy as block errors.
+// Candidate files stream from the MetaStore iterator through a bounded,
+// three-stage pipeline, so per-query memory scales with the in-flight window
+// (worker counts plus constant channel buffers), not with the candidate-file
+// count:
+//
+//   - the file stage pulls one candidate at a time, enforces the prefilter, and
+//     applies the in-memory file-level bloom test;
+//   - a file worker evaluates that file's data block filters, reading every
+//     section on one pooled handle in a forward pass (see evaluateBlockFilters),
+//     and dispatches only the blocks that survive;
+//   - block workers scan those blocks concurrently, reusing the file's pooled
+//     handles rather than opening one per block (see fileHandlePool).
+//
+// A MetaStore error mid-iteration stops further pulls but lets already-
+// dispatched work finish and deliver its rows; the error surfaces from
+// Results.Err joined with any block errors — the same partial-results
+// philosophy as block errors.
 //
 // Queries are independent of the ingest lifecycle: a stopped engine still
 // serves queries, because reads touch only the MetaStore and DataStore.
@@ -168,41 +213,134 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 
 	// A query without bloom conditions cannot be disqualified by any filter:
 	// skip filter evaluation entirely, and downstream, skip reading the block
-	// filter sections (see processDataBlock).
+	// filter sections (see evaluateBlockFilters).
 	hasBloomConditions := pruneBloomQuery != nil && pruneBloomQuery.Expression != nil
 
 	r := newResults(ctx)
 
-	jobs := make(chan dataBlockJob, queryJobBuffer)
+	// One handle pool per query: each candidate file is opened once for its
+	// block filter pass, and its block scans borrow that handle back instead of
+	// opening their own. The pool is closed on teardown, after every worker has
+	// exited.
+	handles := newFileHandlePool(b.dataStore)
 
-	// Block workers are spawned on demand, one per job sent, until
-	// MaxQueryConcurrency are running: the job total is unknown up front
-	// (files stream from the MetaStore), and spawning against demand yields
-	// the same min(jobs, MaxQueryConcurrency) worker count the old upfront
-	// sizing produced — a fully pruned query spawns none. Each worker also
-	// watches the query context so cancellation winds workers down promptly
-	// even while the file stage is still draining the store iterator.
-	var wg sync.WaitGroup
-	worker := func() {
-		defer wg.Done()
+	fileJobs := make(chan fileFilterJob, queryFileJobBuffer)
+	blockJobs := make(chan dataBlockJob, queryJobBuffer)
+
+	// Workers are spawned on demand, one per job sent, until
+	// MaxQueryConcurrency of each kind are running: the job total is unknown up
+	// front (files stream from the MetaStore), and spawning against demand
+	// yields the same min(jobs, MaxQueryConcurrency) worker count upfront
+	// sizing would — a fully pruned query spawns no block workers. Each worker
+	// also watches the query context so cancellation winds workers down
+	// promptly even while the file stage is still draining the store iterator.
+	var fileWorkers, blockWorkers sync.WaitGroup
+
+	blockWorker := func() {
+		defer blockWorkers.Done()
 
 		slot := querySlot{sem: b.querySemaphore, ctx: r.ctx}
 		defer slot.release()
 		var scratch *rowMatchScratch
+
+		// runJob releases the file reference its dispatcher retained on every
+		// path — scanned, failed, or abandoned at cancellation — and reports
+		// whether the worker should keep taking jobs.
+		runJob := func(job dataBlockJob) bool {
+			defer handles.release(job.filePointer)
+			if !slot.acquire() {
+				return false
+			}
+			defer slot.release()
+			if scratch == nil {
+				scratch = newRowMatchScratch(rowMatcher)
+			}
+			b.processDataBlock(r, &slot, handles, job, rowMatcher, scratch)
+			return true
+		}
+
 		for {
 			select {
-			case job, ok := <-jobs:
+			case job, ok := <-blockJobs:
 				if !ok {
 					return
 				}
-				if !slot.acquire() {
+				if !runJob(job) {
 					return
 				}
-				if scratch == nil {
-					scratch = newRowMatchScratch(rowMatcher)
+			case <-r.ctx.Done():
+				return
+			}
+		}
+	}
+
+	// Block workers are spawned by whichever file worker dispatched the job, so
+	// their running count is shared and moves under CAS.
+	var blockWorkersSpawned atomic.Int64
+	spawnBlockWorker := func() {
+		limit := int64(b.config.MaxQueryConcurrency)
+		for {
+			running := blockWorkersSpawned.Load()
+			if running >= limit {
+				return
+			}
+			if blockWorkersSpawned.CompareAndSwap(running, running+1) {
+				break
+			}
+		}
+		blockWorkers.Add(1)
+		go blockWorker()
+	}
+
+	fileWorker := func() {
+		defer fileWorkers.Done()
+
+		slot := querySlot{sem: b.querySemaphore, ctx: r.ctx}
+		defer slot.release()
+		// One survivor buffer per worker, reused across files.
+		var survivors []blockScanCandidate
+
+		for {
+			select {
+			case job, ok := <-fileJobs:
+				if !ok {
+					return
 				}
-				b.processDataBlock(r, &slot, job, pruneBloomQuery, rowMatcher, scratch)
+
+				// Reading the sections as one forward pass needs them in offset
+				// order; the dispatch below indexes the same ordering.
+				blocks := blocksByAscendingOffset(job.blocks)
+
+				// One reference spans the filter pass and the dispatch that
+				// follows, so the file's handles cannot be closed in between.
+				handles.retain(job.filePointer)
+				survivors = b.evaluateBlockFilters(r, &slot, handles, job.filePointer, blocks, pruneBloomQuery, survivors[:0])
+				// The filter pass is the I/O this worker holds a semaphore slot
+				// for; dispatch can block on the block workers, and a slot held
+				// while blocked would park it for every other query (and, at a
+				// small MaxQueryConcurrency, keep the block workers from ever
+				// acquiring one).
 				slot.release()
+
+				dispatched := true
+				for _, survivor := range survivors {
+					blockJob := dataBlockJob{
+						filePointer:    job.filePointer,
+						blockMetadata:  blocks[survivor.index],
+						filterDuration: survivor.filterDuration,
+					}
+					handles.retain(job.filePointer)
+					if err := sendWithContext(r.ctx, blockJobs, blockJob); err != nil {
+						handles.release(job.filePointer)
+						dispatched = false
+						break
+					}
+					spawnBlockWorker()
+				}
+				handles.release(job.filePointer)
+				if !dispatched {
+					return
+				}
 			case <-r.ctx.Done():
 				return
 			}
@@ -210,21 +348,21 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 	}
 
 	// File stage: pull one candidate at a time from the MetaStore iterator and
-	// fan its blocks out to the workers. Exiting the range loop — on error,
-	// cancellation, or a blocked job send — runs the store iterator's deferred
-	// cleanup. File-level bloom tests are pure in-memory checks, so this
-	// single goroutine runs them inline without taking query-semaphore slots;
-	// the semaphore keeps bounding block scans exactly as before.
+	// hand the survivors to the file workers. Exiting the range loop — on
+	// error, cancellation, or a blocked job send — runs the store iterator's
+	// deferred cleanup. File-level bloom tests are pure in-memory checks, so
+	// this single goroutine runs them inline without taking query-semaphore
+	// slots; the semaphore keeps bounding the I/O stages.
 	//
-	// The file stage holds its own WaitGroup token and is the only spawner,
-	// so the counter cannot reach zero — letting wg.Wait return — before it
-	// exits; worker spawns therefore never race wg.Wait, and the zero-worker
-	// query (empty iterator, everything pruned) completes when the file stage
-	// alone finishes.
-	wg.Add(1)
+	// The file stage holds a token in fileWorkers and is the only spawner of
+	// file workers, so that counter cannot reach zero — letting fileWorkers.Wait
+	// return — before it exits; spawns therefore never race the Wait, and the
+	// zero-worker query (empty iterator, everything pruned) completes when the
+	// file stage alone finishes.
+	fileWorkers.Add(1)
 	go func() {
-		defer wg.Done()
-		defer close(jobs)
+		defer fileWorkers.Done()
+		defer close(fileJobs)
 
 		workersSpawned := 0
 		for maybeFile, err := range b.metaStore.GetMaybeFilesForQuery(r.ctx, query.Prefilter) {
@@ -268,33 +406,198 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 				b.queryFilePruneHook(maybeFile)
 			}
 
-			for _, blockMetadata := range maybeFile.Metadata.DataBlocks {
-				job := dataBlockJob{
-					filePointer:   maybeFile.PointerBytes,
-					blockMetadata: blockMetadata,
-				}
-				if err := sendWithContext(r.ctx, jobs, job); err != nil {
-					return
-				}
-				if workersSpawned < b.config.MaxQueryConcurrency {
-					workersSpawned++
-					wg.Add(1)
-					go worker()
-				}
+			job := fileFilterJob{
+				filePointer: maybeFile.PointerBytes,
+				blocks:      maybeFile.Metadata.DataBlocks,
+			}
+			if err := sendWithContext(r.ctx, fileJobs, job); err != nil {
+				return
+			}
+			if workersSpawned < b.config.MaxQueryConcurrency {
+				workersSpawned++
+				fileWorkers.Add(1)
+				go fileWorker()
 			}
 		}
 	}()
 
+	// Teardown order: file workers are the only spawners of block workers, so
+	// waiting for them first makes blockWorkers.Wait race-free, and the pool
+	// closes only once no reader can hold or ask for a handle.
 	go func() {
-		wg.Wait()
+		fileWorkers.Wait()
+		close(blockJobs)
+		blockWorkers.Wait()
+		handles.closeAll()
 		r.markWorkersDone()
 	}()
 
 	return r, nil
 }
 
+// blocksByAscendingOffset returns the blocks ordered by file offset, so a
+// file's filter sections are read as one forward pass. Metadata almost always
+// arrives in offset order (blocks are written in order), so the common case
+// only verifies it; when a store yields them out of order the sort runs on a
+// copy, because the slice belongs to the MetaStore's yielded metadata.
+func blocksByAscendingOffset(blocks []DataBlockMetadata) []DataBlockMetadata {
+	byOffset := func(a, b DataBlockMetadata) int { return cmp.Compare(a.Offset, b.Offset) }
+	if slices.IsSortedFunc(blocks, byOffset) {
+		return blocks
+	}
+	sorted := slices.Clone(blocks)
+	slices.SortFunc(sorted, byOffset)
+	return sorted
+}
+
+// evaluateBlockFilters evaluates one candidate file's data block filters,
+// appending the blocks that survived to dst as indexes into blocks (which must
+// be in ascending offset order).
+//
+// Every filter section is read on a single pooled handle in that order — one
+// open and a forward pass per file, instead of an open and a seek per block —
+// and each block's filter bytes are released as soon as that block has been
+// evaluated, so a file's filter traffic never accumulates in memory.
+//
+// Pruned blocks are accounted for here: each records its BlockStats with
+// BloomFilterSkipped set, zero rows and bytes processed, and a Duration
+// covering its filter read and evaluation, which is all the block cost.
+// Surviving blocks carry that duration to their scan job so their own
+// BlockStats.Duration still covers the whole block.
+//
+// Failures keep the query going, and the blocks already evaluated keep their
+// outcome:
+//
+//   - A section that read but does not parse is that block's problem alone: the
+//     block records an error and the pass continues on the same handle.
+//   - A handle that fails a seek or read (or a file that cannot be opened at
+//     all) makes the rest of the file unreadable: the handle is dropped, the
+//     file records one error, and the blocks that never got their turn still
+//     record the stats entry every block owes.
+func (b *BloomSearchEngine) evaluateBlockFilters(
+	r *Results,
+	slot *querySlot,
+	handles *fileHandlePool,
+	filePointer []byte,
+	blocks []DataBlockMetadata,
+	pruneBloomQuery *BloomQuery,
+	dst []blockScanCandidate,
+) []blockScanCandidate {
+	// A query without bloom conditions cannot be disqualified by any filter: no
+	// section is read at all and every candidate block goes on to be scanned.
+	if pruneBloomQuery == nil || pruneBloomQuery.Expression == nil {
+		for i := range blocks {
+			dst = append(dst, blockScanCandidate{index: i})
+		}
+		return dst
+	}
+
+	if !slot.acquire() {
+		return dst
+	}
+
+	// The handle is opened lazily (blocks without a filter section need none)
+	// and returned to the pool on every exit, so the file's first block scan
+	// borrows it back instead of opening its own.
+	var handle io.ReadSeekCloser
+	defer func() {
+		if handle != nil {
+			handles.put(filePointer, handle)
+		}
+	}()
+
+	// fail records a filter-evaluation failure unless the query has terminated:
+	// after cancellation or Close, the terminal state already tells the story
+	// and errors provoked by the teardown itself are noise.
+	fail := func(err error) {
+		if r.ctx.Err() != nil {
+			return
+		}
+		r.recordBlockError(err)
+	}
+
+	for i := range blocks {
+		if r.ctx.Err() != nil {
+			// Cancellation is neither an error nor a block outcome: the
+			// remaining blocks record nothing, exactly like blocks still queued
+			// for a scan when the query terminates.
+			return dst
+		}
+
+		block := blocks[i]
+		blockStart := time.Now()
+
+		if handle == nil {
+			opened, err := handles.acquire(r.ctx, filePointer)
+			if err != nil {
+				fail(fmt.Errorf("failed to open file: %w", err))
+				recordUnreadBlocks(r, filePointer, blocks[i:], time.Since(blockStart))
+				return dst
+			}
+			handle = opened
+		}
+
+		filters, handleFailed, err := readDataBlockBloomFilters(handle, &block)
+		if err != nil {
+			fail(fmt.Errorf("failed to read data block bloom filters: %w", err))
+			if handleFailed {
+				handles.discard(handle)
+				handle = nil
+				recordUnreadBlocks(r, filePointer, blocks[i:], time.Since(blockStart))
+				return dst
+			}
+			recordUnreadBlocks(r, filePointer, blocks[i:i+1], time.Since(blockStart))
+			continue
+		}
+
+		if b.evaluateBloomFilters(
+			filters.FieldBloomFilter,
+			filters.TokenBloomFilter,
+			filters.FieldTokenBloomFilter,
+			pruneBloomQuery,
+		) {
+			dst = append(dst, blockScanCandidate{index: i, filterDuration: time.Since(blockStart)})
+			continue
+		}
+
+		r.recordBlockStats(BlockStats{
+			FilePointer:        filePointer,
+			BlockOffset:        block.Offset,
+			TotalRows:          int64(block.Rows),
+			TotalBytes:         int64(block.Size),
+			Duration:           time.Since(blockStart),
+			BloomFilterSkipped: true,
+		})
+	}
+
+	return dst
+}
+
+// recordUnreadBlocks gives blocks a failure kept the query from evaluating the
+// stats entry every block owes: nothing scanned, nothing pruned, and the
+// block's full metadata totals — the same shape a block whose scan failed
+// records. The first block carries the failed operation's duration; the ones
+// behind it cost nothing.
+func recordUnreadBlocks(r *Results, filePointer []byte, blocks []DataBlockMetadata, firstDuration time.Duration) {
+	for i, block := range blocks {
+		duration := time.Duration(0)
+		if i == 0 {
+			duration = firstDuration
+		}
+		r.recordBlockStats(BlockStats{
+			FilePointer: filePointer,
+			BlockOffset: block.Offset,
+			TotalRows:   int64(block.Rows),
+			TotalBytes:  int64(block.Size),
+			Duration:    duration,
+		})
+	}
+}
+
 // processDataBlock scans one data block for the query behind r, delivering
-// matched rows to the cursor and recording the block's stats losslessly.
+// matched rows to the cursor and recording the block's stats losslessly. The
+// block's filters were already evaluated by the file stage
+// (evaluateBlockFilters), so reaching here means the block must be scanned.
 //
 // A failure in this block records its error on the cursor and returns: the
 // query continues with other blocks, because partial results are valuable for
@@ -304,28 +607,27 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 func (b *BloomSearchEngine) processDataBlock(
 	r *Results,
 	slot *querySlot,
+	handles *fileHandlePool,
 	job dataBlockJob,
-	pruneBloomQuery *BloomQuery,
 	rowMatcher *compiledRowMatcher,
 	scratch *rowMatchScratch,
 ) {
 	blockStartTime := time.Now()
-	var bloomFilterSkipped bool
 	var rowsScanned, bytesScanned int64
 
-	// Record stats on every exit path. RowsProcessed/BytesProcessed report
-	// what was actually scanned (zero for a bloom-skipped block); TotalRows/
-	// TotalBytes remain the block's full counts.
+	// Record stats on every exit path. RowsProcessed/BytesProcessed report what
+	// was actually scanned (zero when the scan failed before reading rows);
+	// TotalRows/TotalBytes remain the block's full counts. Duration includes the
+	// block's filter read and evaluation, which the file stage performed.
 	defer func() {
 		r.recordBlockStats(BlockStats{
-			FilePointer:        job.filePointer,
-			BlockOffset:        job.blockMetadata.Offset,
-			RowsProcessed:      rowsScanned,
-			BytesProcessed:     bytesScanned,
-			TotalRows:          int64(job.blockMetadata.Rows),
-			TotalBytes:         int64(job.blockMetadata.Size),
-			Duration:           time.Since(blockStartTime),
-			BloomFilterSkipped: bloomFilterSkipped,
+			FilePointer:    job.filePointer,
+			BlockOffset:    job.blockMetadata.Offset,
+			RowsProcessed:  rowsScanned,
+			BytesProcessed: bytesScanned,
+			TotalRows:      int64(job.blockMetadata.Rows),
+			TotalBytes:     int64(job.blockMetadata.Size),
+			Duration:       job.filterDuration + time.Since(blockStartTime),
 		})
 	}()
 
@@ -341,31 +643,10 @@ func (b *BloomSearchEngine) processDataBlock(
 		r.recordBlockError(err)
 	}
 
-	file, err := b.dataStore.OpenFile(ctx, job.filePointer)
+	file, err := handles.acquire(ctx, job.filePointer)
 	if err != nil {
 		fail(fmt.Errorf("failed to open file: %w", err))
 		return
-	}
-	defer file.Close()
-
-	// The block filter section is only read when the query has bloom
-	// conditions; a condition-free query jumps straight to the row data.
-	if pruneBloomQuery != nil && pruneBloomQuery.Expression != nil {
-		blockBloomFilters, err := ReadDataBlockBloomFilters(file, job.blockMetadata)
-		if err != nil {
-			fail(fmt.Errorf("failed to read data block bloom filters: %w", err))
-			return
-		}
-
-		if !b.evaluateBloomFilters(
-			blockBloomFilters.FieldBloomFilter,
-			blockBloomFilters.TokenBloomFilter,
-			blockBloomFilters.FieldTokenBloomFilter,
-			pruneBloomQuery,
-		) {
-			bloomFilterSkipped = true
-			return
-		}
 	}
 
 	// Verify before emit: the row data section is read fully into memory and
@@ -376,9 +657,18 @@ func (b *BloomSearchEngine) processDataBlock(
 	// allocation.
 	rowData, releaseRowData, err := readPooledBlockRowData(file, &job.blockMetadata)
 	if err != nil {
+		// This read is the only thing the scan needs the handle for, and a
+		// failure may have left it mid-stream: close it rather than lend it to
+		// the file's next reader.
+		handles.discard(file)
 		fail(fmt.Errorf("failed to read block row data: %w", err))
 		return
 	}
+	// The rest of the scan runs on the in-memory row data, so the handle goes
+	// back now instead of at the end of the scan: the file's other blocks can
+	// reuse it, and no handle is ever held while a worker waits on a slow
+	// consumer.
+	handles.put(job.filePointer, file)
 	// The block buffer returns to the pool when this scan exits: by then every
 	// row view has been dropped (matching parses transient views; matched rows
 	// are materialized as independent copies before batching).

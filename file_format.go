@@ -422,23 +422,41 @@ func parseFilterSection(section []byte) (*BloomFilters, error) {
 // (BloomFiltersSize == 0) yields empty BloomFilters, which cannot disqualify
 // anything.
 func ReadDataBlockBloomFilters(file io.ReadSeeker, blockMetadata DataBlockMetadata) (*BloomFilters, error) {
-	if blockMetadata.BloomFiltersSize < 0 || blockMetadata.BloomFiltersSize > blockMetadata.Size {
-		return nil, fmt.Errorf("invalid bloom filter section size %d (block size %d)", blockMetadata.BloomFiltersSize, blockMetadata.Size)
+	filters, _, err := readDataBlockBloomFilters(file, &blockMetadata)
+	return filters, err
+}
+
+// readDataBlockBloomFilters is ReadDataBlockBloomFilters, drawing the section
+// buffer from the scan buffer pool and releasing it before returning: filter
+// bytes are transient, so a query evaluating thousands of blocks does not turn
+// every section into garbage. parseFilterSection copies everything it retains
+// (each filter decodes into its own words), so the buffer is reusable the
+// moment it returns.
+//
+// handleFailed reports that the failure came from the handle — a seek or a read
+// — rather than from the section's contents, so the query path can drop a
+// handle whose stream position is unknown instead of lending it to the file's
+// next reader.
+func readDataBlockBloomFilters(file io.ReadSeeker, block *DataBlockMetadata) (filters *BloomFilters, handleFailed bool, err error) {
+	if block.BloomFiltersSize < 0 || block.BloomFiltersSize > block.Size {
+		return nil, false, fmt.Errorf("invalid bloom filter section size %d (block size %d)", block.BloomFiltersSize, block.Size)
 	}
-	if blockMetadata.BloomFiltersSize == 0 {
-		return &BloomFilters{}, nil
+	if block.BloomFiltersSize == 0 {
+		return &BloomFilters{}, false, nil
 	}
 
-	if _, err := file.Seek(int64(blockMetadata.Offset), io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to seek to block offset: %w", err)
+	if _, err := file.Seek(int64(block.Offset), io.SeekStart); err != nil {
+		return nil, true, fmt.Errorf("failed to seek to block offset: %w", err)
 	}
 
-	section := make([]byte, blockMetadata.BloomFiltersSize)
+	section := getScanBuffer(block.BloomFiltersSize)
+	defer putScanBuffer(section)
 	if _, err := io.ReadFull(file, section); err != nil {
-		return nil, fmt.Errorf("failed to read bloom filters: %w", err)
+		return nil, true, fmt.Errorf("failed to read bloom filters: %w", err)
 	}
 
-	return parseFilterSection(section)
+	filters, err = parseFilterSection(section)
+	return filters, false, err
 }
 
 // CompressionType represents the compression algorithm used for row data
