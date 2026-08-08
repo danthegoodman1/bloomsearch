@@ -124,14 +124,14 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 3A: Stop drains ingestChan; shutdown flush uses live ctx; reliable done delivery; Flush acks only after all earlier flush work completes | Missing: implementation + stop-under-load test + TestFlushWaitsForInFlightFlushes. |
-| Incomplete | Work | 3B: Flush error paths close writer + tombstone + deliver error | Missing: implementation + fault-injection flush test. |
-| Incomplete | Work | 3C: Batch atomicity + nil-encoder poisoned-partition fix | Missing: implementation + mid-batch-error and bad-zstd-level tests. |
-| Incomplete | Work | 3D: Merge gates commit on Close; tombstones aborted output; single-flight; GC-failure distinct | Missing: implementation + failing-Close merge test + concurrent-Merge test. |
-| Incomplete | Work | 3E: Per-reader handles in merge; source-param metadata stamping; minmax key-set rule | Missing: implementation + same-file-blocks merge test + param-change merge test. |
-| Incomplete | Work | 3F: Start guard; empty-ingest ack; flush overflow off the ingest actor | Missing: implementation + double-Start/empty-ingest tests. |
-| Incomplete | Work | 3G: Full config validation; `""` compression normalized and readable | Missing: implementation + validation table test + `""`-compression round-trip test. |
-| Incomplete | Gate | Zero acked-row loss, exactly-once done delivery, no bad merge commits | Missing: passing fault-injection suite under `-race`. |
+| Complete | Work | 3A: Stop drains ingestChan; shutdown flush uses live ctx; reliable done delivery; Flush acks only after all earlier flush work completes | Accepting-flag (`stateMu`+`stopped`) closes the enqueue race; engine-owned `flushCtx` + Stop `AfterFunc` deadline abort (stronger than packet spec); `SendToChannelsWithContext` attempts every channel; single-flusher FIFO with blocking `triggerFlush`. Tests: `TestStopUnderLoadLosesNoAckedRows` (ctx-checking store), `TestFlushWaitsForInFlightFlushes` (count=10), `TestIngestAfterStopReturnsError`, `TestStopHonorsDeadlineWhenFlushWorkerWedged`. |
+| Complete | Work | 3B: Flush error paths close writer + tombstone + deliver error | `abortFileWriter` + optional `Abort()` interface; FS store Abort + dir fsync + TombstoneFile removes .dat/reservation/.tmp. Tests: `TestFlushErrorPathsAbortAndReport`, `TestFlushUpdateFailureTombstonesOrphan`, `TestTombstoneRemovesAllArtifacts`. |
+| Complete | Work | 3C: Batch atomicity + nil-encoder poisoned-partition fix | All rows marshaled before any buffer/bloom mutation (same bytes feed walker and buffer — Phase 1 invariant reviewer-verified); encoder created before buffer registration. Test: `TestBatchAtomicityOnMarshalError`. |
+| Complete | Work | 3D: Merge gates commit on Close; tombstones aborted output; single-flight; GC-failure distinct | Close checked before Update; `ErrMergeInProgress` TryLock; `ErrPostCommitCleanup` sentinel. Tests: `TestMergeAbortsOnCloseFailure`, `TestConcurrentMergeSingleFlight`, `TestMergeUpdateFailureTombstonesOutputsKeepsSources`, `TestMergePostCommitTombstoneFailure`. |
+| Complete | Work | 3E: Per-reader handles in merge; source-param metadata stamping; minmax key-set rule | Per-reader `OpenFile`; file params from group[0], block params from sources; equal-key-set mergeability. Red-checked vs HEAD (unexpected EOF / wrong params / widened visibility). Tests: `TestMergeSameFileBlocks`, `TestMergeStampsSourceParams`, `TestMergeMinMaxKeySetIncompatible`. |
+| Complete | Work | 3F: Start guard; empty-ingest ack; flush overflow off the ingest actor | Idempotent Start; empty ingest acks with no 0-row blocks; inline-flush path deleted (FIFO). Tests: `TestDoubleStartStopSafe`, `TestEmptyIngestAcksImmediately`. |
+| Complete | Work | 3G: Full config validation; `""` compression normalized and readable | Every knob validated (`ErrInvalidConfig`); `""` normalized at construction, `normalizeCompression` on both read paths. Tests: `TestConfigValidationTable`, `TestEmptyCompressionReadable`. |
+| Complete | Gate | Zero acked-row loss, exactly-once done delivery, no bad merge commits | `go test -race -count=1 ./...` ok (42.7s, coordinator-verified); 9-test concurrency set at `-race -count=3` ×5 loops + reviewer ×2, zero flakes. Two review rounds (blocker: flaky wedged-Stop test → engine-side post-deadline flush abandonment). Benchmarks: ingest neutral, merge +6-11% (dir fsync + per-reader handles, accepted durability cost). |
 
 ## Phase 4: Query API reshape
 
@@ -140,7 +140,7 @@ A query API whose misuse is hard: unambiguous completion, deterministic error de
 
 Scope:
 - Replace `Query(ctx, q, resultChan, errorChan, statsChan)` with an engine-owned cursor (`Results` with `Next/Row/Err/Stats`, or `iter.Seq2`). Kills in one move: double-close panic on channel reuse, closed-`resultChan`-but-errors ambiguity, never-closed `errorChan`/`statsChan` (the repo's own tests leak goroutines on these — `-race` fails today), and the undocumented must-drain-both-channels deadlock.
-- Canceled queries are distinguishable from complete ones (ctx cancellation surfaces as a terminal error; today dropped files yield silent partial results, bloom_tree_engine.go:978-1007).
+- Canceled queries are distinguishable from complete ones (ctx cancellation surfaces as a terminal error; today dropped files yield silent partial results, bloom_tree_engine.go:978-1007). Note from Phase 3: `SendWithContext` now try-sends before honoring cancellation, so a canceled query whose consumer keeps draining keeps receiving rows — Phase 4 defines cancellation delivery semantics deliberately.
 - Decide and document worker semantics on block error: stop-query vs skip-block (doc comment currently contradicts the code).
 - Workers release the global `querySemaphore` while blocked sending to a slow consumer, or the semaphore becomes per-query with a global cap (today one slow consumer parks global slots and starves unrelated queries, bloom_tree_engine.go:1029-1036,1193).
 - `BlockStats` reports actual scanned rows/bytes (skipped blocks currently report full counts, inflating PERFORMANCE.md); stats delivery contract defined (lossy or not) and stats always terminated.

@@ -22,6 +22,22 @@ import (
 
 var (
 	ErrInvalidConfig = errors.New("invalid configuration")
+
+	// ErrEngineStopped is returned by IngestRows and Flush once Stop has
+	// begun: the engine no longer accepts work, so callers must not retry.
+	ErrEngineStopped = errors.New("engine is stopped")
+
+	// ErrMergeInProgress is returned by Merge when another Merge call on this
+	// engine is still running. Merges are single-flight in-process because
+	// concurrent merges would write every merged row into two output files.
+	ErrMergeInProgress = errors.New("merge already in progress")
+
+	// ErrPostCommitCleanup wraps tombstone failures that happen after a merge
+	// has committed to the MetaStore. The merge itself succeeded and state is
+	// consistent — the new file is referenced and the old files are not — but
+	// the unreferenced source files could not be tombstoned and linger in the
+	// DataStore. Callers receive the MergeStats alongside this error.
+	ErrPostCommitCleanup = errors.New("merge committed but source cleanup failed")
 )
 
 // dataBlockJob represents a job to process a data block
@@ -131,6 +147,28 @@ type BloomSearchEngine struct {
 	wg          sync.WaitGroup
 	ingestDone  chan struct{}
 
+	// flushCtx governs flush-path store calls and done-channel delivery. It is
+	// derived from context.Background, not from b.ctx: once rows are accepted
+	// into a flush, the flush must complete for durability, so engine
+	// cancellation alone never aborts it. Stop arms flushCancel on its own
+	// context (see Stop), which makes the shutdown deadline the only thing
+	// that can abort in-flight flushes and their done-channel delivery.
+	flushCtx    context.Context
+	flushCancel context.CancelFunc
+
+	// stateMu guards started/stopped. IngestRows and Flush take the read lock
+	// around the stopped check and the ingestChan send; Stop takes the write
+	// lock to set stopped before canceling b.ctx. Because a send only happens
+	// under the read lock with stopped == false, no new request can land in
+	// ingestChan after Stop holds the write lock — the ingest worker's
+	// shutdown drain of ingestChan is therefore complete.
+	stateMu sync.RWMutex
+	started bool
+	stopped bool
+
+	// mergeMu makes Merge single-flight in-process (see ErrMergeInProgress).
+	mergeMu sync.Mutex
+
 	querySemaphore chan struct{}
 }
 
@@ -229,27 +267,72 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 }
 
 func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, dataStore DataStore) (*BloomSearchEngine, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
 	if config.Tokenizer == nil {
-		cancel() // make the linter happy
 		return nil, fmt.Errorf("%w: tokenizer is required", ErrInvalidConfig)
 	}
 
+	if config.MaxRowGroupRows <= 0 {
+		return nil, fmt.Errorf("%w: MaxRowGroupRows must be greater than 0", ErrInvalidConfig)
+	}
+
+	if config.MaxRowGroupBytes <= 0 {
+		return nil, fmt.Errorf("%w: MaxRowGroupBytes must be greater than 0", ErrInvalidConfig)
+	}
+
+	if config.MaxFileSize <= 0 {
+		return nil, fmt.Errorf("%w: MaxFileSize must be greater than 0", ErrInvalidConfig)
+	}
+
+	if config.MaxBufferedRows <= 0 {
+		return nil, fmt.Errorf("%w: MaxBufferedRows must be greater than 0", ErrInvalidConfig)
+	}
+
+	if config.MaxBufferedBytes <= 0 {
+		return nil, fmt.Errorf("%w: MaxBufferedBytes must be greater than 0", ErrInvalidConfig)
+	}
+
+	if config.MaxBufferedTime <= 0 {
+		return nil, fmt.Errorf("%w: MaxBufferedTime must be greater than 0", ErrInvalidConfig)
+	}
+
+	if config.IngestBufferSize <= 0 {
+		return nil, fmt.Errorf("%w: IngestBufferSize must be greater than 0", ErrInvalidConfig)
+	}
+
 	if config.FileBloomExpectedItems == 0 {
-		cancel() // make the linter happy
 		return nil, fmt.Errorf("%w: BloomExpectedItems must be greater than 0", ErrInvalidConfig)
 	}
 
 	if config.BloomFalsePositiveRate <= 0 || config.BloomFalsePositiveRate >= 1 {
-		cancel() // make the linter happy
 		return nil, fmt.Errorf("%w: BloomFalsePositiveRate must be between 0 and 1", ErrInvalidConfig)
 	}
 
 	if config.MaxQueryConcurrency <= 0 {
-		cancel() // make the linter happy
 		return nil, fmt.Errorf("%w: MaxQueryConcurrency must be greater than 0", ErrInvalidConfig)
 	}
+
+	if config.MaxFilesToMergePerOperation < 2 {
+		return nil, fmt.Errorf("%w: MaxFilesToMergePerOperation must be at least 2", ErrInvalidConfig)
+	}
+
+	// Normalize the empty compression value at construction so every block is
+	// written with an explicit compression type. The read path independently
+	// accepts "" as CompressionNone for files written before normalization
+	// (see normalizeCompression).
+	switch config.RowDataCompression {
+	case "":
+		config.RowDataCompression = CompressionNone
+	case CompressionNone, CompressionSnappy:
+	case CompressionZstd:
+		if config.ZstdCompressionLevel < 1 || config.ZstdCompressionLevel > 22 {
+			return nil, fmt.Errorf("%w: ZstdCompressionLevel must be between 1 and 22", ErrInvalidConfig)
+		}
+	default:
+		return nil, fmt.Errorf("%w: unknown RowDataCompression %q", ErrInvalidConfig, config.RowDataCompression)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	flushCtx, flushCancel := context.WithCancel(context.Background())
 
 	return &BloomSearchEngine{
 		config:    config,
@@ -263,12 +346,25 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 				return &ingestRequest{}
 			},
 		},
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:         ctx,
+		cancel:      cancel,
+		flushCtx:    flushCtx,
+		flushCancel: flushCancel,
 
 		querySemaphore: make(chan struct{}, config.MaxQueryConcurrency),
 		ingestDone:     make(chan struct{}),
 	}, nil
+}
+
+// normalizeCompression maps the empty compression value to CompressionNone.
+// Files written before construction-time normalization carry "" in block
+// metadata (the field marshals with omitempty) and their row data is
+// uncompressed, so the read path treats the two identically.
+func normalizeCompression(compression CompressionType) CompressionType {
+	if compression == "" {
+		return CompressionNone
+	}
+	return compression
 }
 
 func (b *BloomSearchEngine) newFileLevelBloomFilters() (*bloom.BloomFilter, *bloom.BloomFilter, *bloom.BloomFilter) {
@@ -277,15 +373,49 @@ func (b *BloomSearchEngine) newFileLevelBloomFilters() (*bloom.BloomFilter, *blo
 		bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
 }
 
-// Start begins the ingestion and flush workers
+// Start begins the ingestion and flush workers. Start is idempotent: extra
+// calls while running are no-ops, and Start after Stop is a no-op (a stopped
+// engine cannot be restarted; construct a new one).
 func (b *BloomSearchEngine) Start() {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+
+	if b.started || b.stopped {
+		return
+	}
+	b.started = true
+
 	b.wg.Add(2)
 	go b.ingestWorker()
 	go b.flushWorker()
 }
 
-// Stop gracefully shuts down the engine with a timeout
+// Stop gracefully shuts down the engine. Ingest requests accepted before Stop
+// are drained and flushed: the ingest worker empties ingestChan, flushes any
+// buffered rows, and the flush worker finishes every queued flush before
+// exiting, so every accepted batch is either made durable or receives an
+// error on its done channel. Shutdown flushes run against the DataStore and
+// MetaStore with a live context; ctx expiring aborts them (and Stop returns
+// the deadline error), which is the only way an in-flight flush is canceled.
+//
+// Pass a ctx with a deadline (or one that will be canceled): ctx expiry is
+// the only abort path, so Stop(context.Background()) waits indefinitely if
+// the pipeline is wedged behind the documented done-channel backpressure (an
+// abandoned unbuffered doneChan stalls the flush worker, backing up the
+// ingest worker and any blocked IngestRows callers Stop must wait for).
 func (b *BloomSearchEngine) Stop(ctx context.Context) error {
+	// Arm the deadline abort before anything that can block: when ctx
+	// expires, in-flight flush store calls, done-channel delivery, and flush
+	// enqueueing all abort, which also unwinds any IngestRows caller holding
+	// the read lock on a full ingest buffer — so Stop can always honor its
+	// deadline. The AfterFunc is dropped on a graceful finish, leaving
+	// flushCtx live.
+	stopAfter := context.AfterFunc(ctx, b.flushCancel)
+
+	b.stateMu.Lock()
+	b.stopped = true
+	b.stateMu.Unlock()
+
 	// Signal workers to stop
 	b.cancel()
 
@@ -299,6 +429,7 @@ func (b *BloomSearchEngine) Stop(ctx context.Context) error {
 	select {
 	case <-done:
 		// Workers finished gracefully
+		stopAfter()
 		return nil
 	case <-ctx.Done():
 		// Timeout occurred
@@ -306,24 +437,51 @@ func (b *BloomSearchEngine) Stop(ctx context.Context) error {
 	}
 }
 
-// IngestRows queues rows for ingestion by the actor
+// IngestRows queues rows for ingestion by the actor. Returns
+// ErrEngineStopped once Stop has begun; a nil return means the batch was
+// accepted and will either be made durable or receive an error on doneChan.
+//
+// Done-channel delivery is blocking: provide a buffered channel or actively
+// receive from it. An abandoned unbuffered doneChan stalls the flush worker
+// (deliberate backpressure) until the engine's Stop deadline aborts delivery.
 func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]any, doneChan chan error) error {
+	b.stateMu.RLock()
+	defer b.stateMu.RUnlock()
+
+	if b.stopped {
+		return ErrEngineStopped
+	}
+
 	req := b.requestPool.Get().(*ingestRequest)
 	req.rows = rows
 	req.doneChan = doneChan
 
+	// Sending under the read lock means Stop cannot set stopped (and cancel
+	// b.ctx) until this send lands, so the shutdown drain always sees it. The
+	// ingest worker keeps consuming until b.ctx is canceled, so the send
+	// cannot block Stop indefinitely.
 	select {
 	case b.ingestChan <- req:
 		return nil
 	case <-ctx.Done():
+		req.reset()
+		b.requestPool.Put(req)
 		return ctx.Err()
-	case <-b.ctx.Done():
-		return context.Canceled
 	}
 }
 
-// Flush forces a flush of any buffered data
+// Flush forces a flush of any buffered data and waits for it — and for every
+// flush queued before it — to complete. With nothing buffered it still waits
+// behind all in-flight flush work (all flushes go through one FIFO worker),
+// so a nil return means every row ingested before Flush was called is
+// durable. Returns ErrEngineStopped once Stop has begun.
 func (b *BloomSearchEngine) Flush(ctx context.Context) error {
+	b.stateMu.RLock()
+	if b.stopped {
+		b.stateMu.RUnlock()
+		return ErrEngineStopped
+	}
+
 	req := b.requestPool.Get().(*ingestRequest)
 	req.rows = nil
 	req.forceFlush = true
@@ -332,16 +490,14 @@ func (b *BloomSearchEngine) Flush(ctx context.Context) error {
 
 	select {
 	case b.ingestChan <- req:
+		b.stateMu.RUnlock()
 		// Wait for flush to complete (once committed, let it finish)
 		return <-doneChan
 	case <-ctx.Done():
+		b.stateMu.RUnlock()
 		req.reset()
 		b.requestPool.Put(req)
 		return ctx.Err()
-	case <-b.ctx.Done():
-		req.reset()
-		b.requestPool.Put(req)
-		return context.Canceled
 	}
 }
 
@@ -367,24 +523,46 @@ func (b *BloomSearchEngine) ingestWorker() {
 		select {
 		case <-b.ctx.Done():
 			fmt.Println("ingestWorker context done")
-			// Flush any remaining buffered data before exiting
-			if bufferedRowCount > 0 {
-				b.flushBufferedData(
-					partitionBuffers,
-					&doneChans,
-					&bufferedRowCount,
-					&bufferedBytes,
-					&bufferStartTime,
-					&fileFieldBloomFilter,
-					&fileTokenBloomFilter,
-					&fileFieldTokenBloomFilter,
-				)
+			// Stop set the stopped flag before canceling b.ctx, so ingestChan
+			// can no longer receive new requests: draining until empty
+			// processes every accepted batch. Requests are processed with the
+			// flush context — b.ctx is already canceled and using it would
+			// fail the shutdown flush and drop done-channel delivery.
+			for {
+				select {
+				case req := <-b.ingestChan:
+					b.processIngestRequest(
+						b.flushCtx,
+						req,
+						partitionBuffers,
+						&doneChans,
+						&bufferedRowCount,
+						&bufferedBytes,
+						&bufferStartTime,
+						&fileFieldBloomFilter,
+						&fileTokenBloomFilter,
+						&fileFieldTokenBloomFilter,
+					)
+				default:
+					// Flush any remaining buffered data (and ack any
+					// remaining waiters) before exiting.
+					b.flushBufferedData(
+						partitionBuffers,
+						&doneChans,
+						&bufferedRowCount,
+						&bufferedBytes,
+						&bufferStartTime,
+						&fileFieldBloomFilter,
+						&fileTokenBloomFilter,
+						&fileFieldTokenBloomFilter,
+					)
+					return
+				}
 			}
-			return
 		case req := <-b.ingestChan:
 			// Process the batch of rows
 			b.processIngestRequest(
-				b.ctx,
+				b.flushCtx,
 				req,
 				partitionBuffers,
 				&doneChans,
@@ -413,7 +591,10 @@ func (b *BloomSearchEngine) ingestWorker() {
 	}
 }
 
-// flushBufferedData flushes the current buffered data and resets the buffer state
+// flushBufferedData flushes the current buffered data and resets the buffer
+// state. With no buffered partitions but pending done channels it still
+// enqueues an ack-only flush request, so waiters are acked in FIFO order
+// behind every flush already queued or in flight.
 func (b *BloomSearchEngine) flushBufferedData(
 	partitionBuffers map[string]*partitionBuffer,
 	doneChans *[]chan error,
@@ -424,7 +605,7 @@ func (b *BloomSearchEngine) flushBufferedData(
 	fileTokenBloomFilter **bloom.BloomFilter,
 	fileFieldTokenBloomFilter **bloom.BloomFilter,
 ) {
-	if len(partitionBuffers) == 0 {
+	if len(partitionBuffers) == 0 && len(*doneChans) == 0 {
 		return
 	}
 
@@ -475,25 +656,29 @@ func (b *BloomSearchEngine) processIngestRequest(
 		b.requestPool.Put(req)
 	}()
 
-	// If this is a force flush request, immediately trigger a flush
+	// If this is a force flush request, route it through the flush FIFO even
+	// with nothing buffered: flushBufferedData enqueues an ack-only flush
+	// request in that case, so the ack is ordered behind all in-flight flush
+	// work and Flush never returns before earlier rows are durable.
 	if req.forceFlush {
-		if *bufferedRowCount > 0 {
-			// Add the force flush doneChan to the list before flushing
-			*doneChans = append(*doneChans, req.doneChan)
-			b.flushBufferedData(
-				partitionBuffers,
-				doneChans,
-				bufferedRowCount,
-				bufferedBytes,
-				bufferStartTime,
-				fileFieldBloomFilter,
-				fileTokenBloomFilter,
-				fileFieldTokenBloomFilter,
-			)
-		} else {
-			// No buffered data, signal completion immediately
-			SendOptionalWithContext(ctx, req.doneChan, nil)
-		}
+		*doneChans = append(*doneChans, req.doneChan)
+		b.flushBufferedData(
+			partitionBuffers,
+			doneChans,
+			bufferedRowCount,
+			bufferedBytes,
+			bufferStartTime,
+			fileFieldBloomFilter,
+			fileTokenBloomFilter,
+			fileFieldTokenBloomFilter,
+		)
+		return
+	}
+
+	// An empty batch has nothing to make durable: ack immediately and leave
+	// the buffers untouched (no empty partition buffer, no 0-row block).
+	if len(req.rows) == 0 {
+		SendOptionalWithContext(ctx, req.doneChan, nil)
 		return
 	}
 
@@ -508,10 +693,40 @@ func (b *BloomSearchEngine) processIngestRequest(
 		partitionedRows[""] = req.rows
 	}
 
-	// Create partition buffers if they don't exist
+	// Serialize and validate every row before mutating any partition buffer or
+	// bloom filter, so a mid-batch error rejects the whole batch and leaves
+	// the buffered state exactly as it was. Indexing walks the marshaled JSON
+	// bytes, the same canonical representation query-time row verification
+	// walks (see forEachPathValue in tokenizer.go).
+	partitionedRowBytes := make(map[string][][]byte, len(partitionedRows))
+	for partitionID, rows := range partitionedRows {
+		rowBytesList := make([][]byte, len(rows))
+		for i, row := range rows {
+			rowBytes, err := json.Marshal(row)
+			if err != nil {
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to serialize row: %w", err))
+				return
+			}
+
+			// Check if row is too large for uint32 length prefix
+			if len(rowBytes) > 0xFFFFFFFF {
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF))
+				return
+			}
+
+			rowBytesList[i] = rowBytes
+		}
+		partitionedRowBytes[partitionID] = rowBytesList
+	}
+
+	// Create partition buffers if they don't exist. The compression encoder is
+	// created before the buffer is registered, and buffers created for this
+	// batch are removed on failure — a half-constructed entry (nil encoder)
+	// must never persist, or the next ingest for that partition panics.
+	createdPartitions := make([]string, 0)
 	for partitionID := range partitionedRows {
 		if partitionBuffers[partitionID] == nil {
-			partitionBuffers[partitionID] = &partitionBuffer{
+			newBuffer := &partitionBuffer{
 				partitionID:           partitionID,
 				minMaxIndexes:         make(map[string]MinMaxIndex),
 				buffer:                bytes.Buffer{},
@@ -521,13 +736,17 @@ func (b *BloomSearchEngine) processIngestRequest(
 				uncompressedSize:      0,
 				rowCount:              0,
 			}
-			var err error
-			partitionBuffers[partitionID].compressionEncoders, err = b.createCompressionWriter(&partitionBuffers[partitionID].buffer)
+			encoders, err := b.createCompressionWriter(&newBuffer.buffer)
 			if err != nil {
+				for _, createdID := range createdPartitions {
+					delete(partitionBuffers, createdID)
+				}
 				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to create compression writer: %w", err))
 				return
 			}
-
+			newBuffer.compressionEncoders = encoders
+			partitionBuffers[partitionID] = newBuffer
+			createdPartitions = append(createdPartitions, partitionID)
 		}
 	}
 
@@ -542,23 +761,11 @@ func (b *BloomSearchEngine) processIngestRequest(
 	// Process each partition
 	for partitionID, rows := range partitionedRows {
 		partitionBuffer := partitionBuffers[partitionID]
+		rowBytesList := partitionedRowBytes[partitionID]
 
 		// Process each row
-		for _, row := range rows {
-			// Serialize the row first: indexing walks the marshaled JSON bytes,
-			// the same canonical representation query-time row verification
-			// walks (see forEachPathValue in tokenizer.go)
-			rowBytes, err := json.Marshal(row)
-			if err != nil {
-				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to serialize row: %w", err))
-				return
-			}
-
-			// Check if row is too large for uint32 length prefix
-			if len(rowBytes) > 0xFFFFFFFF {
-				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF))
-				return
-			}
+		for i, row := range rows {
+			rowBytes := rowBytesList[i]
 
 			// Add info to bloom filters: every path (including intermediate
 			// object/array paths) to the field filters, leaf-value tokens to the
@@ -604,11 +811,19 @@ func (b *BloomSearchEngine) processIngestRequest(
 				}
 			}
 
-			// Write length prefix (uint32) followed by row bytes
+			// Write length prefix (uint32) followed by row bytes. The
+			// destination is an in-memory buffer, so failures here are
+			// exceptional; they are still reported rather than swallowed.
 			lengthBytes := make([]byte, LengthPrefixSize)
 			binary.LittleEndian.PutUint32(lengthBytes, uint32(len(rowBytes)))
-			partitionBuffer.compressionEncoders.writer.Write(lengthBytes)
-			partitionBuffer.compressionEncoders.writer.Write(rowBytes)
+			if _, err := partitionBuffer.compressionEncoders.writer.Write(lengthBytes); err != nil {
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to buffer row length: %w", err))
+				return
+			}
+			if _, err := partitionBuffer.compressionEncoders.writer.Write(rowBytes); err != nil {
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to buffer row data: %w", err))
+				return
+			}
 
 			// Increment stats
 			partitionBuffer.uncompressedSize += len(rowBytes) + LengthPrefixSize
@@ -682,6 +897,13 @@ func (b *BloomSearchEngine) processIngestRequest(
 	}
 }
 
+// triggerFlush enqueues a flush request for the flush worker. The send
+// blocks: the ingest actor is the only producer and the flush worker the only
+// consumer, so flushes execute strictly FIFO — Flush acks cannot overtake
+// flushes queued before them — and flushing never runs inline on the ingest
+// actor. A full channel simply applies backpressure to ingest. If the
+// shutdown deadline expires while the flush worker is wedged, waiters are
+// told (best effort) instead of being dropped silently.
 func (b *BloomSearchEngine) triggerFlush(partitionBuffers map[string]*partitionBuffer, doneChans []chan error, fileBloomFilters BloomFilters) {
 	flushReq := flushRequest{
 		partitionBuffers: partitionBuffers,
@@ -689,13 +911,14 @@ func (b *BloomSearchEngine) triggerFlush(partitionBuffers map[string]*partitionB
 		fileBloomFilters: fileBloomFilters,
 	}
 
-	// Send to flush worker (non-blocking)
 	select {
 	case b.flushChan <- flushReq:
 		// Successfully queued for flush
-	default:
-		// Flush channel is full, handle directly (should be rare)
-		b.handleFlush(flushReq)
+	case <-b.flushCtx.Done():
+		// Shutdown deadline expired: the flush worker will not take this
+		// request. Deliver the failure to ready waiters; flushCtx is already
+		// canceled so blocked channels are given up immediately.
+		SendToChannelsWithContext(b.flushCtx, doneChans, fmt.Errorf("flush abandoned: %w", b.flushCtx.Err()))
 	}
 }
 
@@ -709,19 +932,21 @@ func (b *BloomSearchEngine) flushWorker() {
 			case <-b.ctx.Done():
 				shuttingDown = true
 			case flushReq := <-b.flushChan:
-				b.handleFlush(flushReq)
+				b.handleFlush(b.flushCtx, flushReq)
 			}
 			continue
 		}
 
 		select {
 		case flushReq := <-b.flushChan:
-			b.handleFlush(flushReq)
+			b.handleFlush(b.flushCtx, flushReq)
 		case <-b.ingestDone:
+			// The ingest worker has exited, so every flush request it will
+			// ever produce is already in the channel; drain them all.
 			for {
 				select {
 				case flushReq := <-b.flushChan:
-					b.handleFlush(flushReq)
+					b.handleFlush(b.flushCtx, flushReq)
 				default:
 					fmt.Println("flushWorker context done")
 					return
@@ -731,7 +956,42 @@ func (b *BloomSearchEngine) flushWorker() {
 	}
 }
 
-func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
+// abortFileWriter discards a partially written file so it can never become
+// visible: writers implementing Abort discard without publishing (Close on a
+// rename-on-close writer would publish a corrupt file); other writers are
+// closed unless a Close was already attempted. The pointer is then
+// tombstoned so the store forgets whatever was reserved for it. Cleanup is
+// best effort — the caller's original error is what gets reported.
+func (b *BloomSearchEngine) abortFileWriter(ctx context.Context, writer io.WriteCloser, filePointerBytes []byte, closeAttempted bool) {
+	if aborter, ok := writer.(interface{ Abort() error }); ok {
+		aborter.Abort()
+	} else if !closeAttempted {
+		writer.Close()
+	}
+	b.dataStore.TombstoneFile(ctx, filePointerBytes)
+}
+
+// handleFlush writes one file from a flush request and acks its done
+// channels. A request without partition buffers is ack-only: it exists purely
+// to order a Flush ack behind earlier flush work. On any failure after
+// CreateFile the writer is aborted and the pointer tombstoned before the
+// error is delivered, so no partial file stays visible or leaks a handle.
+func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushRequest) {
+	// Once the shutdown deadline has aborted flush work, queued requests must
+	// not start any store work: a ctx-ignoring store would happily keep
+	// creating files after Stop already returned. Report the abandonment to
+	// every waiter instead (best effort — ctx is already canceled, so only
+	// ready channels receive it).
+	if err := ctx.Err(); err != nil {
+		SendToChannelsWithContext(ctx, flushReq.doneChans, fmt.Errorf("flush abandoned: %w", err))
+		return
+	}
+
+	if len(flushReq.partitionBuffers) == 0 {
+		SendToChannelsWithContext(ctx, flushReq.doneChans, nil)
+		return
+	}
+
 	fileMetadata := FileMetadata{
 		BloomFilters:           flushReq.fileBloomFilters,
 		BloomExpectedItems:     b.config.FileBloomExpectedItems,
@@ -740,12 +1000,18 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 	}
 
 	// Stream write to data store
-	writer, filePointerBytes, err := b.dataStore.CreateFile(b.ctx)
+	writer, filePointerBytes, err := b.dataStore.CreateFile(ctx)
 	if err != nil {
 		fmt.Println("failed to create file: %w", err)
 		// Write error to all done channels
-		SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to create file: %w", err))
+		SendToChannelsWithContext(ctx, flushReq.doneChans, fmt.Errorf("failed to create file: %w", err))
 		return
+	}
+
+	// fail aborts the partial file and reports err to every waiter.
+	fail := func(err error, closeAttempted bool) {
+		b.abortFileWriter(ctx, writer, filePointerBytes, closeAttempted)
+		SendToChannelsWithContext(ctx, flushReq.doneChans, err)
 	}
 
 	currentOffset := 0
@@ -755,7 +1021,7 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		// Finalize compression encoders before writing
 		var compressedData []byte
 		if err := partitionBuffer.compressionEncoders.finalizeCompression(); err != nil {
-			SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to finalize compression: %w", err))
+			fail(fmt.Errorf("failed to finalize compression: %w", err), false)
 			return
 		}
 		compressedData = partitionBuffer.buffer.Bytes()
@@ -769,7 +1035,7 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 		// Write bloom filters and hash
 		_, _, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, dataBlockBloomFilters)
 		if err != nil {
-			SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to write bloom filters: %w", err))
+			fail(fmt.Errorf("failed to write bloom filters: %w", err), false)
 			return
 		}
 
@@ -778,8 +1044,7 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 
 		// Write the row data buffer
 		if _, err := writer.Write(compressedData); err != nil {
-			// Write error to all done channels
-			SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to write data block: %w", err))
+			fail(fmt.Errorf("failed to write data block: %w", err), false)
 			return
 		}
 
@@ -806,26 +1071,30 @@ func (b *BloomSearchEngine) handleFlush(flushReq flushRequest) {
 
 	// Write final metadata to data store and footer
 	if err := b.writeFileMetadataAndFooter(writer, &fileMetadata); err != nil {
-		SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to write file metadata and footer: %w", err))
+		fail(fmt.Errorf("failed to write file metadata and footer: %w", err), false)
 		return
 	}
 
 	if err := writer.Close(); err != nil {
-		SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to close file writer: %w", err))
+		fail(fmt.Errorf("failed to close file writer: %w", err), true)
 		return
 	}
 
-	if err := b.metaStore.Update(b.ctx, []WriteOperation{
+	if err := b.metaStore.Update(ctx, []WriteOperation{
 		{
 			FileMetadata:     &fileMetadata,
 			FilePointerBytes: filePointerBytes,
 		},
 	}, nil); err != nil {
-		SendToChannelsWithContext(b.ctx, flushReq.doneChans, fmt.Errorf("failed to store file metadata: %w", err))
+		// The file is fully written and published but never became
+		// referenced; tombstone the orphan. The writer is already closed, so
+		// no abort.
+		b.dataStore.TombstoneFile(ctx, filePointerBytes)
+		SendToChannelsWithContext(ctx, flushReq.doneChans, fmt.Errorf("failed to store file metadata: %w", err))
 		return
 	}
 
-	SendToChannelsWithContext(b.ctx, flushReq.doneChans, nil)
+	SendToChannelsWithContext(ctx, flushReq.doneChans, nil)
 }
 
 // evaluateBloomFilters tests if bloom filters match the bloom query
@@ -1157,7 +1426,7 @@ func (b *BloomSearchEngine) processDataBlock(
 
 	// Create appropriate decompression reader based on compression type
 	var rowDataReader io.Reader
-	switch job.blockMetadata.Compression {
+	switch normalizeCompression(job.blockMetadata.Compression) {
 	case CompressionNone:
 		rowDataReader = hashReader
 	case CompressionSnappy:
@@ -1226,8 +1495,17 @@ func (b *BloomSearchEngine) processDataBlock(
 	}
 }
 
-// Merge executes file merging to optimize storage and query performance
+// Merge executes file merging to optimize storage and query performance.
+// Merge is single-flight per engine: a call while another Merge is running
+// returns ErrMergeInProgress (concurrent merges would duplicate every merged
+// row). A return of non-nil stats WITH an error wrapping
+// ErrPostCommitCleanup means the merge committed — state is consistent, only
+// unreferenced source files linger in the DataStore.
 func (b *BloomSearchEngine) Merge(ctx context.Context) (*MergeStats, error) {
+	if !b.mergeMu.TryLock() {
+		return nil, ErrMergeInProgress
+	}
+	defer b.mergeMu.Unlock()
 	return b.merge(ctx)
 }
 
@@ -1341,6 +1619,13 @@ func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 
 		newFilePointer, newFileMetadata, err := b.executeMergeGroup(ctx, group)
 		if err != nil {
+			// Outputs from groups that already completed were published but
+			// never referenced by the MetaStore; tombstone the orphans.
+			// Sources are untouched — they are only tombstoned after a
+			// successful MetaStore.Update.
+			for _, writeOp := range writeOps {
+				b.dataStore.TombstoneFile(ctx, writeOp.FilePointerBytes)
+			}
 			return nil, fmt.Errorf("failed to merge group %d: %w", groupIndex, err)
 		}
 
@@ -1361,17 +1646,31 @@ func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 	}
 
 	// Update metastore: add new files and remove old ones
+	var postCommitCleanupErr error
 	if len(writeOps) > 0 {
 		fmt.Printf("Updating metastore: adding %d new files, removing %d old files\n", len(writeOps), len(deleteOps))
 		if err := b.metaStore.Update(ctx, writeOps, deleteOps); err != nil {
+			// Nothing committed: the merge outputs were published but never
+			// referenced, so tombstone them. Sources stay referenced and
+			// untouched.
+			for _, writeOp := range writeOps {
+				b.dataStore.TombstoneFile(ctx, writeOp.FilePointerBytes)
+			}
 			return nil, fmt.Errorf("failed to update metastore after merge: %w", err)
 		}
 		fmt.Printf("Metastore update completed successfully\n")
 
+		// The merge is committed from here on. Tombstone failures are
+		// garbage-collection failures, not merge failures: report them via
+		// ErrPostCommitCleanup alongside the stats.
+		var tombstoneErrs []error
 		for _, deleteOp := range deleteOps {
 			if err := b.dataStore.TombstoneFile(ctx, deleteOp.FilePointerBytes); err != nil {
-				return nil, fmt.Errorf("failed to tombstone data file after metadata update: %w", err)
+				tombstoneErrs = append(tombstoneErrs, err)
 			}
+		}
+		if len(tombstoneErrs) > 0 {
+			postCommitCleanupErr = fmt.Errorf("%w: %w", ErrPostCommitCleanup, errors.Join(tombstoneErrs...))
 		}
 	}
 
@@ -1391,7 +1690,7 @@ func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 		stats.BytesPerSecond = float64(totalBytesProcessed) / duration.Seconds()
 	}
 
-	return stats, nil
+	return stats, postCommitCleanupErr
 }
 
 // dataBlocksAreMergeable checks if two data blocks can be merged together
@@ -1404,6 +1703,19 @@ func (b *BloomSearchEngine) dataBlocksAreMergeable(block1, block2 DataBlockMetad
 	if block1.BloomExpectedItems != block2.BloomExpectedItems ||
 		block1.BloomFalsePositiveRate != block2.BloomFalsePositiveRate {
 		return false
+	}
+
+	// Blocks must index the same minmax key set. Merging a block that lacks a
+	// key with one that has it would give the keyless block's rows the other
+	// block's range — widening strict-prefilter visibility to rows whose
+	// block never indexed the key. Such blocks are copied as-is instead.
+	if len(block1.MinMaxIndexes) != len(block2.MinMaxIndexes) {
+		return false
+	}
+	for key := range block1.MinMaxIndexes {
+		if _, exists := block2.MinMaxIndexes[key]; !exists {
+			return false
+		}
 	}
 
 	// Check if merging would exceed size limits
@@ -1650,12 +1962,22 @@ func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileM
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create merge file: %w", err)
 	}
-	defer writer.Close()
+
+	// fail aborts the partial output (never publishing it) and tombstones its
+	// pointer; the sources are untouched because they are only tombstoned
+	// after a successful MetaStore.Update in merge().
+	fail := func(err error, closeAttempted bool) ([]byte, *FileMetadata, error) {
+		b.abortFileWriter(ctx, writer, filePointerBytes, closeAttempted)
+		return nil, nil, err
+	}
 
 	var newDataBlocks []DataBlockMetadata
 	currentOffset := 0
 
-	// Collect all data blocks from all files with their file references
+	// Collect all data blocks from all files with their file references.
+	// These shared handles serve only whole-block copies; row-level merge
+	// readers open their own handle per block (see mergeDataBlocks) so
+	// same-file blocks never interleave reads on one seek position.
 	var allBlocks []blockWithFile
 	openFiles := make(map[string]io.ReadSeekCloser)
 
@@ -1665,7 +1987,7 @@ func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileM
 		if openFiles[fileKey] == nil {
 			sourceFile, err := b.dataStore.OpenFile(ctx, candidate.filePointer)
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to open source file for merge: %w", err)
+				return fail(fmt.Errorf("failed to open source file for merge: %w", err), false)
 			}
 			openFiles[fileKey] = sourceFile
 			defer sourceFile.Close()
@@ -1689,27 +2011,39 @@ func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileM
 
 	// Process each partition
 	for partitionID, blockIndices := range partitionBlocks {
-		err := b.processPartitionBlocks(writer, allBlocks, blockIndices, partitionID, &currentOffset, &newDataBlocks)
+		err := b.processPartitionBlocks(ctx, writer, allBlocks, blockIndices, partitionID, &currentOffset, &newDataBlocks)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to process partition %s: %w", partitionID, err)
+			return fail(fmt.Errorf("failed to process partition %s: %w", partitionID, err), false)
 		}
 	}
 
-	// Create new file metadata
+	// Create new file metadata. The bloom params describe the source group's
+	// filters (the merged filters were built from them above) — stamping the
+	// current config here would make the metadata lie about the filters' m/k
+	// whenever the config changed since the sources were written, permanently
+	// breaking future merges of this file.
 	newFileMetadata := &FileMetadata{
 		BloomFilters: BloomFilters{
 			FieldBloomFilter:      newFileFieldBloomFilter,
 			TokenBloomFilter:      newFileTokenBloomFilter,
 			FieldTokenBloomFilter: newFileFieldTokenBloomFilter,
 		},
-		BloomExpectedItems:     b.config.FileBloomExpectedItems,
-		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
+		BloomExpectedItems:     group[0].metadata.BloomExpectedItems,
+		BloomFalsePositiveRate: group[0].metadata.BloomFalsePositiveRate,
 		DataBlocks:             newDataBlocks,
 	}
 
 	// Write file metadata and footer
 	if err := b.writeFileMetadataAndFooter(writer, newFileMetadata); err != nil {
-		return nil, nil, fmt.Errorf("failed to write file metadata: %w", err)
+		return fail(fmt.Errorf("failed to write file metadata: %w", err), false)
+	}
+
+	// Close is the publish step (and for rename-on-close stores the only
+	// point the file becomes visible): it must succeed before merge() may
+	// commit the pointer to the MetaStore, or a failed finalize would delete
+	// sole copies of the source data.
+	if err := writer.Close(); err != nil {
+		return fail(fmt.Errorf("failed to close merge file writer: %w", err), true)
 	}
 
 	return filePointerBytes, newFileMetadata, nil
@@ -1724,7 +2058,7 @@ type blockWithFile struct {
 }
 
 // processPartitionBlocks handles merging data blocks for a single partition
-func (b *BloomSearchEngine) processPartitionBlocks(writer io.Writer, allBlocks []blockWithFile, blockIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata) error {
+func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, blockIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata) error {
 	// Group mergeable blocks together
 	var mergeGroups [][]int // groups of block indices that can be merged
 	processed := make(map[int]bool)
@@ -1772,7 +2106,7 @@ func (b *BloomSearchEngine) processPartitionBlocks(writer io.Writer, allBlocks [
 			}
 		} else {
 			// Multiple blocks, merge them
-			err := b.mergeDataBlocks(writer, allBlocks, group, partitionID, currentOffset, newDataBlocks)
+			err := b.mergeDataBlocks(ctx, writer, allBlocks, group, partitionID, currentOffset, newDataBlocks)
 			if err != nil {
 				return fmt.Errorf("failed to merge data blocks: %w", err)
 			}
@@ -1809,9 +2143,18 @@ func (b *BloomSearchEngine) copyDataBlock(writer io.Writer, blockWithFile blockW
 }
 
 // mergeDataBlocks merges multiple data blocks into a single optimized data block using streaming
-func (b *BloomSearchEngine) mergeDataBlocks(writer io.Writer, allBlocks []blockWithFile, groupIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata) error {
-	// Create streaming readers for each block
+func (b *BloomSearchEngine) mergeDataBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, groupIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata) error {
+	// Create streaming readers for each block. Every reader opens its own
+	// file handle: blocks from the same source file sharing one seeking
+	// handle would clobber each other's positions as the round-robin merge
+	// interleaves reads.
 	var readers []*dataBlockRowReader
+	defer func() {
+		for _, reader := range readers {
+			reader.Close()
+		}
+	}()
+
 	var mergedBloomFilters *BloomFilters
 	var mergedMinMaxIndexes map[string]MinMaxIndex
 
@@ -1819,7 +2162,7 @@ func (b *BloomSearchEngine) mergeDataBlocks(writer io.Writer, allBlocks []blockW
 		blockWithFile := allBlocks[blockIdx]
 
 		// Create streaming reader for this block
-		reader, err := b.newDataBlockRowReader(blockWithFile.file, blockWithFile.block)
+		reader, err := b.newDataBlockRowReader(ctx, blockWithFile.filePointer, blockWithFile.block)
 		if err != nil {
 			return fmt.Errorf("failed to create row reader for data block: %w", err)
 		}
@@ -1838,8 +2181,12 @@ func (b *BloomSearchEngine) mergeDataBlocks(writer io.Writer, allBlocks []blockW
 		}
 	}
 
-	// Stream merge the data blocks
-	newBlockMetadata, err := b.streamMergeDataBlocks(writer, readers, partitionID, mergedBloomFilters, mergedMinMaxIndexes, *currentOffset)
+	// Stream merge the data blocks. The merged block's bloom params come from
+	// the source blocks (dataBlocksAreMergeable requires them to be
+	// identical) so the metadata describes the filters that were actually
+	// merged, not the current config.
+	sourceBlock := allBlocks[groupIndices[0]].block
+	newBlockMetadata, err := b.streamMergeDataBlocks(writer, readers, partitionID, mergedBloomFilters, mergedMinMaxIndexes, *currentOffset, sourceBlock.BloomExpectedItems, sourceBlock.BloomFalsePositiveRate)
 	if err != nil {
 		return fmt.Errorf("failed to stream merge data blocks: %w", err)
 	}
@@ -1851,7 +2198,7 @@ func (b *BloomSearchEngine) mergeDataBlocks(writer io.Writer, allBlocks []blockW
 }
 
 // streamMergeDataBlocks performs streaming merge of multiple data block readers
-func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*dataBlockRowReader, partitionID string, bloomFilters *BloomFilters, minMaxIndexes map[string]MinMaxIndex, offset int) (*DataBlockMetadata, error) {
+func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*dataBlockRowReader, partitionID string, bloomFilters *BloomFilters, minMaxIndexes map[string]MinMaxIndex, offset int, bloomExpectedItems uint, bloomFalsePositiveRate float64) (*DataBlockMetadata, error) {
 	// Serialize and write bloom filters
 	_, _, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, bloomFilters)
 	if err != nil {
@@ -1925,17 +2272,19 @@ func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*d
 	totalSize := bloomFiltersSize + rowDataCounter.count
 
 	return &DataBlockMetadata{
-		PartitionID:            partitionID,
-		Rows:                   rowCount,
-		Offset:                 offset,
-		Size:                   totalSize,
-		BloomFiltersSize:       bloomFiltersSize,
-		MinMaxIndexes:          minMaxIndexes,
+		PartitionID:      partitionID,
+		Rows:             rowCount,
+		Offset:           offset,
+		Size:             totalSize,
+		BloomFiltersSize: bloomFiltersSize,
+		MinMaxIndexes:    minMaxIndexes,
+		// Compression reflects how the merged row data was just written
+		// (current config); the bloom params reflect the source filters.
 		Compression:            b.config.RowDataCompression,
 		UncompressedSize:       uncompressedSize,
 		RowDataHash:            rowDataHash,
-		BloomExpectedItems:     uint(b.config.MaxRowGroupRows),
-		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
+		BloomExpectedItems:     bloomExpectedItems,
+		BloomFalsePositiveRate: bloomFalsePositiveRate,
 	}, nil
 }
 
@@ -1951,8 +2300,11 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// dataBlockRowReader provides streaming access to rows from a data block
+// dataBlockRowReader provides streaming access to rows from a data block.
+// Each reader owns its file handle, so multiple readers over blocks of the
+// same source file never disturb each other's positions; Close releases it.
 type dataBlockRowReader struct {
+	file          io.ReadSeekCloser
 	rowDataReader io.Reader
 	bloomFilters  *BloomFilters
 	hasMore       bool
@@ -1964,17 +2316,25 @@ type dataBlockRowReader struct {
 	zstdDecoder   *zstd.Decoder
 }
 
-// newDataBlockRowReader creates a streaming reader for a data block
-func (b *BloomSearchEngine) newDataBlockRowReader(file io.ReadSeeker, blockMetadata DataBlockMetadata) (*dataBlockRowReader, error) {
+// newDataBlockRowReader creates a streaming reader for a data block, opening
+// a dedicated file handle for it. Callers must Close the reader.
+func (b *BloomSearchEngine) newDataBlockRowReader(ctx context.Context, filePointer []byte, blockMetadata DataBlockMetadata) (*dataBlockRowReader, error) {
+	file, err := b.dataStore.OpenFile(ctx, filePointer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source file for row reader: %w", err)
+	}
+
 	// Read bloom filters first
 	blockBloomFilters, err := ReadDataBlockBloomFilters(file, blockMetadata)
 	if err != nil {
+		file.Close()
 		return nil, fmt.Errorf("failed to read bloom filters: %w", err)
 	}
 
 	// Seek to row data
 	rowDataOffset := int64(blockMetadata.Offset + blockMetadata.BloomFiltersSize)
 	if _, err := file.Seek(rowDataOffset, 0); err != nil {
+		file.Close()
 		return nil, fmt.Errorf("failed to seek to row data: %w", err)
 	}
 
@@ -1988,7 +2348,7 @@ func (b *BloomSearchEngine) newDataBlockRowReader(file io.ReadSeeker, blockMetad
 	// Create appropriate decompression reader based on compression type
 	var rowDataReader io.Reader
 	var zstdDec *zstd.Decoder
-	switch blockMetadata.Compression {
+	switch normalizeCompression(blockMetadata.Compression) {
 	case CompressionNone:
 		rowDataReader = hashReader
 	case CompressionSnappy:
@@ -1997,11 +2357,13 @@ func (b *BloomSearchEngine) newDataBlockRowReader(file io.ReadSeeker, blockMetad
 		// Use streaming zstd decompression
 		decoder, err := zstd.NewReader(hashReader)
 		if err != nil {
+			file.Close()
 			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 		}
 		rowDataReader = decoder
 		zstdDec = decoder
 	default:
+		file.Close()
 		return nil, fmt.Errorf("unsupported compression type: %s", blockMetadata.Compression)
 	}
 
@@ -2009,6 +2371,7 @@ func (b *BloomSearchEngine) newDataBlockRowReader(file io.ReadSeeker, blockMetad
 	hashAlreadyVerified := blockMetadata.RowDataHash == 0
 
 	reader := &dataBlockRowReader{
+		file:          file,
 		rowDataReader: rowDataReader,
 		bloomFilters:  blockBloomFilters,
 		hasMore:       true,
@@ -2024,6 +2387,15 @@ func (b *BloomSearchEngine) newDataBlockRowReader(file io.ReadSeeker, blockMetad
 	reader.next()
 
 	return reader, nil
+}
+
+// Close releases the reader's decoder and file handle (idempotent).
+func (r *dataBlockRowReader) Close() {
+	r.closeDecoder()
+	if r.file != nil {
+		r.file.Close()
+		r.file = nil
+	}
 }
 
 // next reads the next row from the stream
