@@ -2,6 +2,7 @@ package bloomsearch
 
 import (
 	"context"
+	"iter"
 	"sync"
 )
 
@@ -41,25 +42,36 @@ func (s *MemoryMetaStore) Update(ctx context.Context, writeOps []WriteOperation,
 // optimization (the engine re-applies the prefilter regardless), data blocks
 // that cannot match the prefilter are dropped and files left with no matching
 // blocks are omitted.
-func (s *MemoryMetaStore) GetMaybeFilesForQuery(ctx context.Context, prefilter *QueryPrefilter) ([]MaybeFile, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var result []MaybeFile
-
-	for pointer, metadata := range s.files {
-		// metadata is a copy of the map value, so reassigning its DataBlocks
-		// (FilterDataBlocks allocates when it filters) leaves the stored
-		// metadata untouched.
-		metadata.DataBlocks = FilterDataBlocks(metadata.DataBlocks, prefilter)
-		if prefilter != nil && len(metadata.DataBlocks) == 0 {
-			continue
+//
+// Consumers do slow work between yields, so the candidate set is snapshotted
+// under the read lock and yielded after it is released — a concurrent Update
+// never waits on a paused iteration. The O(candidates) snapshot is
+// deliberate, not an optimization target: the MetaStore contract forbids
+// holding locks across yields, and this store keeps everything in memory
+// anyway.
+func (s *MemoryMetaStore) GetMaybeFilesForQuery(ctx context.Context, prefilter *QueryPrefilter) iter.Seq2[MaybeFile, error] {
+	return func(yield func(MaybeFile, error) bool) {
+		s.mu.RLock()
+		snapshot := make([]MaybeFile, 0, len(s.files))
+		for pointer, metadata := range s.files {
+			// metadata is a copy of the map value, so reassigning its
+			// DataBlocks (FilterDataBlocks allocates when it filters) leaves
+			// the stored metadata untouched.
+			metadata.DataBlocks = FilterDataBlocks(metadata.DataBlocks, prefilter)
+			if prefilter != nil && len(metadata.DataBlocks) == 0 {
+				continue
+			}
+			snapshot = append(snapshot, MaybeFile{
+				PointerBytes: []byte(pointer),
+				Metadata:     metadata,
+			})
 		}
-		result = append(result, MaybeFile{
-			PointerBytes: []byte(pointer),
-			Metadata:     metadata,
-		})
-	}
+		s.mu.RUnlock()
 
-	return result, nil
+		for _, file := range snapshot {
+			if !yield(file, nil) {
+				return
+			}
+		}
+	}
 }

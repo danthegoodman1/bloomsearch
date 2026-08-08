@@ -44,8 +44,11 @@ func (b *BloomSearchEngine) Merge(ctx context.Context) (*MergeStats, error) {
 func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 	mergeStartTime := time.Now()
 
-	// Get all files for evaluation
-	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, nil)
+	// Get all files for evaluation. Merge grouping genuinely needs the full
+	// candidate view at once, so the iterator is collected; any yielded error
+	// — or ctx termination mid-iteration — aborts the merge before anything
+	// is written.
+	maybeFiles, err := collectMaybeFiles(ctx, b.metaStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		return nil, err
 	}

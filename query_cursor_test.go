@@ -147,7 +147,7 @@ func TestQueryCursorBlockErrorContinues(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	maybeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, metaStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files: %v", err)
 	}

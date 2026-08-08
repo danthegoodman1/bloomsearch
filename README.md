@@ -326,14 +326,16 @@ Handles file metadata storage and query pre-filtering:
 
 ```go
 type MetaStore interface {
-    GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error)
+    GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) iter.Seq2[MaybeFile, error]
     Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error
 }
 ```
 
 Can be the same as DataStore (e.g., `FileSystemDataStore`) or separate for performance.
 
-Store-side prefiltering is an optimization, not a correctness requirement: the engine re-applies the query's prefilter to every returned file's data blocks, so a store may ignore the query entirely and return everything. Advanced implementations using databases should still pre-filter partition IDs and minmax indexes to avoid shipping metadata the engine will discard. The prefilter/bloom/regex expression trees are exported with lossless JSON round-trips so external MetaStores can translate them (e.g., to SQL).
+`GetMaybeFilesForQuery` returns a standard-library iterator, so candidate files stream to the engine one at a time instead of arriving as one slice — per-query memory scales with the in-flight window, not the candidate count. Errors flow through the yielded second value: a store that fails yields one `(MaybeFile{}, err)` and returns, and the engine stops pulling at the first error, surfacing it from `Results.Err` alongside any block errors. The engine may also stop early (query canceled or cursor closed), so stores must release resources via defers inside the iterator closure, and blocking waits inside the iterator must honor `ctx` so a terminated query winds down promptly. Yields block on query backpressure, so stores must not hold exclusive locks across yields — snapshot under a read lock or page through stable views, then yield. Yielding transfers ownership: the engine retains the yielded file pointer and data-block metadata for the life of the query, so stores must not reuse or mutate those buffers, slices, or maps after yielding.
+
+Store-side prefiltering is an optimization, not a correctness requirement: the engine re-applies the query's prefilter to every yielded file's data blocks, so a store may ignore the query entirely and yield everything. Advanced implementations using databases should still pre-filter partition IDs and minmax indexes to avoid shipping metadata the engine will discard. The prefilter/bloom/regex expression trees are exported with lossless JSON round-trips so external MetaStores can translate them (e.g., to SQL).
 
 ### Write path
 
@@ -405,7 +407,7 @@ query := NewQuery().
 results, err := engine.Query(ctx, query)
 ```
 
-The engine enforces strict prefilter semantics itself, re-filtering whatever the MetaStore returns. File-level bloom filters are tested next (concurrently at 20 or more candidate files) and released immediately after, so per-query memory does not scale with candidate-file filter size. Each surviving data block becomes a job for a bounded worker pool — up to `MaxQueryConcurrency` blocks across *all* queries process concurrently — and a query without bloom conditions skips reading block filter sections entirely.
+Candidate files stream from the MetaStore iterator through a bounded pipeline: a file stage pulls one file at a time, enforces strict prefilter semantics itself (re-filtering whatever the MetaStore yields), tests the file-level bloom filters, and releases them immediately after, so per-query memory does not scale with the candidate-file count or filter size. Each surviving data block becomes a job for a bounded worker pool — up to `MaxQueryConcurrency` blocks across *all* queries process concurrently — and a query without bloom conditions skips reading block filter sections entirely.
 
 When regex filters are present, the engine compiles patterns once per query and derives a field-existence bloom guard for earlier file/block pruning. Row verification is compiled once per query into a single-walk matcher.
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"strings"
 	"sync"
@@ -54,9 +55,11 @@ func (s *ctxCheckingStore) TombstoneFile(ctx context.Context, filePointerBytes [
 	return s.base.TombstoneFile(ctx, filePointerBytes)
 }
 
-func (s *ctxCheckingStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
+func (s *ctxCheckingStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) iter.Seq2[MaybeFile, error] {
 	if err := s.check(ctx); err != nil {
-		return nil, err
+		return func(yield func(MaybeFile, error) bool) {
+			yield(MaybeFile{}, err)
+		}
 	}
 	return s.base.GetMaybeFilesForQuery(ctx, query)
 }
@@ -143,7 +146,7 @@ func (s *flushFaultStore) TombstoneFile(ctx context.Context, filePointerBytes []
 	return s.base.TombstoneFile(ctx, filePointerBytes)
 }
 
-func (s *flushFaultStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
+func (s *flushFaultStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) iter.Seq2[MaybeFile, error] {
 	return s.base.GetMaybeFilesForQuery(ctx, query)
 }
 
@@ -233,7 +236,7 @@ func (s *blockingCreateStore) TombstoneFile(ctx context.Context, filePointerByte
 	return s.base.TombstoneFile(ctx, filePointerBytes)
 }
 
-func (s *blockingCreateStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
+func (s *blockingCreateStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) iter.Seq2[MaybeFile, error] {
 	return s.base.GetMaybeFilesForQuery(ctx, query)
 }
 
@@ -248,17 +251,21 @@ type compressionStrippingMetaStore struct {
 	base *FileSystemDataStore
 }
 
-func (s *compressionStrippingMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
-	maybeFiles, err := s.base.GetMaybeFilesForQuery(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	for i := range maybeFiles {
-		for j := range maybeFiles[i].Metadata.DataBlocks {
-			maybeFiles[i].Metadata.DataBlocks[j].Compression = ""
+func (s *compressionStrippingMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) iter.Seq2[MaybeFile, error] {
+	return func(yield func(MaybeFile, error) bool) {
+		for maybeFile, err := range s.base.GetMaybeFilesForQuery(ctx, query) {
+			if err != nil {
+				yield(MaybeFile{}, err)
+				return
+			}
+			for j := range maybeFile.Metadata.DataBlocks {
+				maybeFile.Metadata.DataBlocks[j].Compression = ""
+			}
+			if !yield(maybeFile, nil) {
+				return
+			}
 		}
 	}
-	return maybeFiles, nil
 }
 
 func (s *compressionStrippingMetaStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {
@@ -828,7 +835,7 @@ func TestMergeUpdateFailureTombstonesOutputsKeepsSources(t *testing.T) {
 		}
 	}
 
-	sourcesBefore, err := store.GetMaybeFilesForQuery(ctx, nil)
+	sourcesBefore, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files before merge: %v", err)
 	}
@@ -846,7 +853,7 @@ func TestMergeUpdateFailureTombstonesOutputsKeepsSources(t *testing.T) {
 	}
 
 	// Metastore unchanged: the same two source files, nothing else.
-	filesAfter, err := store.GetMaybeFilesForQuery(ctx, nil)
+	filesAfter, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files after failed merge: %v", err)
 	}
@@ -915,7 +922,7 @@ func TestMergePostCommitTombstoneFailure(t *testing.T) {
 		}
 	}
 
-	sourcesBefore, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+	sourcesBefore, err := collectMaybeFiles(ctx, metaStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files before merge: %v", err)
 	}
@@ -940,7 +947,7 @@ func TestMergePostCommitTombstoneFailure(t *testing.T) {
 	}
 
 	// The merge committed: the metastore references exactly the merged file.
-	filesAfter, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+	filesAfter, err := collectMaybeFiles(ctx, metaStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files after merge: %v", err)
 	}
@@ -1077,7 +1084,7 @@ func TestMergeSameFileBlocks(t *testing.T) {
 	engine1.Stop(stopCtx)
 	cancel()
 
-	maybeFiles, err := store.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files after first merge: %v", err)
 	}
@@ -1167,7 +1174,7 @@ func TestMergeStampsRebuiltParams(t *testing.T) {
 		t.Fatalf("merge of old-config files failed: %v", err)
 	}
 
-	maybeFiles, err := store.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files: %v", err)
 	}
@@ -1268,7 +1275,7 @@ func TestMergeMinMaxKeySetIncompatible(t *testing.T) {
 
 	// The pp blocks have differing minmax key sets so they are copied as-is,
 	// never merged into one block.
-	maybeFiles, err := store.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files after merge: %v", err)
 	}
@@ -1387,7 +1394,7 @@ func TestEmptyIngestAcksImmediately(t *testing.T) {
 	if err := engine.Flush(ctx); err != nil {
 		t.Fatalf("second flush failed: %v", err)
 	}
-	maybeFiles, err := store.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files: %v", err)
 	}

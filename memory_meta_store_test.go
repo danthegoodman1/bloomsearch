@@ -3,6 +3,7 @@ package bloomsearch
 import (
 	"context"
 	"fmt"
+	"iter"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ type ignorePrefilterMetaStore struct {
 	*MemoryMetaStore
 }
 
-func (s *ignorePrefilterMetaStore) GetMaybeFilesForQuery(ctx context.Context, prefilter *QueryPrefilter) ([]MaybeFile, error) {
+func (s *ignorePrefilterMetaStore) GetMaybeFilesForQuery(ctx context.Context, prefilter *QueryPrefilter) iter.Seq2[MaybeFile, error] {
 	return s.MemoryMetaStore.GetMaybeFilesForQuery(ctx, nil)
 }
 
@@ -160,7 +161,7 @@ func TestMemoryMetaStoreConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				maybeFiles, err := store.GetMaybeFilesForQuery(ctx, prefilter)
+				maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, prefilter))
 				if err != nil {
 					t.Errorf("query failed: %v", err)
 					return

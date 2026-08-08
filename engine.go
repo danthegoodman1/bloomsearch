@@ -72,10 +72,11 @@ type BloomSearchEngine struct {
 
 	querySemaphore chan struct{}
 
-	// queryFilePruneHook, when set (tests only), observes the matching files
-	// after the file-level bloom test and filter release, before block jobs
-	// are enqueued.
-	queryFilePruneHook func([]MaybeFile)
+	// queryFilePruneHook, when set (tests only), observes each file that
+	// survives the file-level bloom test, after its filters are released and
+	// before its block jobs are enqueued. It is called from the query's
+	// file-stage goroutine, one file at a time.
+	queryFilePruneHook func(MaybeFile)
 }
 
 type BloomSearchEngineConfig struct {

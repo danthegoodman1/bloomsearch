@@ -38,7 +38,7 @@ func TestMeasuredFilterSizing(t *testing.T) {
 	}
 	ingestAndFlush(t, engine, rows)
 
-	maybeFiles, err := store.GetMaybeFilesForQuery(context.Background(), nil)
+	maybeFiles, err := collectMaybeFiles(context.Background(), store.GetMaybeFilesForQuery(context.Background(), nil))
 	if err != nil {
 		t.Fatalf("failed to list files: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestFalsePositiveRateWithinBudget(t *testing.T) {
 	}
 	ingestAndFlush(t, engine, rows)
 
-	maybeFiles, err := store.GetMaybeFilesForQuery(context.Background(), nil)
+	maybeFiles, err := collectMaybeFiles(context.Background(), store.GetMaybeFilesForQuery(context.Background(), nil))
 	if err != nil {
 		t.Fatalf("failed to list files: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestV1FilesRemainReadable(t *testing.T) {
 		t.Fatalf("merge of v1+v2 files failed: %v", err)
 	}
 
-	maybeFiles, err := store.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestV2FormatRoundTrip(t *testing.T) {
 	// The metadata handed to the MetaStore at flush is the source of truth;
 	// what the file reader decodes must match it exactly.
 	ctx := context.Background()
-	written, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+	written, err := collectMaybeFiles(ctx, metaStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil || len(written) != 1 {
 		t.Fatalf("expected 1 file in metastore, got %d (err %v)", len(written), err)
 	}
@@ -686,7 +686,7 @@ func TestNoFilterReadWhenNoBloomConditions(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	maybeFiles, err := fsStore.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, fsStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil || len(maybeFiles) != 1 {
 		t.Fatalf("expected 1 file, got %d (err %v)", len(maybeFiles), err)
 	}
@@ -748,9 +748,12 @@ func TestFileFiltersReleasedAfterFileTest(t *testing.T) {
 	ingestAndFlush(t, engine, []map[string]any{{"id": "one", "service": "auth"}})
 	ingestAndFlush(t, engine, []map[string]any{{"id": "two", "service": "payment"}})
 
+	// The hook runs on the query's file-stage goroutine. Reading observed
+	// after the cursor drains needs no lock: Next returning false
+	// happens-after the file stage exited, and with it every hook call.
 	var observed []MaybeFile
-	engine.queryFilePruneHook = func(files []MaybeFile) {
-		observed = append([]MaybeFile(nil), files...)
+	engine.queryFilePruneHook = func(file MaybeFile) {
+		observed = append(observed, file)
 	}
 
 	// Token matches both files, so both pass the file-level test.
@@ -769,7 +772,7 @@ func TestFileFiltersReleasedAfterFileTest(t *testing.T) {
 	}
 
 	// The MetaStore's own copies are untouched by the release.
-	maybeFiles, err := metaStore.GetMaybeFilesForQuery(context.Background(), nil)
+	maybeFiles, err := collectMaybeFiles(context.Background(), metaStore.GetMaybeFilesForQuery(context.Background(), nil))
 	if err != nil {
 		t.Fatalf("failed to list files: %v", err)
 	}
@@ -807,7 +810,7 @@ func TestMergeRebuildsFilters(t *testing.T) {
 
 	// Sanity: measured sizing gave the two files' blocks different filter
 	// parameters, the case that could never merge before the rebuild path.
-	before, err := store.GetMaybeFilesForQuery(ctx, nil)
+	before, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil || len(before) != 2 {
 		t.Fatalf("expected 2 files before merge, got %d (err %v)", len(before), err)
 	}
@@ -819,7 +822,7 @@ func TestMergeRebuildsFilters(t *testing.T) {
 		t.Fatalf("merge failed: %v", err)
 	}
 
-	after, err := store.GetMaybeFilesForQuery(ctx, nil)
+	after, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("failed to list files: %v", err)
 	}
@@ -929,7 +932,7 @@ func TestV1FilterSectionInsideV2Container(t *testing.T) {
 		t.Fatalf("merge failed: %v", err)
 	}
 
-	maybeFiles, err := store.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil || len(maybeFiles) != 1 {
 		t.Fatalf("expected 1 merged file, got %d (err %v)", len(maybeFiles), err)
 	}
@@ -1024,7 +1027,7 @@ func TestMergeAbortsOnCorruptSourceBlock(t *testing.T) {
 			cancel()
 
 			ctx := context.Background()
-			maybeFiles, err := store.GetMaybeFilesForQuery(ctx, nil)
+			maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 			if err != nil || len(maybeFiles) != 2 {
 				t.Fatalf("expected 2 source files, got %d (err %v)", len(maybeFiles), err)
 			}
@@ -1092,7 +1095,7 @@ func TestMergeAbortsOnCorruptSourceBlock(t *testing.T) {
 			if len(others) != 0 {
 				t.Fatalf("failed merge left artifacts behind: %v", others)
 			}
-			after, err := store.GetMaybeFilesForQuery(ctx, nil)
+			after, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 			if err != nil || len(after) != 2 {
 				t.Fatalf("expected 2 source files after failed merge, got %d (err %v)", len(after), err)
 			}

@@ -136,7 +136,7 @@ func TestGenerateSyntheticData(t *testing.T) {
 	fmt.Println("\n=== Verifying Final State ===")
 
 	// Check files created
-	maybeFiles, err := dataStore.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, dataStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("Failed to get files for verification: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestInspectGeneratedFiles(t *testing.T) {
 	ctx := context.Background()
 
 	// Get all files
-	maybeFiles, err := dataStore.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, dataStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("Failed to get files: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestQueryPerformance(t *testing.T) {
 	ctx := context.Background()
 
 	// Get files info for context
-	maybeFiles, err := dataStore.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, dataStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("Failed to get files for query performance test: %v", err)
 	}
