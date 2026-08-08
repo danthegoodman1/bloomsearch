@@ -7,17 +7,25 @@ import "context"
 // FilePointer is a pointer to a file in the metadata store, depending on the implementation of the MetaStore and DataStore.
 type MetaStore interface {
 	// GetMaybeFilesForQuery returns pointers to files that may contain rows of interest based on the query conditions.
-	// The returned files have already been pre-filtered based on partition IDs and MinMaxIndex conditions,
-	// but their bloom filters have not been tested yet.
+	// The returned files' bloom filters have not been tested yet.
 	//
-	// Strict prefilter semantics: if query conditions reference partition ID or MinMax indexes,
-	// files/data blocks missing that metadata should be excluded.
+	// Store-side prefiltering is an optimization, not a correctness
+	// requirement: the engine re-applies the prefilter to every returned
+	// file's data blocks (see FilterDataBlocks), so a store may ignore the
+	// query entirely and return everything. Stores that can prune cheaply
+	// should still do so — dropping files whose data blocks cannot match, and
+	// optionally returning MaybeFile.Metadata.DataBlocks as a filtered subset
+	// — to avoid shipping metadata the engine will discard.
 	//
-	// The MaybeFile.Metadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
-	// if the query conditions are able to guarantee that some data blocks will not match the query conditions.
+	// Strict prefilter semantics (enforced by the engine, mirrored by stores
+	// that prefilter): if query conditions reference partition ID or MinMax
+	// indexes, data blocks missing that metadata are excluded.
 	GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error)
 
-	// Update atomically performes a set of operations on the MetaStore.
+	// Update atomically performs a set of operations on the MetaStore. The
+	// engine only calls Update after the corresponding DataStore writes have
+	// been durably published (writer.Close succeeded), so a committed pointer
+	// always references a complete file.
 	Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error
 }
 
@@ -36,18 +44,4 @@ type MaybeFile struct {
 	PointerBytes []byte
 	// The FileMetadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
 	Metadata FileMetadata
-	// The size of the file in bytes
-	Size int
-}
-
-// TESTING
-
-type NullMetaStore struct{}
-
-func (n *NullMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
-	return nil, nil
-}
-
-func (n *NullMetaStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {
-	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -49,8 +50,6 @@ func TestGenerateSyntheticData(t *testing.T) {
 	// config.MaxFileSize = 10 * 1024 * 1024 * 1024    // 10GB max file size (for 100GB test)
 
 	// Configure bloom filters for datasets
-	config.FileBloomExpectedItems = 100000 // 100K items per file
-	// config.FileBloomExpectedItems = 10000000        // 10M items per file (for 100GB test)
 	config.BloomFalsePositiveRate = 0.001 // 0.1% false positive rate
 
 	// Disable minmax indexes (but keep partitions enabled)
@@ -148,12 +147,16 @@ func TestGenerateSyntheticData(t *testing.T) {
 
 	for i, file := range maybeFiles {
 		totalRowGroups += len(file.Metadata.DataBlocks)
-		totalFileSize += int64(file.Size)
+		var fileSize int64
+		for _, block := range file.Metadata.DataBlocks {
+			fileSize += int64(block.Size)
+		}
+		totalFileSize += fileSize
 
 		fmt.Printf("File %d: %d row groups, %s\n",
 			i+1,
 			len(file.Metadata.DataBlocks),
-			formatBytes(int64(file.Size)))
+			formatBytes(fileSize))
 	}
 
 	fmt.Printf("\nSummary:\n")
@@ -286,7 +289,6 @@ func TestQueryPerformance(t *testing.T) {
 	config.MaxBufferedBytes = 200 * 1024 * 1024
 	config.MaxBufferedTime = 60 * time.Minute
 	config.MaxFileSize = 100 * 1024 * 1024
-	config.FileBloomExpectedItems = 100000
 	config.BloomFalsePositiveRate = 0.001
 	config.MinMaxIndexes = []string{}
 	config.MaxQueryConcurrency = 100
@@ -345,11 +347,6 @@ func TestQueryPerformance(t *testing.T) {
 			fmt.Printf("\n--- Query: %s ---\n", testQuery.name)
 			fmt.Printf("Description: %s\n", testQuery.description)
 
-			// Channels for query execution
-			resultChan := make(chan map[string]any, 1000)
-			errorChan := make(chan error, 10)
-			statsChan := make(chan BlockStats, 100)
-
 			// Track aggregate metrics
 			var totalDuration time.Duration
 			var totalRowsProcessed int64
@@ -362,69 +359,54 @@ func TestQueryPerformance(t *testing.T) {
 
 			// Start query
 			startTime := time.Now()
-			err := engine.Query(ctx, testQuery.query, resultChan, errorChan, statsChan)
+			res, err := engine.Query(ctx, testQuery.query)
 			if err != nil {
 				t.Fatalf("Query failed to start: %v", err)
 			}
+			defer res.Close()
 
-			// Process stats and results concurrently
-			resultsDone := make(chan bool)
-
-			// Process stats in background (don't wait for this to complete)
-			go func() {
-				for stat := range statsChan {
-					blockCount++
-					totalDuration += stat.Duration
-					totalRowsProcessed += int64(stat.RowsProcessed)
-					totalBytesProcessed += int64(stat.BytesProcessed)
-
-					// Calculate individual block throughput and track peaks
-					if stat.Duration.Seconds() > 0 {
-						blockRowsPerSec := float64(stat.RowsProcessed) / stat.Duration.Seconds()
-						blockBytesPerSec := float64(stat.BytesProcessed) / stat.Duration.Seconds()
-
-						if blockRowsPerSec > peakRowsPerSec {
-							peakRowsPerSec = blockRowsPerSec
-						}
-						if blockBytesPerSec > peakBytesPerSec {
-							peakBytesPerSec = blockBytesPerSec
-						}
-					}
-
-					// fmt.Printf("  Block %s[%d]: %s rows/s, %s bytes/s, %d rows, %s skipped=%t\n",
-					// 	string(stat.FilePointer)[:8], // Show first 8 chars of pointer
-					// 	stat.BlockOffset,
-					// 	FormatRate(stat.RowsProcessed, stat.Duration),
-					// 	FormatBytesPerSecond(stat.BytesProcessed, stat.Duration),
-					// 	stat.RowsProcessed,
-					// 	stat.Duration,
-					// 	stat.BloomFilterSkipped)
-				}
-			}()
-
-			// Count results in background and collect all results
-			go func() {
-				defer func() { resultsDone <- true }()
-				for result := range resultChan {
-					totalResultsReturned++
-					// Collect all results
-					allResults = append(allResults, result)
-				}
-			}()
-
-			// Wait for query completion (only wait for resultChan to close)
-			select {
-			case err := <-errorChan:
-				if err != nil {
-					t.Fatalf("Query error: %v", err)
-				}
-			case <-resultsDone:
-				fmt.Printf("Query complete: Results channel closed\n")
-			case <-time.After(10 * time.Second):
-				t.Fatalf("Query timeout after 10 seconds (processed %d blocks so far)", blockCount)
+			// A watchdog Closes the cursor if the query runs too long, which
+			// makes Next return false so the timeout can be reported.
+			var timedOut atomic.Bool
+			watchdog := time.AfterFunc(10*time.Second, func() {
+				timedOut.Store(true)
+				res.Close()
+			})
+			for res.Next() {
+				totalResultsReturned++
+				allResults = append(allResults, res.Row())
 			}
+			watchdog.Stop()
+			if timedOut.Load() {
+				t.Fatalf("Query timeout after 10 seconds (processed %d blocks so far)", len(res.Stats().BlockStats))
+			}
+			if err := res.Err(); err != nil {
+				t.Fatalf("Query error: %v", err)
+			}
+			fmt.Printf("Query complete: cursor exhausted\n")
 
 			queryTime := time.Since(startTime)
+
+			stats := res.Stats()
+			blockCount = len(stats.BlockStats)
+			for _, stat := range stats.BlockStats {
+				totalDuration += stat.Duration
+				totalRowsProcessed += stat.RowsProcessed
+				totalBytesProcessed += stat.BytesProcessed
+
+				// Calculate individual block throughput and track peaks
+				if stat.Duration.Seconds() > 0 {
+					blockRowsPerSec := float64(stat.RowsProcessed) / stat.Duration.Seconds()
+					blockBytesPerSec := float64(stat.BytesProcessed) / stat.Duration.Seconds()
+
+					if blockRowsPerSec > peakRowsPerSec {
+						peakRowsPerSec = blockRowsPerSec
+					}
+					if blockBytesPerSec > peakBytesPerSec {
+						peakBytesPerSec = blockBytesPerSec
+					}
+				}
+			}
 
 			// Calculate system throughput (user perspective - wall clock)
 			var systemRowsPerSec, systemBytesPerSec float64

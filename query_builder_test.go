@@ -13,12 +13,12 @@ func TestNewQueryDefaultsToImplicitAndExpression(t *testing.T) {
 		t.Fatalf("expected bloom expression to be set")
 	}
 
-	if query.Bloom.Expression.expressionType != bloomExpressionAnd {
-		t.Fatalf("expected root expression type %q, got %q", bloomExpressionAnd, query.Bloom.Expression.expressionType)
+	if query.Bloom.Expression.ExpressionType != BloomExpressionAnd {
+		t.Fatalf("expected root expression type %q, got %q", BloomExpressionAnd, query.Bloom.Expression.ExpressionType)
 	}
 
-	if len(query.Bloom.Expression.children) != 3 {
-		t.Fatalf("expected 3 child expressions, got %d", len(query.Bloom.Expression.children))
+	if len(query.Bloom.Expression.Children) != 3 {
+		t.Fatalf("expected 3 child expressions, got %d", len(query.Bloom.Expression.Children))
 	}
 }
 
@@ -39,17 +39,17 @@ func TestMatchSupportsNestedBooleanExpressions(t *testing.T) {
 		t.Fatalf("expected bloom expression to be set")
 	}
 
-	if query.Bloom.Expression.expressionType != bloomExpressionOr {
-		t.Fatalf("expected root expression type %q, got %q", bloomExpressionOr, query.Bloom.Expression.expressionType)
+	if query.Bloom.Expression.ExpressionType != BloomExpressionOr {
+		t.Fatalf("expected root expression type %q, got %q", BloomExpressionOr, query.Bloom.Expression.ExpressionType)
 	}
 
-	if len(query.Bloom.Expression.children) != 2 {
-		t.Fatalf("expected 2 child expressions, got %d", len(query.Bloom.Expression.children))
+	if len(query.Bloom.Expression.Children) != 2 {
+		t.Fatalf("expected 2 child expressions, got %d", len(query.Bloom.Expression.Children))
 	}
 
-	firstChild := query.Bloom.Expression.children[0]
-	if firstChild.expressionType != bloomExpressionAnd {
-		t.Fatalf("expected first child expression type %q, got %q", bloomExpressionAnd, firstChild.expressionType)
+	firstChild := query.Bloom.Expression.Children[0]
+	if firstChild.ExpressionType != BloomExpressionAnd {
+		t.Fatalf("expected first child expression type %q, got %q", BloomExpressionAnd, firstChild.ExpressionType)
 	}
 }
 
@@ -63,12 +63,12 @@ func TestFieldAfterMatchGetsAndedWithExistingExpression(t *testing.T) {
 		t.Fatalf("expected bloom expression to be set")
 	}
 
-	if query.Bloom.Expression.expressionType != bloomExpressionAnd {
-		t.Fatalf("expected root expression type %q, got %q", bloomExpressionAnd, query.Bloom.Expression.expressionType)
+	if query.Bloom.Expression.ExpressionType != BloomExpressionAnd {
+		t.Fatalf("expected root expression type %q, got %q", BloomExpressionAnd, query.Bloom.Expression.ExpressionType)
 	}
 
-	if len(query.Bloom.Expression.children) != 2 {
-		t.Fatalf("expected 2 child expressions, got %d", len(query.Bloom.Expression.children))
+	if len(query.Bloom.Expression.Children) != 2 {
+		t.Fatalf("expected 2 child expressions, got %d", len(query.Bloom.Expression.Children))
 	}
 }
 
@@ -88,12 +88,12 @@ func TestMatchPrefilterSupportsAndBetweenPartitionAndMinMax(t *testing.T) {
 		t.Fatalf("expected prefilter expression to be set")
 	}
 
-	if query.Prefilter.Expression.expressionType != prefilterExpressionAnd {
-		t.Fatalf("expected root prefilter expression type %q, got %q", prefilterExpressionAnd, query.Prefilter.Expression.expressionType)
+	if query.Prefilter.Expression.ExpressionType != PrefilterExpressionAnd {
+		t.Fatalf("expected root prefilter expression type %q, got %q", PrefilterExpressionAnd, query.Prefilter.Expression.ExpressionType)
 	}
 
-	if len(query.Prefilter.Expression.children) != 4 {
-		t.Fatalf("expected 4 prefilter child expressions, got %d", len(query.Prefilter.Expression.children))
+	if len(query.Prefilter.Expression.Children) != 4 {
+		t.Fatalf("expected 4 prefilter child expressions, got %d", len(query.Prefilter.Expression.Children))
 	}
 }
 
@@ -176,12 +176,12 @@ func TestNewQuerySupportsImplicitRegexAndExpression(t *testing.T) {
 		t.Fatalf("expected regex expression to be set")
 	}
 
-	if query.Regex.Expression.expressionType != regexExpressionAnd {
-		t.Fatalf("expected root regex expression type %q, got %q", regexExpressionAnd, query.Regex.Expression.expressionType)
+	if query.Regex.Expression.ExpressionType != RegexExpressionAnd {
+		t.Fatalf("expected root regex expression type %q, got %q", RegexExpressionAnd, query.Regex.Expression.ExpressionType)
 	}
 
-	if len(query.Regex.Expression.children) != 2 {
-		t.Fatalf("expected 2 regex child expressions, got %d", len(query.Regex.Expression.children))
+	if len(query.Regex.Expression.Children) != 2 {
+		t.Fatalf("expected 2 regex child expressions, got %d", len(query.Regex.Expression.Children))
 	}
 }
 
@@ -202,34 +202,34 @@ func TestMatchRegexSupportsNestedBooleanExpressions(t *testing.T) {
 		t.Fatalf("expected regex expression to be set")
 	}
 
-	if query.Regex.Expression.expressionType != regexExpressionOr {
-		t.Fatalf("expected root regex expression type %q, got %q", regexExpressionOr, query.Regex.Expression.expressionType)
+	if query.Regex.Expression.ExpressionType != RegexExpressionOr {
+		t.Fatalf("expected root regex expression type %q, got %q", RegexExpressionOr, query.Regex.Expression.ExpressionType)
 	}
 
-	if len(query.Regex.Expression.children) != 2 {
-		t.Fatalf("expected 2 regex child expressions, got %d", len(query.Regex.Expression.children))
+	if len(query.Regex.Expression.Children) != 2 {
+		t.Fatalf("expected 2 regex child expressions, got %d", len(query.Regex.Expression.Children))
 	}
 }
 
 func TestRegexFieldGuardBloomQueryPreservesBooleanShape(t *testing.T) {
 	regexQuery := &RegexQuery{
 		Expression: &RegexExpression{
-			expressionType: regexExpressionOr,
-			children: []RegexExpression{
+			ExpressionType: RegexExpressionOr,
+			Children: []RegexExpression{
 				{
-					expressionType: regexExpressionCondition,
-					condition:      &RegexCondition{Field: "service", Pattern: "^pay"},
+					ExpressionType: RegexExpressionCondition,
+					Condition:      &RegexCondition{Field: "service", Pattern: "^pay"},
 				},
 				{
-					expressionType: regexExpressionAnd,
-					children: []RegexExpression{
+					ExpressionType: RegexExpressionAnd,
+					Children: []RegexExpression{
 						{
-							expressionType: regexExpressionCondition,
-							condition:      &RegexCondition{Field: "level", Pattern: "^error$"},
+							ExpressionType: RegexExpressionCondition,
+							Condition:      &RegexCondition{Field: "level", Pattern: "^error$"},
 						},
 						{
-							expressionType: regexExpressionCondition,
-							condition:      &RegexCondition{Field: "message", Pattern: "timeout"},
+							ExpressionType: RegexExpressionCondition,
+							Condition:      &RegexCondition{Field: "message", Pattern: "timeout"},
 						},
 					},
 				},
@@ -242,15 +242,15 @@ func TestRegexFieldGuardBloomQueryPreservesBooleanShape(t *testing.T) {
 		t.Fatalf("expected regex field guard bloom expression")
 	}
 
-	if guard.Expression.expressionType != bloomExpressionOr {
-		t.Fatalf("expected top level OR bloom expression, got %q", guard.Expression.expressionType)
+	if guard.Expression.ExpressionType != BloomExpressionOr {
+		t.Fatalf("expected top level OR bloom expression, got %q", guard.Expression.ExpressionType)
 	}
 
-	if len(guard.Expression.children) != 2 {
-		t.Fatalf("expected 2 top level children, got %d", len(guard.Expression.children))
+	if len(guard.Expression.Children) != 2 {
+		t.Fatalf("expected 2 top level children, got %d", len(guard.Expression.Children))
 	}
 
-	if guard.Expression.children[0].condition == nil || guard.Expression.children[0].condition.Type != BloomField || guard.Expression.children[0].condition.Field != "service" {
+	if guard.Expression.Children[0].Condition == nil || guard.Expression.Children[0].Condition.Type != BloomField || guard.Expression.Children[0].Condition.Field != "service" {
 		t.Fatalf("expected first child to be bloom field condition for service")
 	}
 }

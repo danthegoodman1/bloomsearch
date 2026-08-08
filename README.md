@@ -2,13 +2,14 @@
 
 **Keyword search engine with hierarchical bloom filters for massive datasets**
 
-BloomSearch provides extremely low memory usage and low cold-start searches through pluggable storage interfaces.
+BloomSearch provides low memory usage and low cold-start searches through pluggable storage interfaces.
 
-- **Memory efficient**: Bloom filters have constant size regardless of data volume
+- **Memory efficient**: Bloom filters are sized from the measured distinct entries of the rows they cover, so the configured false positive rate holds at any data volume; queries release file-level filters as soon as they are tested
 - **Pluggable storage**: DataStore and MetaStore interfaces for any backend (can be same or separate)
 - **Fast filtering**: Hierarchical pruning via partitions, minmax indexes, and bloom filters
-- **Flexible queries**: Search by `field`, `token`, or `field:token` with AND/OR combinators
+- **Flexible queries**: Search by `field`, `token`, or `field:token` with AND/OR combinators, plus a regex final filter
 - **Disaggregated storage and compute**: Decoupled resources allow for asymmetric scaling
+- **Silent by default**: the engine never writes to stdout/stderr; diagnostics go to an injectable `slog.Logger` (discarded unless configured)
 
 Perfect for logs, JSON documents, and high-cardinality keyword search.
 
@@ -21,83 +22,85 @@ go get github.com/danthegoodman1/bloomsearch
 ```
 
 ```go
-// Initialize stores
-dataStore := NewFileSystemDataStore("./data")
-metaStore := dataStore // FileSystemDataStore also implements MetaStore
+// The filesystem store implements both the MetaStore and the DataStore.
+store := NewFileSystemDataStore("./data")
 
 // Create engine with default config
-engine := NewBloomSearchEngine(DefaultBloomSearchEngineConfig(), metaStore, dataStore)
+engine, err := NewBloomSearchEngine(DefaultBloomSearchEngineConfig(), store, store)
+if err != nil {
+    log.Fatal(err)
+}
 engine.Start()
 
-// Insert data asynchronously (no wait for flush)
-engine.IngestRows(ctx, []map[string]any{{
-    "level": "error",
+// Ingest is asynchronous: pass nil to fire-and-forget, or provide a
+// buffered `chan error` that receives nil once the rows are durable
+// (or the error that prevented it).
+doneChan := make(chan error, 1)
+err = engine.IngestRows(ctx, []map[string]any{{
+    "level":   "error",
     "message": "database connection failed",
     "service": "auth",
-}}, nil)
-
-// Provide a `chan error` to wait for flush
-doneChan := make(chan error)
-engine.IngestRows(ctx, []map[string]any{{
-    "level": "info",
-    "message": "login successful",
-    "service": "auth",
 }}, doneChan)
+if err != nil {
+    log.Fatal(err) // rows were not accepted: engine stopped, or ctx canceled on a full buffer
+}
+
+// Force a flush and wait for it (and everything queued before it).
+if err := engine.Flush(ctx); err != nil {
+    log.Fatal(err)
+}
 if err := <-doneChan; err != nil {
     log.Fatal(err)
 }
 
-// Collect the resulting rows that match
-resultChan := make(chan map[string]any, 100)
-// If any of the workers error, they report it here
-errorChan := make(chan error, 10)
-
-err := engine.Query(
+// Stream the matching rows through the engine-owned cursor
+results, err := engine.Query(
     ctx,
     // Query for rows where `.level: "error"`
-    NewQuery().Field("level").Token("error").Build(),
-    resultChan,
-    errorChan,
+    NewQuery().FieldToken("level", "error").Build(),
 )
 if err != nil {
     log.Fatal(err)
 }
+defer results.Close() // safe to call at any point; ends the query early
 
-// Process results
-for {
-    select {
-    case <-ctx.Done():
-        return
-    case row, activeWorkers := <-resultChan:
-        if !activeWorkers {
-            return
-        }
-        // Process matching row
-        fmt.Printf("Found row: %+v\n", row)
-    case err := <-errorChan:
-        log.Printf("Query error: %v", err)
-        // Continue processing other results, or cancel context
-    }
+for results.Next() {
+    // Process matching row
+    fmt.Printf("Found row: %+v\n", results.Row())
+}
+// Err is nil on clean completion; failed blocks report joined errors here
+// (the query continues past them), and a canceled query reports its
+// context error
+if err := results.Err(); err != nil {
+    log.Fatal(err)
+}
+
+// Stop with a deadline: ctx expiry is the only way a wedged shutdown aborts.
+stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := engine.Stop(stopCtx); err != nil {
+    log.Fatal(err)
 }
 ```
 
-See tests for complete working examples, including partitioning and minmax index filtering.
+The compile- and output-checked version of this walkthrough lives in [`example_test.go`](./example_test.go). See the other tests for complete working examples, including partitioning and minmax index filtering.
 
 - [Quick start](#quick-start)
 - [Concepts](#concepts)
   - [Bloom filters](#bloom-filters)
   - [Search types](#search-types)
+  - [Search semantics](#search-semantics)
   - [Data files](#data-files)
     - [Partitions](#partitions)
     - [MinMax Indexes](#minmax-indexes)
   - [Merging](#merging)
-    - [Coordinated Merges (issue)](#coordinated-merges-issue)
-    - [TTLs](#ttls)
+    - [Coordinated Merges (roadmap)](#coordinated-merges-roadmap)
+    - [TTLs (roadmap)](#ttls-roadmap)
   - [DataStore](#datastore)
   - [MetaStore](#metastore)
   - [Write path](#write-path)
   - [Query path](#query-path)
-    - [Distributed Query Processing (issue)](#distributed-query-processing-issue)
+    - [Distributed Query Processing (roadmap)](#distributed-query-processing-roadmap)
 - [Performance](#performance)
 - [Contributing](#contributing)
   - [AI Code](#ai-code)
@@ -106,7 +109,9 @@ See tests for complete working examples, including partitioning and minmax index
 
 ### Bloom filters
 
-[Bloom filters](https://en.wikipedia.org/wiki/Bloom_filter) are a probabilistic data structure for testing set membership. They guarantee no false negatives but allow tunable false positives. Constant size regardless of data volume with extremely fast lookups and minimal memory usage.
+[Bloom filters](https://en.wikipedia.org/wiki/Bloom_filter) are a probabilistic data structure for testing set membership. They guarantee no false negatives but allow tunable false positives.
+
+BloomSearch sizes every filter at flush/merge time from the measured number of distinct entries it will hold (fields, tokens, and field:token pairs), so filter size tracks the actual content of each block and file, and the configured false positive rate (`BloomFalsePositiveRate`) holds by construction. The measured counts are recorded in the file metadata (`BloomEntryCounts`) for observability.
 
 ### Search types
 
@@ -163,7 +168,7 @@ query := NewQuery().
     Build()
 ```
 
-Regex evaluation targets full field value strings (not tokenizer tokens).
+Regex evaluation targets full field value strings (not tokenizer tokens), and matches leaves at or beneath the condition's field path.
 
 **Complex combinations**:
 ```go
@@ -201,13 +206,26 @@ Simple chained calls like `.Field(...).Token(...)` still default to implicit `AN
 
 Queries can be combined with AND/OR operators and filtered by [partitions](#partitions) and [minmax indexes](#minmax-indexes).
 
+### Search semantics
+
+Indexing and row verification walk one canonical representation of each row — its marshaled JSON bytes — through one shared walker, which is what makes "no false negatives" hold. The rules that fall out of that walk:
+
+- **Field paths** are object keys joined with the delimiter (`.`). Keys are always treated literally: `*`, `?`, and `\` in field names are ordinary characters, never wildcards.
+- **`Field` matches intermediate paths too**: `Field("user")` matches `{"user": {"name": "x"}}`, because container paths are indexed as field-existence entries.
+- **`FieldToken` is exact-path**: `FieldToken("user", "john")` does not match `{"user": {"name": "john"}}` — use `FieldToken("user.name", "john")` or `Token("john")`.
+- **Keys containing the delimiter collide with the equivalent nested path**: `{"a.b": 1}` and `{"a": {"b": 1}}` both produce the path `a.b` (and both emit the prefix path `a`), so they are indistinguishable to `Field`/`FieldToken`/`FieldRegex`. This is accepted and intentional.
+- **Array elements contribute under the array's own path**; indices are ignored: `FieldToken("tags", "admin")` matches `{"tags": ["admin", "user"]}`.
+- **An empty field path matches nothing**, for every condition type.
+- **Leaf values are canonicalized before tokenizing**: strings use their decoded text, numbers use their raw JSON literal (`9007199254740993` stays exact — no float64 round-trip), booleans become `"true"`/`"false"`, and `null` contributes field existence but no tokens. The tokenizer always receives a string.
+- **The default tokenizer** (`BasicWhitespaceLowerTokenizer`) splits on whitespace and lowercases, so `Token("error")` matches `"Error occurred"`. A custom `ValueTokenizerFunc` replaces it for both indexing and verification.
+
 ### Data files
 
-Data files are designed for single-pass writing with row groups, similar to Parquet. They include minmax filters for quick pruning and support partitions like ClickHouse.
+Data files are designed for single-pass writing with row groups, similar to Parquet. They include minmax indexes for quick pruning and support partitions like ClickHouse.
 
-Files are self-contained and immutable. Bloom filter storage overhead is amortized as row groups grow while filters remain constant size.
+Files are self-contained and immutable. Bloom filters are stored in a compact binary encoding, sized from the measured distinct entries of each block and of the whole file.
 
-See [FILE_FORMAT.md](./FILE_FORMAT.md) for details.
+See [FILE_FORMAT.md](./FILE_FORMAT.md) for details, including the public helpers (`ReadFileMetadata`, `WriteFileFooter`, `ReadDataBlockBloomFilters`, `ReadDataBlockRowData`) that external store implementations can use instead of reimplementing the framing.
 
 #### Partitions
 
@@ -262,42 +280,45 @@ Use `MatchPrefilter(...)` with `PrefilterAnd(...)` / `PrefilterOr(...)` for pref
 
 MinMax indexes are optional at ingest. With strict prefilter semantics, queries with MinMax conditions exclude files/blocks without matching minmax metadata.
 
+Prefilters prune at **block granularity**: they decide which data blocks are scanned, not which rows are returned. Rows inside a surviving block are only tested against the bloom and regex conditions, so a block whose range overlaps the query can still return rows outside the minmax condition's range. Pair a minmax prefilter with row-level conditions (or filter client-side) when exact range semantics matter.
+
 ### Merging
 
 Merging files reduces metadata operations (file opens, bloom filter tests) and improves query performance.
 
-Bloom filters of the same size can be trivially merged by OR-ing their bits. If bloom filter parameters change, the system rebuilds filters from raw data during merge.
+Bloom filter parameters play no role in merge eligibility: merged blocks rebuild their filters from the row data, sized from the measured distinct entries of the merged rows. Two blocks are mergeable if they share the same partition ID and the same set of minmax index keys, and combined they stay within the row group limits (`MaxRowGroupRows`, `MaxRowGroupBytes`); files group together when they contain at least one mergeable block pair and their combined size stays under `MaxFileSize`.
 
-Two files are considered mergeable if they have the same file-level bloom filter parameters, and combined they are still under the max file size threshold.
+The merge rewrites data block by block, with memory bounded per block rather than per file. Blocks that merge are decompressed and their rows re-streamed: every row feeds the rebuilt filters, and the combined rows are recompressed with the engine's current compression config (so differing compression settings are supported and consolidated). Because a block's filter section precedes its row data on disk but is only known after every row has streamed through, the merged block's compressed row data is buffered in memory until the block completes — bounded by `MaxRowGroupBytes`. Blocks with no merge partner are copied verbatim (after their filter-section CRC and row-data hash are verified), then re-streamed once for entry collection so the output file's rebuilt file-level filters cover them too. A corrupt source block fails the merge instead of propagating into the output.
 
-Once two files have been decided to merge, the algorithm then considers whether row groups within the files can be merged. They are considered mergeable if they share the same partition ID, have the same bloom filter parameters and combined are under the max row group size parameters (number of rows is ignored here since this matters less than when memory-buffering).
+Commit is gated on durability: the output file's `Close` must succeed before the MetaStore atomically adds the new file and removes the old ones, and only after that commit are the source files tombstoned. A merge that fails partway tombstones its own partial output and leaves every source untouched. `Merge` is single-flight per engine (`ErrMergeInProgress`), and a committed merge whose source cleanup failed reports `ErrPostCommitCleanup` alongside the stats — state is consistent, only unreferenced files linger.
 
-Then, all merging is done via streaming to keep memory usage low.
+v1-format files remain mergeable: their blocks are rewritten into v2 form when they combine, and copied verbatim otherwise.
 
-First, the new file is created in the DataStore. Then, row groups are merged together by decompressing and rewriting them (this means different compression settings are supported and consolidated) and bloom filters merged. Row groups that are not merged are simply copied in as-is without decompressing. Row group metadata is merged (minmax indexes, number of rows, etc.) and added to the running file metadata. The final file metadata is created by merging all file-level bloom filters and writing it out to the new file. Finally, the MetaStore receives an update to atomically create the new file, and delete all the old files.
+#### Coordinated Merges (roadmap)
 
-#### Coordinated Merges ([issue](https://github.com/danthegoodman1/bloomsearch/issues/19))
+**Not implemented** — tracked in [this issue](https://github.com/danthegoodman1/bloomsearch/issues/19). Merges today are single-flight within one engine process; multiple concurrent writers need external coordination. A `CoordinatedMetaStore` could expose lease methods, enabling multiple writers and background merge processes to work together safely.
 
-Multiple concurrent writers need coordination to avoid conflicts. A `CoordinatedMetaStore` can expose lease methods, enabling multiple writers and background merge processes to work together safely.
+#### TTLs (roadmap)
 
-#### TTLs
-
-TTL uses the same merging mechanism to drop expired data. Configure TTL conditions based on partition ID, minmax indexes, or row group age. Expired row groups and files are dropped during merge.
-
-TTLs are optional.
+**Not implemented.** The design intent is for TTLs to reuse the merging mechanism to drop expired data (conditions based on partition ID, minmax indexes, or row group age, applied during merge), but no TTL configuration exists today.
 
 ### DataStore
 
-Pluggable interface for file storage with two methods:
+Pluggable interface for file storage:
 
 ```go
 type DataStore interface {
     CreateFile(ctx context.Context) (io.WriteCloser, []byte, error)
     OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error)
+    TombstoneFile(ctx context.Context, filePointerBytes []byte) error
 }
 ```
 
 The `filePointerBytes` abstracts storage location (file path, S3 bucket/key, etc.) and is stored in the MetaStore for later retrieval. Enables storage backends like filesystem, S3, GCS, etc.
+
+A successful `Close` on the returned writer must durably publish the file — the engine acknowledges ingested rows and commits pointers only after `Close` returns nil. The writer may optionally implement `Abort() error` to discard a failed partial write without publishing it. `TombstoneFile` marks a file (and any artifacts derived from its pointer) as unreferenced; implementations decide when physical garbage collection happens.
+
+The shipped `FileSystemDataStore` writes under a temp name and publishes with sync + rename + directory fsync on `Close`, so in-progress files are never visible to queries.
 
 ### MetaStore
 
@@ -312,7 +333,7 @@ type MetaStore interface {
 
 Can be the same as DataStore (e.g., `FileSystemDataStore`) or separate for performance.
 
-Advanced implementations using databases can pre-filter partition IDs and minmax indexes, reducing bloom filter tests.
+Store-side prefiltering is an optimization, not a correctness requirement: the engine re-applies the query's prefilter to every returned file's data blocks, so a store may ignore the query entirely and return everything. Advanced implementations using databases should still pre-filter partition IDs and minmax indexes to avoid shipping metadata the engine will discard. The prefilter/bloom/regex expression trees are exported with lossless JSON round-trips so external MetaStores can translate them (e.g., to SQL).
 
 ### Write path
 
@@ -335,8 +356,13 @@ Advanced implementations using databases can pre-filter partition IDs and minmax
 
 Configurable flush triggers: row count, byte size, or time-based.
 
-Buffering is done in a single thread to remove lock content, and at flush time spawns off a dedicated goroutine for writing the buffers. This means
-that flushing has no impact on ingestion performance.
+Buffering runs on a single ingest actor (no lock contention), and flushes are handed to a single dedicated flush worker through a FIFO queue. Ingestion continues while a flush writes, but the pipeline is bounded: if flushes fall behind, the queue applies backpressure to the ingest actor rather than buffering without limit.
+
+**Durability contract**: a batch's done channel receives nil only after the file's writer `Close` succeeded (for the filesystem store: data fsync, rename to the final name, directory fsync) *and* the MetaStore `Update` committed the pointer. `Flush(ctx)` waits behind every flush queued before it, so a nil return means every previously ingested row is durable.
+
+**Done channels are delivered to with a blocking send**: provide a buffered channel or actively receive from it. An abandoned unbuffered done channel deliberately stalls the flush worker (backpressure) until the engine's Stop deadline aborts delivery.
+
+**Stop drains before exiting**: requests accepted before `Stop` are flushed, and every done channel is answered. Pass `Stop` a context with a deadline — ctx expiry is the only abort path for a wedged pipeline, and `Stop(context.Background())` can wait forever.
 
 ### Query path
 
@@ -345,8 +371,8 @@ Query flow for `field`, `token`, `field:token`, and final-stage `field regex` co
 ```
 ┌─────────────┐    ┌─────────────────┐    ┌──────────────┐
 │1. Build     │ ──►│2. Pre-filter    │ ──►│3. Bloom Test │
-│   Query     │    │   (MetaStore)   │    │ (file-level) │
-│             │    │                 │    │              │
+│   Query     │    │   (MetaStore +  │    │ (file-level) │
+│             │    │    engine)      │    │              │
 └─────────────┘    └─────────────────┘    └──────┬───────┘
                                                  │
                                                  ▼
@@ -376,29 +402,26 @@ query := NewQuery().
     Field("user_id").Token("error").
     Build()
 
-maybeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
+results, err := engine.Query(ctx, query)
 ```
 
-Query processing is done highly-concurrently: A goroutine is spawned for every file (if the result is over 20 files), and for every row group. This allows it to maximimze multi-core machines.
+The engine enforces strict prefilter semantics itself, re-filtering whatever the MetaStore returns. File-level bloom filters are tested next (concurrently at 20 or more candidate files) and released immediately after, so per-query memory does not scale with candidate-file filter size. Each surviving data block becomes a job for a bounded worker pool — up to `MaxQueryConcurrency` blocks across *all* queries process concurrently — and a query without bloom conditions skips reading block filter sections entirely.
 
-When regex filters are present, the engine compiles patterns once per query and derives a field-existence bloom guard for earlier file/block pruning.
+When regex filters are present, the engine compiles patterns once per query and derives a field-existence bloom guard for earlier file/block pruning. Row verification is compiled once per query into a single-walk matcher.
 
-Memory usage scales with concurrent file reads, not dataset size.
+Block scans verify before emitting: the block's row data is read fully, CRC-checked, and decompressed within metadata-declared bounds before any row is matched, so a corrupt block yields a clean block error and no rows.
 
-This flow is a bit simplified, see `BloomSearchEngine.Query` for more detail.
+`BloomSearchEngine.Query` returns an engine-owned `Results` cursor. Block workers stream matched rows into the cursor in bounded batches, so the caller receives rows through `Next`/`Row` as blocks complete, and arbitrarily large result sets never accumulate in memory.
 
-As you notice, `BloomSearchEngine.Query` takes in a `resultChan` and `errorChan`. This is because each row group
-processor reads the row group one row at a time, allowing to stream matches back to the caller.
+When `Next` returns `false`, no block workers remain: `Err` reports the terminal state (nil on clean completion, the joined block errors when some blocks failed — the query continues past failed blocks because partial results are valuable for search — or the context error when the query was canceled), and `Stats` is complete. Call `Close` to terminate a query early.
 
-This enables processing of arbitrarily large results as well.
+Queries are independent of the ingest lifecycle: a stopped engine still serves queries, because reads touch only the MetaStore and DataStore.
 
-When the `resultChan` closes, there are no more active row group processors, and the caller can exit.
+#### Distributed Query Processing (roadmap)
 
-#### Distributed Query Processing ([issue](https://github.com/danthegoodman1/bloomsearch/issues/14))
+**Not implemented** — tracked in [this issue](https://github.com/danthegoodman1/bloomsearch/issues/14). The design sketch:
 
 Query processing naturally decomposes into independent row group tasks that can be distributed across multiple nodes. Since results are streamed back asynchronously without ordering guarantees, this creates a perfectly parallelizable workload.
-
-Distributed query processing extends the existing path like this:
 
 ```
 ┌──────────┐     ┌──────────────┐     ┌───────────┐     ┌─────────────┐     ┌─────────────┐
@@ -415,7 +438,7 @@ Distributed query processing extends the existing path like this:
 4. **Peers Process Row Groups** - Each peer performs bloom filter tests and row scanning independently
 5. **Stream Results Back to Coordinator** - Peers stream matching rows directly to the coordinator via unique query IDs
 
-Peer discovery uses gossip protocol for fault tolerance, while work assignment prioritizes peers with available capacity. Each peer maintains its own connection to the coordinator for result streaming, enabling horizontal scaling without central bottlenecks.
+Peer discovery would use a gossip protocol for fault tolerance, while work assignment prioritizes peers with available capacity.
 
 ## Performance
 
