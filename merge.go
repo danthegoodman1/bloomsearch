@@ -113,9 +113,10 @@ func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 		for _, candidate := range group {
 			totalFilesProcessed++
 			totalRowGroupsProcessed += int64(len(candidate.metadata.DataBlocks))
-			for _, block := range candidate.metadata.DataBlocks {
+			for i := range candidate.metadata.DataBlocks {
+				block := &candidate.metadata.DataBlocks[i]
 				totalRowsProcessed += int64(block.Rows)
-				totalBytesProcessed += int64(block.Size)
+				totalBytesProcessed += int64(block.OnDiskSize())
 			}
 		}
 	}
@@ -289,7 +290,9 @@ func (b *BloomSearchEngine) calculateFileStatistics(metadata FileMetadata) fileS
 
 	partitionSet := make(map[string]bool)
 
-	for _, block := range metadata.DataBlocks {
+	for i := range metadata.DataBlocks {
+		block := &metadata.DataBlocks[i]
+
 		// Track unique partitions
 		if !partitionSet[block.PartitionID] {
 			partitionSet[block.PartitionID] = true
@@ -297,7 +300,7 @@ func (b *BloomSearchEngine) calculateFileStatistics(metadata FileMetadata) fileS
 		}
 
 		// Accumulate totals
-		stats.totalSize += block.Size
+		stats.totalSize += block.OnDiskSize()
 		stats.totalRows += block.Rows
 		stats.blockCount++
 	}
@@ -436,12 +439,17 @@ func (b *BloomSearchEngine) hasMergeableBlockPair(groupBlocks, candBlocks map[st
 
 // executeMergeGroup merges a group of files with smart row group merging.
 //
+// The output is assembled in the file format's order: every block's row data
+// streams out first, with the blocks' filter sections buffered, then the
+// buffered sections are written as the output's contiguous block filter region
+// and the footer closes the file.
+//
 // The output file's filters are rebuilt from measured entries rather than
 // OR-merged from the sources: merged blocks contribute the entry sets
 // collected while their rows stream through (see mergeDataBlocks), and
-// raw-copied blocks — whose bytes are copied verbatim — are re-streamed
-// purely for entry collection (see copyDataBlock). Rebuilding keeps the
-// merged file's filters right-sized instead of unioning possibly saturated
+// copied blocks — whose row data and filter section are copied verbatim — are
+// re-streamed purely for entry collection (see copyDataBlock). Rebuilding keeps
+// the merged file's filters right-sized instead of unioning possibly saturated
 // or differently-sized source filters.
 func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileMergeCandidate) ([]byte, *FileMetadata, error) {
 	// Create new file for writing
@@ -464,6 +472,10 @@ func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileM
 	// File-level entries accumulate across every block of the output file.
 	fileEntries := newBloomEntrySets()
 
+	// The output's block filter sections, buffered until its row data is
+	// complete (see blockFilterRegionWriter).
+	var filterRegion blockFilterRegionWriter
+
 	// Collect all data blocks from all files with their file pointers. Block
 	// reads open their own handle per block, so same-file blocks never
 	// interleave reads on one seek position.
@@ -485,19 +497,28 @@ func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileM
 
 	// Process each partition
 	for partitionID, blockIndices := range partitionBlocks {
-		err := b.processPartitionBlocks(ctx, writer, allBlocks, blockIndices, partitionID, &currentOffset, &newDataBlocks, fileEntries)
+		err := b.processPartitionBlocks(ctx, writer, allBlocks, blockIndices, partitionID, &currentOffset, &newDataBlocks, fileEntries, &filterRegion)
 		if err != nil {
 			return fail(fmt.Errorf("failed to process partition %s: %w", partitionID, err), false)
 		}
 	}
 
+	// Every block's row data is out: write the buffered filter sections as the
+	// output's block filter region and rebase the blocks' filter offsets.
+	regionSize, err := filterRegion.finish(writer, currentOffset, newDataBlocks)
+	if err != nil {
+		return fail(err, false)
+	}
+
 	// The metadata describes what was actually built: filters sized from the
 	// measured entry counts at the engine's configured false positive rate.
 	newFileMetadata := &FileMetadata{
-		BloomFilters:           fileEntries.buildFilters(b.config.BloomFalsePositiveRate),
-		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
-		BloomEntryCounts:       fileEntries.counts(),
-		DataBlocks:             newDataBlocks,
+		BloomFilters:            fileEntries.buildFilters(b.config.BloomFalsePositiveRate),
+		BloomFalsePositiveRate:  b.config.BloomFalsePositiveRate,
+		BloomEntryCounts:        fileEntries.counts(),
+		BlockFilterRegionOffset: currentOffset,
+		BlockFilterRegionSize:   regionSize,
+		DataBlocks:              newDataBlocks,
 	}
 
 	// Write file metadata and footer
@@ -523,7 +544,7 @@ type blockWithFile struct {
 }
 
 // processPartitionBlocks handles merging data blocks for a single partition
-func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, blockIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets) error {
+func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, blockIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets, filterRegion *blockFilterRegionWriter) error {
 	// Bucket blocks by merge key (within one partition, that is the minmax
 	// key set); blocks in different buckets can never merge, so grouping only
 	// compares same-key blocks.
@@ -581,13 +602,13 @@ func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer i
 		if len(group) == 1 {
 			// Single block, just copy it
 			blockIdx := group[0]
-			err := b.copyDataBlock(ctx, writer, allBlocks[blockIdx], currentOffset, newDataBlocks, fileEntries)
+			err := b.copyDataBlock(ctx, writer, allBlocks[blockIdx], currentOffset, newDataBlocks, fileEntries, filterRegion)
 			if err != nil {
 				return fmt.Errorf("failed to copy data block: %w", err)
 			}
 		} else {
 			// Multiple blocks, merge them
-			err := b.mergeDataBlocks(ctx, writer, allBlocks, group, partitionID, currentOffset, newDataBlocks, fileEntries)
+			err := b.mergeDataBlocks(ctx, writer, allBlocks, group, partitionID, currentOffset, newDataBlocks, fileEntries, filterRegion)
 			if err != nil {
 				return fmt.Errorf("failed to merge data blocks: %w", err)
 			}
@@ -597,17 +618,21 @@ func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer i
 	return nil
 }
 
-// copyDataBlock copies a single data block — filter section and row data —
-// to the output file verbatim, then re-streams the block's rows purely for
-// entry collection so the merged file's rebuilt file-level filters cover the
-// copied rows too. Both the filter section (its CRC, via parseFilterSection)
-// and the row data (see decodeBlockRowData) are verified before anything is
-// written: a corrupt source block fails the merge instead of propagating the
-// corruption into the output file.
-func (b *BloomSearchEngine) copyDataBlock(ctx context.Context, writer io.Writer, bwf blockWithFile, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets) error {
+// copyDataBlock copies a single data block to the output file verbatim: its row
+// data is written at the output's current offset and its filter section is
+// buffered for the output's block filter region, so the block keeps its exact
+// bytes while moving into the new file's layout. The block's rows are then
+// re-streamed purely for entry collection, so the merged file's rebuilt
+// file-level filters cover the copied rows too.
+//
+// Both the filter section (its CRC, via parseFilterSection) and the row data
+// (see decodeBlockRowData) are verified before anything is written: a corrupt
+// source block fails the merge instead of propagating the corruption into the
+// output file.
+func (b *BloomSearchEngine) copyDataBlock(ctx context.Context, writer io.Writer, bwf blockWithFile, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets, filterRegion *blockFilterRegionWriter) error {
 	block := bwf.block
-	if block.BloomFiltersSize < 0 || block.BloomFiltersSize > block.Size {
-		return fmt.Errorf("invalid bloom filter section size %d (block size %d)", block.BloomFiltersSize, block.Size)
+	if block.BloomFilterSize < 0 || block.BloomFilterOffset < 0 {
+		return fmt.Errorf("invalid bloom filter section location (offset %d, size %d)", block.BloomFilterOffset, block.BloomFilterSize)
 	}
 
 	file, err := b.dataStore.OpenFile(ctx, bwf.filePointer)
@@ -616,21 +641,28 @@ func (b *BloomSearchEngine) copyDataBlock(ctx context.Context, writer io.Writer,
 	}
 	defer file.Close()
 
-	if _, err := file.Seek(int64(block.Offset), io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek to source block: %w", err)
-	}
-	raw := make([]byte, block.Size)
-	if _, err := io.ReadFull(file, raw); err != nil {
-		return fmt.Errorf("failed to read block data: %w", err)
-	}
-
-	if block.BloomFiltersSize > 0 {
-		if _, err := parseFilterSection(raw[:block.BloomFiltersSize]); err != nil {
+	// The filter section and the row data are separate extents of the source
+	// file (the source's filters live in its own filter region), so they are
+	// read separately.
+	filterSection := make([]byte, block.BloomFilterSize)
+	if block.BloomFilterSize > 0 {
+		if err := readFullAt(file, filterSection, int64(block.BloomFilterOffset)); err != nil {
+			return fmt.Errorf("failed to read block filter section: %w", err)
+		}
+		if _, err := parseFilterSection(filterSection); err != nil {
 			return fmt.Errorf("failed to verify copied block filter section: %w", err)
 		}
 	}
 
-	rowData, err := decodeBlockRowData(raw[block.BloomFiltersSize:], &block)
+	if block.RowDataOffset < 0 || block.RowDataSize < 0 {
+		return fmt.Errorf("invalid row data location (offset %d, size %d)", block.RowDataOffset, block.RowDataSize)
+	}
+	compressed := make([]byte, block.RowDataSize)
+	if err := readFullAt(file, compressed, int64(block.RowDataOffset)); err != nil {
+		return fmt.Errorf("failed to read block data: %w", err)
+	}
+
+	rowData, err := decodeBlockRowData(compressed, &block)
 	if err != nil {
 		return fmt.Errorf("failed to verify copied block row data: %w", err)
 	}
@@ -646,16 +678,17 @@ func (b *BloomSearchEngine) copyDataBlock(ctx context.Context, writer io.Writer,
 		fileEntries.indexRow(rowBytes, b.config.Tokenizer)
 	}
 
-	if _, err := writer.Write(raw); err != nil {
-		return fmt.Errorf("failed to copy block data: %w", err)
+	if _, err := writer.Write(compressed); err != nil {
+		return fmt.Errorf("failed to copy block row data: %w", err)
 	}
 
-	// Create new block metadata with updated offset (everything else stays the same)
+	// The copied block keeps everything but its location in the file.
 	newBlockMetadata := block // copy the struct
-	newBlockMetadata.Offset = *currentOffset
+	newBlockMetadata.RowDataOffset = *currentOffset
+	newBlockMetadata.BloomFilterOffset, newBlockMetadata.BloomFilterSize = filterRegion.add(filterSection)
 
 	*newDataBlocks = append(*newDataBlocks, newBlockMetadata)
-	*currentOffset += newBlockMetadata.Size
+	*currentOffset += newBlockMetadata.RowDataSize
 
 	return nil
 }
@@ -663,15 +696,14 @@ func (b *BloomSearchEngine) copyDataBlock(ctx context.Context, writer io.Writer,
 // mergeDataBlocks merges multiple data blocks into a single data block,
 // rebuilding the block's bloom filters from its rows: every row is fed
 // through the shared walker/tokenizer into fresh entry sets, and exact-sized
-// filters are built once the merged block is complete. Because the filter
-// section precedes the row data on disk but is only known after every row has
-// streamed through, the compressed row data is buffered in memory (bounded by
-// the row-group size budget) until the block completes.
+// filters are built once the merged block is complete. The compressed row data
+// is buffered in memory (bounded by the row-group size budget) until the block
+// completes, because its CRC32C goes into the block metadata.
 //
 // Blocks are loaded one at a time, each through its own file handle, so
 // blocks from the same source file never interleave reads on a shared seek
 // position.
-func (b *BloomSearchEngine) mergeDataBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, groupIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets) error {
+func (b *BloomSearchEngine) mergeDataBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, groupIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets, filterRegion *blockFilterRegionWriter) error {
 	blockEntries := newBloomEntrySets()
 	var mergedMinMaxIndexes map[string]MinMaxIndex
 
@@ -733,30 +765,30 @@ func (b *BloomSearchEngine) mergeDataBlocks(ctx context.Context, writer io.Write
 	}
 	compressionEncoders.release()
 
-	// Every row has streamed through: build the block's exact-sized filters
-	// and write the block as [filter section][compressed row data].
+	// Every row has streamed through: build the block's exact-sized filters,
+	// write its row data, and buffer its filter section for the output's
+	// block filter region.
 	blockFilters := blockEntries.buildFilters(b.config.BloomFalsePositiveRate)
 	filterSection, err := encodeFilterSection(&blockFilters)
 	if err != nil {
 		return fmt.Errorf("failed to encode bloom filters: %w", err)
 	}
-	if _, err := writer.Write(filterSection); err != nil {
-		return fmt.Errorf("failed to write bloom filters: %w", err)
-	}
 	if _, err := writer.Write(compressed.Bytes()); err != nil {
 		return fmt.Errorf("failed to write merged row data: %w", err)
 	}
+	filterOffset, filterSize := filterRegion.add(filterSection)
 
 	blockEntries.unionInto(fileEntries)
 
-	totalSize := len(filterSection) + compressed.Len()
 	*newDataBlocks = append(*newDataBlocks, DataBlockMetadata{
-		PartitionID:      partitionID,
-		Rows:             rowCount,
-		Offset:           *currentOffset,
-		Size:             totalSize,
-		BloomFiltersSize: len(filterSection),
-		MinMaxIndexes:    mergedMinMaxIndexes,
+		PartitionID:   partitionID,
+		Rows:          rowCount,
+		RowDataOffset: *currentOffset,
+		RowDataSize:   compressed.Len(),
+		// Region-relative until filterRegion.finish rebases it.
+		BloomFilterOffset: filterOffset,
+		BloomFilterSize:   filterSize,
+		MinMaxIndexes:     mergedMinMaxIndexes,
 		// Compression and bloom params both reflect what was just built with
 		// the current config.
 		Compression:            b.config.RowDataCompression,
@@ -766,7 +798,7 @@ func (b *BloomSearchEngine) mergeDataBlocks(ctx context.Context, writer io.Write
 		BloomEntryCounts:       blockEntries.counts(),
 		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
 	})
-	*currentOffset += totalSize
+	*currentOffset += compressed.Len()
 
 	return nil
 }

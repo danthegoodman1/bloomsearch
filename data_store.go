@@ -22,8 +22,10 @@ type DataStore interface {
 	// closed and then tombstoned.
 	CreateFile(ctx context.Context) (io.WriteCloser, []byte, error)
 
-	// OpenFile opens a file for reading. Each reader owns its handle; the
-	// engine opens separate handles for concurrent reads of the same file.
+	// OpenFile opens a file for reading. A handle is used by one goroutine at a
+	// time and serves many seeks and reads: the query path reuses handles
+	// across a file's filter and row data reads, and opens separate handles for
+	// concurrent reads of the same file.
 	OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error)
 
 	// TombstoneFile marks a file as no longer referenced by metadata, along

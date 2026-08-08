@@ -148,8 +148,8 @@ func TestGenerateSyntheticData(t *testing.T) {
 	for i, file := range maybeFiles {
 		totalRowGroups += len(file.Metadata.DataBlocks)
 		var fileSize int64
-		for _, block := range file.Metadata.DataBlocks {
-			fileSize += int64(block.Size)
+		for j := range file.Metadata.DataBlocks {
+			fileSize += int64(file.Metadata.DataBlocks[j].OnDiskSize())
 		}
 		totalFileSize += fileSize
 
@@ -230,10 +230,11 @@ func TestInspectGeneratedFiles(t *testing.T) {
 		fileRows := 0
 		filePartitions := make(map[string]int)
 
-		for j, block := range maybeFile.Metadata.DataBlocks {
+		for j := range maybeFile.Metadata.DataBlocks {
+			block := &maybeFile.Metadata.DataBlocks[j]
 			fmt.Printf("    Block %d: partition='%s', rows=%d, size=%s\n",
-				j+1, block.PartitionID, block.Rows, formatBytes(int64(block.Size)))
-			fileSize += block.Size
+				j+1, block.PartitionID, block.Rows, formatBytes(int64(block.OnDiskSize())))
+			fileSize += block.OnDiskSize()
 			fileRows += block.Rows
 			filePartitions[block.PartitionID] += block.Rows
 			partitionCounts[block.PartitionID] += block.Rows

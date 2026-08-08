@@ -102,8 +102,10 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	fmt.Printf("  Block:\n")
 	fmt.Printf("    Partition ID: %s\n", block.PartitionID)
 	fmt.Printf("    Rows: %d\n", block.Rows)
-	fmt.Printf("    Offset: %d\n", block.Offset)
-	fmt.Printf("    Size: %d\n", block.Size)
+	fmt.Printf("    Row Data Offset: %d\n", block.RowDataOffset)
+	fmt.Printf("    Row Data Size: %d\n", block.RowDataSize)
+	fmt.Printf("    Bloom Filter Offset: %d\n", block.BloomFilterOffset)
+	fmt.Printf("    Bloom Filter Size: %d\n", block.BloomFilterSize)
 	fmt.Printf("    MinMax Indexes: %v\n", block.MinMaxIndexes)
 
 	// Print bloom filter info
@@ -122,8 +124,8 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 
 	fmt.Printf("\n  Reading rows from Block:\n")
 
-	// First, read and verify the bloom filter section at the beginning of
-	// the data block
+	// First, read and verify the block's filter section out of the file's
+	// block filter region
 	bloomFilters, err := ReadDataBlockBloomFilters(file, block)
 	assert.NoError(t, err)
 	assert.NotNil(t, bloomFilters.FieldBloomFilter, "Field bloom filter should exist")
@@ -132,13 +134,12 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 
 	fmt.Printf("  Bloom filters loaded successfully from data block\n")
 
-	// Position at the row data that follows the filter section
-	_, err = file.Seek(int64(block.Offset+block.BloomFiltersSize), 0)
+	// Position at the block's row data
+	_, err = file.Seek(int64(block.RowDataOffset), 0)
 	assert.NoError(t, err)
 
 	// Now read the row data
-	// (block.Size - BloomFiltersSize) gives us the row data size
-	rowDataSize := block.Size - block.BloomFiltersSize
+	rowDataSize := block.RowDataSize
 	bytesRead := 0
 	rowCount := 0
 	readRows := make([]map[string]any, 0, block.Rows)
