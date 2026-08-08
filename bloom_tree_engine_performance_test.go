@@ -50,8 +50,6 @@ func TestGenerateSyntheticData(t *testing.T) {
 	// config.MaxFileSize = 10 * 1024 * 1024 * 1024    // 10GB max file size (for 100GB test)
 
 	// Configure bloom filters for datasets
-	config.FileBloomExpectedItems = 100000 // 100K items per file
-	// config.FileBloomExpectedItems = 10000000        // 10M items per file (for 100GB test)
 	config.BloomFalsePositiveRate = 0.001 // 0.1% false positive rate
 
 	// Disable minmax indexes (but keep partitions enabled)
@@ -287,7 +285,6 @@ func TestQueryPerformance(t *testing.T) {
 	config.MaxBufferedBytes = 200 * 1024 * 1024
 	config.MaxBufferedTime = 60 * time.Minute
 	config.MaxFileSize = 100 * 1024 * 1024
-	config.FileBloomExpectedItems = 100000
 	config.BloomFalsePositiveRate = 0.001
 	config.MinMaxIndexes = []string{}
 	config.MaxQueryConcurrency = 100

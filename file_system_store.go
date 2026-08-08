@@ -258,11 +258,6 @@ func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata,
 	}
 	version := binary.LittleEndian.Uint32(versionBytes)
 
-	// Verify version
-	if version != FileVersion {
-		return nil, 0, fmt.Errorf("unsupported file version %d in file %s", version, filePath)
-	}
-
 	// Read metadata length
 	metadataLengthBytes := make([]byte, 4)
 	_, err = file.ReadAt(metadataLengthBytes, fileSize-8-4-4)
@@ -279,20 +274,60 @@ func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata,
 	}
 
 	// Read metadata
-	metadataBytes := make([]byte, metadataLength)
 	metadataOffset := fileSize - 8 - 4 - 4 - int64(HashSize) - int64(metadataLength)
+	if metadataOffset < 0 {
+		return nil, 0, fmt.Errorf("metadata length %d exceeds file size in %s", metadataLength, filePath)
+	}
+	metadataBytes := make([]byte, metadataLength)
 	_, err = file.ReadAt(metadataBytes, metadataOffset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to read metadata from %s: %w", filePath, err)
 	}
 
-	// Parse and verify metadata
-	metadata, err := FileMetadataFromBytesWithHash(metadataBytes, metadataHashBytes)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to parse metadata from %s: %w", filePath, err)
-	}
+	// Parse and verify metadata, dispatching on the file version.
+	switch version {
+	case FileVersionV1:
+		// v1: the file-level bloom filters are embedded in the metadata JSON.
+		metadata, err := FileMetadataFromBytesWithHash(metadataBytes, metadataHashBytes)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to parse metadata from %s: %w", filePath, err)
+		}
+		return metadata, fileSize, nil
 
-	return metadata, fileSize, nil
+	case FileVersionV2:
+		// v2: the metadata JSON carries no filter bytes; the file-level
+		// filters live in a binary section immediately preceding it.
+		metadataV2, err := fileMetadataV2FromBytesWithHash(metadataBytes, metadataHashBytes)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to parse metadata from %s: %w", filePath, err)
+		}
+
+		metadata := &FileMetadata{
+			BloomFalsePositiveRate: metadataV2.BloomFalsePositiveRate,
+			BloomEntryCounts:       metadataV2.BloomEntryCounts,
+			DataBlocks:             metadataV2.DataBlocks,
+		}
+
+		if metadataV2.FileFilterSectionSize < 0 || int64(metadataV2.FileFilterSectionSize) > metadataOffset {
+			return nil, 0, fmt.Errorf("invalid file filter section size %d in %s", metadataV2.FileFilterSectionSize, filePath)
+		}
+		if metadataV2.FileFilterSectionSize > 0 {
+			filterSection := make([]byte, metadataV2.FileFilterSectionSize)
+			if _, err := file.ReadAt(filterSection, metadataOffset-int64(metadataV2.FileFilterSectionSize)); err != nil {
+				return nil, 0, fmt.Errorf("failed to read file bloom filters from %s: %w", filePath, err)
+			}
+			filters, err := parseFilterSection(filterSection)
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to parse file bloom filters from %s: %w", filePath, err)
+			}
+			metadata.BloomFilters = *filters
+		}
+
+		return metadata, fileSize, nil
+
+	default:
+		return nil, 0, fmt.Errorf("unsupported file version %d in file %s", version, filePath)
+	}
 }
 
 func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {

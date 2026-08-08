@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"hash/crc32"
 	"io"
 	"sort"
@@ -95,23 +94,88 @@ func (e *compressionEncoders) finalizeCompression() error {
 	return nil
 }
 
-// writeBloomFiltersWithHash serializes bloom filters and writes them with their hash to a writer
-func (b *BloomSearchEngine) writeBloomFiltersWithHash(writer io.Writer, bloomFilters *BloomFilters) ([]byte, []byte, int, error) {
-	// Serialize bloom filters and get hash
-	bloomFiltersBytes, bloomFiltersHashBytes := bloomFilters.Bytes()
+// bloomEntrySets accumulates the distinct bloom entries — field paths,
+// tokens, and field::token pairs — of a set of rows. Ingest and merge collect
+// entries into these sets instead of inserting into filters directly, so that
+// filters can be built right-sized from exact distinct counts once the rows
+// are known (bloom hashing then happens on the flush/merge path, off the
+// ingest actor).
+type bloomEntrySets struct {
+	fields      map[string]struct{}
+	tokens      map[string]struct{}
+	fieldTokens map[string]struct{}
+}
 
-	// Write bloom filters
-	if _, err := writer.Write(bloomFiltersBytes); err != nil {
-		return nil, nil, 0, fmt.Errorf("failed to write bloom filters: %w", err)
+func newBloomEntrySets() *bloomEntrySets {
+	return &bloomEntrySets{
+		fields:      make(map[string]struct{}),
+		tokens:      make(map[string]struct{}),
+		fieldTokens: make(map[string]struct{}),
 	}
+}
 
-	// Write bloom filters hash
-	if _, err := writer.Write(bloomFiltersHashBytes); err != nil {
-		return nil, nil, 0, fmt.Errorf("failed to write bloom filters hash: %w", err)
+// indexRow walks a marshaled row through the shared walker and records every
+// bloom entry it produces: every path (including intermediate object/array
+// paths) as a field entry, leaf-value tokens as token entries, and
+// exact-leaf-path::token pairs as field-token entries.
+func (s *bloomEntrySets) indexRow(rowBytes []byte, tokenizer ValueTokenizerFunc) {
+	forEachPathValue(gjson.ParseBytes(rowBytes), ".", func(path string, value gjson.Result, isLeaf bool) {
+		s.fields[path] = struct{}{}
+		if !isLeaf {
+			return
+		}
+		text, ok := leafTokenInput(value)
+		if !ok {
+			return
+		}
+		for _, token := range tokenizer(text) {
+			s.tokens[token] = struct{}{}
+			s.fieldTokens[makeFieldTokenKey(path, token)] = struct{}{}
+		}
+	})
+}
+
+// unionInto adds every entry to dst.
+func (s *bloomEntrySets) unionInto(dst *bloomEntrySets) {
+	for entry := range s.fields {
+		dst.fields[entry] = struct{}{}
 	}
+	for entry := range s.tokens {
+		dst.tokens[entry] = struct{}{}
+	}
+	for entry := range s.fieldTokens {
+		dst.fieldTokens[entry] = struct{}{}
+	}
+}
 
-	// Return bloom filter bytes, hash bytes, and total size written
-	return bloomFiltersBytes, bloomFiltersHashBytes, len(bloomFiltersBytes) + len(bloomFiltersHashBytes), nil
+func (s *bloomEntrySets) counts() BloomEntryCounts {
+	return BloomEntryCounts{
+		Fields:      len(s.fields),
+		Tokens:      len(s.tokens),
+		FieldTokens: len(s.fieldTokens),
+	}
+}
+
+// buildFilters builds bloom filters sized for exactly the accumulated entries
+// at the given false positive rate.
+func (s *bloomEntrySets) buildFilters(falsePositiveRate float64) BloomFilters {
+	return BloomFilters{
+		FieldBloomFilter:      buildSizedBloomFilter(s.fields, falsePositiveRate),
+		TokenBloomFilter:      buildSizedBloomFilter(s.tokens, falsePositiveRate),
+		FieldTokenBloomFilter: buildSizedBloomFilter(s.fieldTokens, falsePositiveRate),
+	}
+}
+
+// buildSizedBloomFilter builds a filter sized for exactly the given entries.
+// NewWithEstimates degenerates at n=0 (zero bits, NaN hash count), so an
+// empty set is sized for one entry; with nothing inserted it still correctly
+// tests negative.
+func buildSizedBloomFilter(entries map[string]struct{}, falsePositiveRate float64) *bloom.BloomFilter {
+	filter := bloom.NewWithEstimates(uint(max(len(entries), 1)), falsePositiveRate)
+	for entry := range entries {
+		filter.AddString(entry)
+	}
+	return filter
 }
 
 type PartitionFunc func(row map[string]any) string
@@ -131,7 +195,6 @@ func (r *ingestRequest) reset() {
 type flushRequest struct {
 	partitionBuffers map[string]*partitionBuffer
 	doneChans        []chan error
-	fileBloomFilters BloomFilters
 }
 
 type BloomSearchEngine struct {
@@ -170,6 +233,11 @@ type BloomSearchEngine struct {
 	mergeMu sync.Mutex
 
 	querySemaphore chan struct{}
+
+	// queryFilePruneHook, when set (tests only), observes the matching files
+	// after the file-level bloom test and filter release, before block jobs
+	// are enqueued.
+	queryFilePruneHook func([]MaybeFile)
 }
 
 // BlockStats describes one block job of a query. RowsProcessed and
@@ -217,8 +285,9 @@ type BloomSearchEngineConfig struct {
 	// The maximum number of total data blocks that can be processed concurrently across all queries
 	MaxQueryConcurrency int
 
-	// Bloom filter parameters
-	FileBloomExpectedItems uint
+	// Bloom filter false positive rate. Filter capacities need no
+	// configuration: filters are sized at flush/merge time from the measured
+	// distinct entry counts of the rows they cover.
 	BloomFalsePositiveRate float64
 
 	// Compression configuration
@@ -233,15 +302,13 @@ type BloomSearchEngineConfig struct {
 }
 
 type partitionBuffer struct {
-	partitionID           string
-	rowCount              int
-	minMaxIndexes         map[string]MinMaxIndex
-	buffer                bytes.Buffer
-	fieldBloomFilter      *bloom.BloomFilter
-	tokenBloomFilter      *bloom.BloomFilter
-	fieldTokenBloomFilter *bloom.BloomFilter
-	compressionEncoders   *compressionEncoders
-	uncompressedSize      int
+	partitionID         string
+	rowCount            int
+	minMaxIndexes       map[string]MinMaxIndex
+	buffer              bytes.Buffer
+	entries             *bloomEntrySets
+	compressionEncoders *compressionEncoders
+	uncompressedSize    int
 }
 
 func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
@@ -260,7 +327,6 @@ func DefaultBloomSearchEngineConfig() BloomSearchEngineConfig {
 
 		MaxQueryConcurrency: 1_000,
 
-		FileBloomExpectedItems: 100_000,
 		BloomFalsePositiveRate: 0.001,
 
 		// Default to Snappy for fast decompression
@@ -302,10 +368,6 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 
 	if config.IngestBufferSize <= 0 {
 		return nil, fmt.Errorf("%w: IngestBufferSize must be greater than 0", ErrInvalidConfig)
-	}
-
-	if config.FileBloomExpectedItems == 0 {
-		return nil, fmt.Errorf("%w: BloomExpectedItems must be greater than 0", ErrInvalidConfig)
 	}
 
 	if config.BloomFalsePositiveRate <= 0 || config.BloomFalsePositiveRate >= 1 {
@@ -370,12 +432,6 @@ func normalizeCompression(compression CompressionType) CompressionType {
 		return CompressionNone
 	}
 	return compression
-}
-
-func (b *BloomSearchEngine) newFileLevelBloomFilters() (*bloom.BloomFilter, *bloom.BloomFilter, *bloom.BloomFilter) {
-	return bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate),
-		bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate),
-		bloom.NewWithEstimates(b.config.FileBloomExpectedItems, b.config.BloomFalsePositiveRate)
 }
 
 // Start begins the ingestion and flush workers. Start is idempotent: extra
@@ -518,7 +574,6 @@ func (b *BloomSearchEngine) ingestWorker() {
 	bufferedRowCount := 0
 	bufferedBytes := 0
 	var bufferStartTime time.Time
-	fileFieldBloomFilter, fileTokenBloomFilter, fileFieldTokenBloomFilter := b.newFileLevelBloomFilters()
 
 	// Create a ticker for periodic time-based flush checks
 	ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
@@ -544,9 +599,6 @@ func (b *BloomSearchEngine) ingestWorker() {
 						&bufferedRowCount,
 						&bufferedBytes,
 						&bufferStartTime,
-						&fileFieldBloomFilter,
-						&fileTokenBloomFilter,
-						&fileFieldTokenBloomFilter,
 					)
 				default:
 					// Flush any remaining buffered data (and ack any
@@ -557,9 +609,6 @@ func (b *BloomSearchEngine) ingestWorker() {
 						&bufferedRowCount,
 						&bufferedBytes,
 						&bufferStartTime,
-						&fileFieldBloomFilter,
-						&fileTokenBloomFilter,
-						&fileFieldTokenBloomFilter,
 					)
 					return
 				}
@@ -574,9 +623,6 @@ func (b *BloomSearchEngine) ingestWorker() {
 				&bufferedRowCount,
 				&bufferedBytes,
 				&bufferStartTime,
-				&fileFieldBloomFilter,
-				&fileTokenBloomFilter,
-				&fileFieldTokenBloomFilter,
 			)
 		case <-ticker.C:
 			// Check for time-based flush
@@ -587,9 +633,6 @@ func (b *BloomSearchEngine) ingestWorker() {
 					&bufferedRowCount,
 					&bufferedBytes,
 					&bufferStartTime,
-					&fileFieldBloomFilter,
-					&fileTokenBloomFilter,
-					&fileFieldTokenBloomFilter,
 				)
 			}
 		}
@@ -606,9 +649,6 @@ func (b *BloomSearchEngine) flushBufferedData(
 	bufferedRowCount *int,
 	bufferedBytes *int,
 	bufferStartTime *time.Time,
-	fileFieldBloomFilter **bloom.BloomFilter,
-	fileTokenBloomFilter **bloom.BloomFilter,
-	fileFieldTokenBloomFilter **bloom.BloomFilter,
 ) {
 	if len(partitionBuffers) == 0 && len(*doneChans) == 0 {
 		return
@@ -622,15 +662,7 @@ func (b *BloomSearchEngine) flushBufferedData(
 	doneChannsCopy := make([]chan error, len(*doneChans))
 	copy(doneChannsCopy, *doneChans)
 
-	b.triggerFlush(
-		partitionBuffersCopy,
-		doneChannsCopy,
-		BloomFilters{
-			FieldBloomFilter:      *fileFieldBloomFilter,
-			TokenBloomFilter:      *fileTokenBloomFilter,
-			FieldTokenBloomFilter: *fileFieldTokenBloomFilter,
-		},
-	)
+	b.triggerFlush(partitionBuffersCopy, doneChannsCopy)
 
 	// Reset local state
 	for k := range partitionBuffers {
@@ -640,7 +672,6 @@ func (b *BloomSearchEngine) flushBufferedData(
 	*bufferedRowCount = 0
 	*bufferedBytes = 0
 	*bufferStartTime = time.Time{}
-	*fileFieldBloomFilter, *fileTokenBloomFilter, *fileFieldTokenBloomFilter = b.newFileLevelBloomFilters()
 }
 
 func (b *BloomSearchEngine) processIngestRequest(
@@ -651,9 +682,6 @@ func (b *BloomSearchEngine) processIngestRequest(
 	bufferedRowCount *int,
 	bufferedBytes *int,
 	bufferStartTime *time.Time,
-	fileFieldBloomFilter **bloom.BloomFilter,
-	fileTokenBloomFilter **bloom.BloomFilter,
-	fileFieldTokenBloomFilter **bloom.BloomFilter,
 ) {
 	// Process the request and return to pool at the end
 	defer func() {
@@ -673,9 +701,6 @@ func (b *BloomSearchEngine) processIngestRequest(
 			bufferedRowCount,
 			bufferedBytes,
 			bufferStartTime,
-			fileFieldBloomFilter,
-			fileTokenBloomFilter,
-			fileFieldTokenBloomFilter,
 		)
 		return
 	}
@@ -732,14 +757,12 @@ func (b *BloomSearchEngine) processIngestRequest(
 	for partitionID := range partitionedRows {
 		if partitionBuffers[partitionID] == nil {
 			newBuffer := &partitionBuffer{
-				partitionID:           partitionID,
-				minMaxIndexes:         make(map[string]MinMaxIndex),
-				buffer:                bytes.Buffer{},
-				fieldBloomFilter:      bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
-				tokenBloomFilter:      bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
-				fieldTokenBloomFilter: bloom.NewWithEstimates(uint(b.config.MaxRowGroupRows), b.config.BloomFalsePositiveRate),
-				uncompressedSize:      0,
-				rowCount:              0,
+				partitionID:      partitionID,
+				minMaxIndexes:    make(map[string]MinMaxIndex),
+				buffer:           bytes.Buffer{},
+				entries:          newBloomEntrySets(),
+				uncompressedSize: 0,
+				rowCount:         0,
 			}
 			encoders, err := b.createCompressionWriter(&newBuffer.buffer)
 			if err != nil {
@@ -772,28 +795,10 @@ func (b *BloomSearchEngine) processIngestRequest(
 		for i, row := range rows {
 			rowBytes := rowBytesList[i]
 
-			// Add info to bloom filters: every path (including intermediate
-			// object/array paths) to the field filters, leaf-value tokens to the
-			// token filters, and exact-leaf-path::token pairs to the field-token
-			// filters
-			forEachPathValue(gjson.ParseBytes(rowBytes), ".", func(path string, value gjson.Result, isLeaf bool) {
-				partitionBuffer.fieldBloomFilter.AddString(path)
-				(*fileFieldBloomFilter).AddString(path)
-				if !isLeaf {
-					return
-				}
-				text, ok := leafTokenInput(value)
-				if !ok {
-					return
-				}
-				for _, token := range b.config.Tokenizer(text) {
-					fieldTokenKey := makeFieldTokenKey(path, token)
-					partitionBuffer.tokenBloomFilter.AddString(token)
-					partitionBuffer.fieldTokenBloomFilter.AddString(fieldTokenKey)
-					(*fileTokenBloomFilter).AddString(token)
-					(*fileFieldTokenBloomFilter).AddString(fieldTokenKey)
-				}
-			})
+			// Record the row's bloom entries in the partition's dedup sets.
+			// Filters are built from these sets at flush time, sized for the
+			// exact distinct counts (see handleFlush).
+			partitionBuffer.entries.indexRow(rowBytes, b.config.Tokenizer)
 
 			// Check for minmax indexes, reading Go-native values from the
 			// original row so numeric identity is preserved (conversions clamp
@@ -895,9 +900,6 @@ func (b *BloomSearchEngine) processIngestRequest(
 			bufferedRowCount,
 			bufferedBytes,
 			bufferStartTime,
-			fileFieldBloomFilter,
-			fileTokenBloomFilter,
-			fileFieldTokenBloomFilter,
 		)
 	}
 }
@@ -909,11 +911,10 @@ func (b *BloomSearchEngine) processIngestRequest(
 // actor. A full channel simply applies backpressure to ingest. If the
 // shutdown deadline expires while the flush worker is wedged, waiters are
 // told (best effort) instead of being dropped silently.
-func (b *BloomSearchEngine) triggerFlush(partitionBuffers map[string]*partitionBuffer, doneChans []chan error, fileBloomFilters BloomFilters) {
+func (b *BloomSearchEngine) triggerFlush(partitionBuffers map[string]*partitionBuffer, doneChans []chan error) {
 	flushReq := flushRequest{
 		partitionBuffers: partitionBuffers,
 		doneChans:        doneChans,
-		fileBloomFilters: fileBloomFilters,
 	}
 
 	select {
@@ -998,8 +999,6 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 	}
 
 	fileMetadata := FileMetadata{
-		BloomFilters:           flushReq.fileBloomFilters,
-		BloomExpectedItems:     b.config.FileBloomExpectedItems,
 		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
 		DataBlocks:             make([]DataBlockMetadata, 0),
 	}
@@ -1021,6 +1020,10 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 
 	currentOffset := 0
 
+	// The file-level filters are built from the union of the blocks' entry
+	// sets, so they too are sized for exact distinct counts.
+	fileEntries := newBloomEntrySets()
+
 	// For each partition buffer, write the data block to the data store
 	for _, partitionBuffer := range flushReq.partitionBuffers {
 		// Finalize compression encoders before writing
@@ -1030,16 +1033,16 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 			return
 		}
 		compressedData = partitionBuffer.buffer.Bytes()
-		// Create data block bloom filters struct
-		dataBlockBloomFilters := &BloomFilters{
-			FieldBloomFilter:      partitionBuffer.fieldBloomFilter,
-			TokenBloomFilter:      partitionBuffer.tokenBloomFilter,
-			FieldTokenBloomFilter: partitionBuffer.fieldTokenBloomFilter,
-		}
 
-		// Write bloom filters and hash
-		_, _, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, dataBlockBloomFilters)
+		// Build the block's filters right-sized from the measured distinct
+		// entry counts and write them as the block's filter section.
+		blockFilters := partitionBuffer.entries.buildFilters(b.config.BloomFalsePositiveRate)
+		filterSection, err := encodeFilterSection(&blockFilters)
 		if err != nil {
+			fail(fmt.Errorf("failed to encode bloom filters: %w", err), false)
+			return
+		}
+		if _, err := writer.Write(filterSection); err != nil {
 			fail(fmt.Errorf("failed to write bloom filters: %w", err), false)
 			return
 		}
@@ -1053,26 +1056,30 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 			return
 		}
 
-		// No file-level hash currently needed
+		partitionBuffer.entries.unionInto(fileEntries)
 
-		dataBlockSize := bloomFiltersSize + len(compressedData)
+		dataBlockSize := len(filterSection) + len(compressedData)
 
 		fileMetadata.DataBlocks = append(fileMetadata.DataBlocks, DataBlockMetadata{
 			PartitionID:            partitionBuffer.partitionID,
 			Rows:                   partitionBuffer.rowCount,
 			Offset:                 currentOffset,
 			Size:                   dataBlockSize,
-			BloomFiltersSize:       bloomFiltersSize,
+			BloomFiltersSize:       len(filterSection),
 			MinMaxIndexes:          partitionBuffer.minMaxIndexes,
 			Compression:            b.config.RowDataCompression,
 			UncompressedSize:       partitionBuffer.uncompressedSize,
 			RowDataHash:            rowDataHash,
-			BloomExpectedItems:     uint(b.config.MaxRowGroupRows),
+			HasRowDataHash:         true,
+			BloomEntryCounts:       partitionBuffer.entries.counts(),
 			BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
 		})
 
 		currentOffset += dataBlockSize
 	}
+
+	fileMetadata.BloomFilters = fileEntries.buildFilters(b.config.BloomFalsePositiveRate)
+	fileMetadata.BloomEntryCounts = fileEntries.counts()
 
 	// Write final metadata to data store and footer
 	if err := b.writeFileMetadataAndFooter(writer, &fileMetadata); err != nil {
@@ -1235,20 +1242,29 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 	}
 	maybeFiles = prefilteredFiles
 
+	// A query without bloom conditions cannot be disqualified by any filter:
+	// skip filter evaluation entirely, and downstream, skip reading the block
+	// filter sections (see processDataBlock).
+	hasBloomConditions := pruneBloomQuery != nil && pruneBloomQuery.Expression != nil
+
 	// Test file-level bloom filters, using concurrency only above a threshold
 	const concurrencyThreshold = 20
 
+	// Once a file has passed (or skipped) the file-level test, its filters
+	// have served their purpose: release them before block jobs are built so
+	// per-query memory stops scaling with candidate-file size.
 	var matchingFiles []MaybeFile
-	if len(maybeFiles) < concurrencyThreshold {
+	if !hasBloomConditions || len(maybeFiles) < concurrencyThreshold {
 		// Sequential evaluation for small numbers of files
 		matchingFiles = make([]MaybeFile, 0, len(maybeFiles))
 		for _, maybeFile := range maybeFiles {
-			if b.evaluateBloomFilters(
+			if !hasBloomConditions || b.evaluateBloomFilters(
 				maybeFile.Metadata.BloomFilters.FieldBloomFilter,
 				maybeFile.Metadata.BloomFilters.TokenBloomFilter,
 				maybeFile.Metadata.BloomFilters.FieldTokenBloomFilter,
 				pruneBloomQuery,
 			) {
+				maybeFile.Metadata.BloomFilters = BloomFilters{}
 				matchingFiles = append(matchingFiles, maybeFile)
 			}
 		}
@@ -1273,6 +1289,7 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 					maybeFile.Metadata.BloomFilters.FieldTokenBloomFilter,
 					pruneBloomQuery,
 				) {
+					maybeFile.Metadata.BloomFilters = BloomFilters{}
 					SendWithContext(ctx, matchingFilesChan, maybeFile)
 				}
 			}(maybeFile)
@@ -1286,6 +1303,10 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 		for matchingFile := range matchingFilesChan {
 			matchingFiles = append(matchingFiles, matchingFile)
 		}
+	}
+
+	if b.queryFilePruneHook != nil {
+		b.queryFilePruneHook(matchingFiles)
 	}
 
 	// Cancellation during setup surfaces as a query error rather than
@@ -1406,117 +1427,72 @@ func (b *BloomSearchEngine) processDataBlock(
 	}
 	defer file.Close()
 
-	blockBloomFilters, err := ReadDataBlockBloomFilters(file, job.blockMetadata)
-	if err != nil {
-		fail(fmt.Errorf("failed to read data block bloom filters: %w", err))
-		return
-	}
-
-	if !b.evaluateBloomFilters(
-		blockBloomFilters.FieldBloomFilter,
-		blockBloomFilters.TokenBloomFilter,
-		blockBloomFilters.FieldTokenBloomFilter,
-		pruneBloomQuery,
-	) {
-		bloomFilterSkipped = true
-		return
-	}
-
-	rowDataOffset := int64(job.blockMetadata.Offset + job.blockMetadata.BloomFiltersSize)
-	if _, err := file.Seek(rowDataOffset, 0); err != nil {
-		fail(fmt.Errorf("failed to seek to row data: %w", err))
-		return
-	}
-
-	// Calculate compressed row data size (no trailing hash now)
-	compressedRowDataSize := job.blockMetadata.Size - job.blockMetadata.BloomFiltersSize
-
-	// Create a limited reader for the compressed row data
-	limitedReader := io.LimitReader(file, int64(compressedRowDataSize))
-
-	// Create hash-calculating reader to verify hash while streaming
-	hashReader := newHashCalculatingReader(limitedReader, int64(compressedRowDataSize))
-
-	// Create appropriate decompression reader based on compression type
-	var rowDataReader io.Reader
-	switch normalizeCompression(job.blockMetadata.Compression) {
-	case CompressionNone:
-		rowDataReader = hashReader
-	case CompressionSnappy:
-		rowDataReader = snappy.NewReader(hashReader)
-	case CompressionZstd:
-		decoder, err := zstd.NewReader(hashReader)
+	// The block filter section is only read when the query has bloom
+	// conditions; a condition-free query jumps straight to the row data.
+	if pruneBloomQuery != nil && pruneBloomQuery.Expression != nil {
+		blockBloomFilters, err := ReadDataBlockBloomFilters(file, job.blockMetadata)
 		if err != nil {
-			fail(fmt.Errorf("failed to create zstd decoder: %w", err))
+			fail(fmt.Errorf("failed to read data block bloom filters: %w", err))
 			return
 		}
-		rowDataReader = decoder
-		defer decoder.Close()
-	default:
-		fail(fmt.Errorf("unsupported compression type: %s", job.blockMetadata.Compression))
+
+		if !b.evaluateBloomFilters(
+			blockBloomFilters.FieldBloomFilter,
+			blockBloomFilters.TokenBloomFilter,
+			blockBloomFilters.FieldTokenBloomFilter,
+			pruneBloomQuery,
+		) {
+			bloomFilterSkipped = true
+			return
+		}
+	}
+
+	// Verify before emit: the row data section is read fully into memory and
+	// CRC-checked, then decompressed with its output bounded by the block's
+	// UncompressedSize, before any row is scanned — a corrupt block errors
+	// cleanly instead of streaming corrupt rows to the caller, and a corrupt
+	// length prefix is rejected by the scanner instead of driving a giant
+	// allocation.
+	rowData, err := readBlockRowData(file, &job.blockMetadata)
+	if err != nil {
+		fail(fmt.Errorf("failed to read block row data: %w", err))
 		return
 	}
 
-	// Now read individual rows from the decompressed stream
-	var lengthBytes [LengthPrefixSize]byte
-	rowBuf := make([]byte, 0)
+	scanner := blockRowScanner{data: rowData}
 	for {
 		// Cancellation is terminal for the query; stop scanning promptly.
 		if ctx.Err() != nil {
 			return
 		}
 
-		n, err := io.ReadFull(rowDataReader, lengthBytes[:])
-		if err == io.EOF {
+		rowBytes, ok, err := scanner.next()
+		if err != nil {
+			fail(fmt.Errorf("failed to read row: %w", err))
+			return
+		}
+		if !ok {
 			break // End of data
-		}
-		if err != nil || n != LengthPrefixSize {
-			fail(fmt.Errorf("failed to read row length: %w", err))
-			return
-		}
-
-		rowLength := binary.LittleEndian.Uint32(lengthBytes[:])
-
-		if cap(rowBuf) < int(rowLength) {
-			rowBuf = make([]byte, int(rowLength))
-		} else {
-			rowBuf = rowBuf[:int(rowLength)]
-		}
-
-		n, err = io.ReadFull(rowDataReader, rowBuf)
-		if err != nil || n != int(rowLength) {
-			fail(fmt.Errorf("failed to read row data: %w", err))
-			return
 		}
 
 		rowsScanned++
-		bytesScanned += int64(LengthPrefixSize) + int64(rowLength)
+		bytesScanned += int64(LengthPrefixSize) + int64(len(rowBytes))
 
-		rowValue := gjson.ParseBytes(rowBuf)
+		rowValue := gjson.ParseBytes(rowBytes)
 		if !TestGJSONForQuery(rowValue, rowBloomQuery, regexQuery, ".", b.config.Tokenizer) {
 			continue
 		}
 
 		// Materialize the row from the same gjson parse used for matching —
 		// one parse per row. gjson materializes JSON numbers as float64,
-		// matching encoding/json, and ParseBytes copied rowBuf, so the map
-		// does not alias the reused scan buffer.
-		row, ok := rowValue.Value().(map[string]any)
-		if !ok {
+		// matching encoding/json.
+		row, isObject := rowValue.Value().(map[string]any)
+		if !isObject {
 			fail(fmt.Errorf("row is not a JSON object"))
 			return
 		}
 
 		if err := r.deliver(slot, row); err != nil {
-			return
-		}
-	}
-
-	// Verify hash after all data has been read
-	if job.blockMetadata.RowDataHash != 0 {
-		computedHash := hashReader.Sum32()
-		if computedHash != job.blockMetadata.RowDataHash {
-			fail(fmt.Errorf("row data hash mismatch: expected %x, got %x", job.blockMetadata.RowDataHash, computedHash))
 			return
 		}
 	}
@@ -1720,15 +1696,12 @@ func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 	return stats, postCommitCleanupErr
 }
 
-// dataBlocksAreMergeable checks if two data blocks can be merged together
+// dataBlocksAreMergeable checks if two data blocks can be merged together.
+// Bloom filter parameters impose no constraint: merged blocks rebuild their
+// filters from row data, sized for the merged rows' measured entry counts.
 func (b *BloomSearchEngine) dataBlocksAreMergeable(block1, block2 DataBlockMetadata) bool {
 	// Must have the same partition ID
 	if block1.PartitionID != block2.PartitionID {
-		return false
-	}
-
-	if block1.BloomExpectedItems != block2.BloomExpectedItems ||
-		block1.BloomFalsePositiveRate != block2.BloomFalsePositiveRate {
 		return false
 	}
 
@@ -1758,30 +1731,6 @@ func (b *BloomSearchEngine) dataBlocksAreMergeable(block1, block2 DataBlockMetad
 	}
 
 	return true
-}
-
-// mergeBloomFiltersStruct merges two bloom filters by performing Merge operation
-func (b *BloomSearchEngine) mergeBloomFiltersStruct(filters1, filters2 *BloomFilters) (*BloomFilters, error) {
-	// Copy the first filter
-	merged := &BloomFilters{
-		FieldBloomFilter:      filters1.FieldBloomFilter.Copy(),
-		TokenBloomFilter:      filters1.TokenBloomFilter.Copy(),
-		FieldTokenBloomFilter: filters1.FieldTokenBloomFilter.Copy(),
-	}
-
-	// Merge the second filter into the copy
-	// This will fail if the filters have incompatible parameters (different m, k values)
-	if err := merged.FieldBloomFilter.Merge(filters2.FieldBloomFilter); err != nil {
-		return nil, fmt.Errorf("failed to merge bloom filters: %w", err)
-	}
-	if err := merged.TokenBloomFilter.Merge(filters2.TokenBloomFilter); err != nil {
-		return nil, fmt.Errorf("failed to merge bloom filters: %w", err)
-	}
-	if err := merged.FieldTokenBloomFilter.Merge(filters2.FieldTokenBloomFilter); err != nil {
-		return nil, fmt.Errorf("failed to merge bloom filters: %w", err)
-	}
-
-	return merged, nil
 }
 
 // mergeMinMaxIndexes merges minmax indexes from two data blocks
@@ -1849,100 +1798,80 @@ func (b *BloomSearchEngine) calculateFileStatistics(metadata FileMetadata) fileS
 	return stats
 }
 
-// identifyFileMergeGroups groups files that should be merged together using smart row group merging
+// identifyFileMergeGroups groups files that should be merged together using
+// smart row group merging. Bloom filter parameters play no role in grouping:
+// merged blocks rebuild their filters from row data, so any two files with
+// mergeable row groups are candidates (with measured filter sizing, files
+// essentially never share filter parameters).
 func (b *BloomSearchEngine) identifyFileMergeGroups(files []fileMergeCandidate) [][]fileMergeCandidate {
-	if len(files) == 0 {
+	if len(files) < 2 {
 		return nil
 	}
 
-	// Group files by bloom filter parameters
-	type bloomFilterParams struct {
-		expectedItems     uint
-		falsePositiveRate float64
-	}
+	// Sort files by potential for merging (smaller files first, then by partition locality)
+	candidates := append([]fileMergeCandidate(nil), files...)
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
 
-	parameterGroups := make(map[bloomFilterParams][]fileMergeCandidate)
-	for _, file := range files {
-		params := bloomFilterParams{
-			expectedItems:     file.metadata.BloomExpectedItems,
-			falsePositiveRate: file.metadata.BloomFalsePositiveRate,
+		// Primary: Prefer files with smaller average block sizes (more opportunity for merging)
+		aAvgBlockSize := a.statistics.totalSize / max(a.statistics.blockCount, 1)
+		bAvgBlockSize := b.statistics.totalSize / max(b.statistics.blockCount, 1)
+
+		if aAvgBlockSize != bAvgBlockSize {
+			return aAvgBlockSize < bAvgBlockSize
 		}
-		parameterGroups[params] = append(parameterGroups[params], file)
-	}
+
+		// Secondary: Sort by total size (smaller first)
+		return a.statistics.totalSize < b.statistics.totalSize
+	})
 
 	var mergeGroups [][]fileMergeCandidate
 	totalFilesInGroups := 0
 
-	for _, compatibleFiles := range parameterGroups {
-		if len(compatibleFiles) < 2 {
+	// Track which files have already been assigned to a group
+	fileAssigned := make(map[int]bool)
+
+	// Greedy approach: try to group files that can benefit from row group merging
+	for i, file := range candidates {
+		if fileAssigned[i] {
 			continue
-		}
-
-		// Sort files by potential for merging (smaller files first, then by partition locality)
-		sort.Slice(compatibleFiles, func(i, j int) bool {
-			a, b := compatibleFiles[i], compatibleFiles[j]
-
-			// Primary: Prefer files with smaller average block sizes (more opportunity for merging)
-			aAvgBlockSize := a.statistics.totalSize / max(a.statistics.blockCount, 1)
-			bAvgBlockSize := b.statistics.totalSize / max(b.statistics.blockCount, 1)
-
-			if aAvgBlockSize != bAvgBlockSize {
-				return aAvgBlockSize < bAvgBlockSize
-			}
-
-			// Secondary: Sort by total size (smaller first)
-			return a.statistics.totalSize < b.statistics.totalSize
-		})
-
-		// Track which files have already been assigned to a group
-		fileAssigned := make(map[int]bool)
-
-		// Greedy approach: try to group files that can benefit from row group merging
-		for i, file := range compatibleFiles {
-			if fileAssigned[i] {
-				continue
-			}
-
-			if totalFilesInGroups >= b.config.MaxFilesToMergePerOperation {
-				break
-			}
-
-			currentGroup := []fileMergeCandidate{file}
-			currentGroupSize := file.statistics.totalSize
-			fileAssigned[i] = true
-
-			// Add compatible files to this group
-			for j := i + 1; j < len(compatibleFiles); j++ {
-				if fileAssigned[j] {
-					continue
-				}
-
-				if totalFilesInGroups+len(currentGroup)+1 > b.config.MaxFilesToMergePerOperation {
-					break
-				}
-
-				candidate := compatibleFiles[j]
-
-				newSize := currentGroupSize + candidate.statistics.totalSize
-				if newSize > b.config.MaxFileSize {
-					continue
-				}
-
-				if b.hasCompatibleRowGroups(currentGroup, candidate) {
-					currentGroup = append(currentGroup, candidate)
-					currentGroupSize = newSize
-					fileAssigned[j] = true
-				}
-			}
-
-			if len(currentGroup) > 1 {
-				mergeGroups = append(mergeGroups, currentGroup)
-				totalFilesInGroups += len(currentGroup)
-			}
 		}
 
 		if totalFilesInGroups >= b.config.MaxFilesToMergePerOperation {
 			break
+		}
+
+		currentGroup := []fileMergeCandidate{file}
+		currentGroupSize := file.statistics.totalSize
+		fileAssigned[i] = true
+
+		// Add compatible files to this group
+		for j := i + 1; j < len(candidates); j++ {
+			if fileAssigned[j] {
+				continue
+			}
+
+			if totalFilesInGroups+len(currentGroup)+1 > b.config.MaxFilesToMergePerOperation {
+				break
+			}
+
+			candidate := candidates[j]
+
+			newSize := currentGroupSize + candidate.statistics.totalSize
+			if newSize > b.config.MaxFileSize {
+				continue
+			}
+
+			if b.hasCompatibleRowGroups(currentGroup, candidate) {
+				currentGroup = append(currentGroup, candidate)
+				currentGroupSize = newSize
+				fileAssigned[j] = true
+			}
+		}
+
+		if len(currentGroup) > 1 {
+			mergeGroups = append(mergeGroups, currentGroup)
+			totalFilesInGroups += len(currentGroup)
 		}
 	}
 
@@ -1964,26 +1893,16 @@ func (b *BloomSearchEngine) hasCompatibleRowGroups(currentGroup []fileMergeCandi
 	return false
 }
 
-// executeMergeGroup merges a group of files with smart row group merging
+// executeMergeGroup merges a group of files with smart row group merging.
+//
+// The output file's filters are rebuilt from measured entries rather than
+// OR-merged from the sources: merged blocks contribute the entry sets
+// collected while their rows stream through (see mergeDataBlocks), and
+// raw-copied blocks — whose bytes are copied verbatim — are re-streamed
+// purely for entry collection (see copyDataBlock). Rebuilding keeps the
+// merged file's filters right-sized instead of unioning possibly saturated
+// or differently-sized source filters.
 func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileMergeCandidate) ([]byte, *FileMetadata, error) {
-	// Initialize new file-level bloom filters by merging from source files
-	newFileFieldBloomFilter := bloom.NewWithEstimates(group[0].metadata.BloomExpectedItems, group[0].metadata.BloomFalsePositiveRate)
-	newFileTokenBloomFilter := bloom.NewWithEstimates(group[0].metadata.BloomExpectedItems, group[0].metadata.BloomFalsePositiveRate)
-	newFileFieldTokenBloomFilter := bloom.NewWithEstimates(group[0].metadata.BloomExpectedItems, group[0].metadata.BloomFalsePositiveRate)
-
-	// Merge file-level bloom filters from all source files
-	for _, candidate := range group {
-		if err := newFileFieldBloomFilter.Merge(candidate.metadata.BloomFilters.FieldBloomFilter); err != nil {
-			return nil, nil, fmt.Errorf("failed to merge file field bloom filter: %w", err)
-		}
-		if err := newFileTokenBloomFilter.Merge(candidate.metadata.BloomFilters.TokenBloomFilter); err != nil {
-			return nil, nil, fmt.Errorf("failed to merge file token bloom filter: %w", err)
-		}
-		if err := newFileFieldTokenBloomFilter.Merge(candidate.metadata.BloomFilters.FieldTokenBloomFilter); err != nil {
-			return nil, nil, fmt.Errorf("failed to merge file field-token bloom filter: %w", err)
-		}
-	}
-
 	// Create new file for writing
 	writer, filePointerBytes, err := b.dataStore.CreateFile(ctx)
 	if err != nil {
@@ -2001,31 +1920,18 @@ func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileM
 	var newDataBlocks []DataBlockMetadata
 	currentOffset := 0
 
-	// Collect all data blocks from all files with their file references.
-	// These shared handles serve only whole-block copies; row-level merge
-	// readers open their own handle per block (see mergeDataBlocks) so
-	// same-file blocks never interleave reads on one seek position.
+	// File-level entries accumulate across every block of the output file.
+	fileEntries := newBloomEntrySets()
+
+	// Collect all data blocks from all files with their file pointers. Block
+	// reads open their own handle per block, so same-file blocks never
+	// interleave reads on one seek position.
 	var allBlocks []blockWithFile
-	openFiles := make(map[string]io.ReadSeekCloser)
-
-	// Open all files and collect blocks
 	for _, candidate := range group {
-		fileKey := string(candidate.filePointer)
-		if openFiles[fileKey] == nil {
-			sourceFile, err := b.dataStore.OpenFile(ctx, candidate.filePointer)
-			if err != nil {
-				return fail(fmt.Errorf("failed to open source file for merge: %w", err), false)
-			}
-			openFiles[fileKey] = sourceFile
-			defer sourceFile.Close()
-		}
-
 		for _, blockMetadata := range candidate.metadata.DataBlocks {
 			allBlocks = append(allBlocks, blockWithFile{
 				block:       blockMetadata,
-				file:        openFiles[fileKey],
 				filePointer: candidate.filePointer,
-				processed:   false,
 			})
 		}
 	}
@@ -2038,25 +1944,18 @@ func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileM
 
 	// Process each partition
 	for partitionID, blockIndices := range partitionBlocks {
-		err := b.processPartitionBlocks(ctx, writer, allBlocks, blockIndices, partitionID, &currentOffset, &newDataBlocks)
+		err := b.processPartitionBlocks(ctx, writer, allBlocks, blockIndices, partitionID, &currentOffset, &newDataBlocks, fileEntries)
 		if err != nil {
 			return fail(fmt.Errorf("failed to process partition %s: %w", partitionID, err), false)
 		}
 	}
 
-	// Create new file metadata. The bloom params describe the source group's
-	// filters (the merged filters were built from them above) — stamping the
-	// current config here would make the metadata lie about the filters' m/k
-	// whenever the config changed since the sources were written, permanently
-	// breaking future merges of this file.
+	// The metadata describes what was actually built: filters sized from the
+	// measured entry counts at the engine's configured false positive rate.
 	newFileMetadata := &FileMetadata{
-		BloomFilters: BloomFilters{
-			FieldBloomFilter:      newFileFieldBloomFilter,
-			TokenBloomFilter:      newFileTokenBloomFilter,
-			FieldTokenBloomFilter: newFileFieldTokenBloomFilter,
-		},
-		BloomExpectedItems:     group[0].metadata.BloomExpectedItems,
-		BloomFalsePositiveRate: group[0].metadata.BloomFalsePositiveRate,
+		BloomFilters:           fileEntries.buildFilters(b.config.BloomFalsePositiveRate),
+		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
+		BloomEntryCounts:       fileEntries.counts(),
 		DataBlocks:             newDataBlocks,
 	}
 
@@ -2076,16 +1975,14 @@ func (b *BloomSearchEngine) executeMergeGroup(ctx context.Context, group []fileM
 	return filePointerBytes, newFileMetadata, nil
 }
 
-// blockWithFile represents a data block with its associated file handle
+// blockWithFile represents a data block with the pointer of its source file
 type blockWithFile struct {
 	block       DataBlockMetadata
-	file        io.ReadSeeker
 	filePointer []byte
-	processed   bool
 }
 
 // processPartitionBlocks handles merging data blocks for a single partition
-func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, blockIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata) error {
+func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, blockIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets) error {
 	// Group mergeable blocks together
 	var mergeGroups [][]int // groups of block indices that can be merged
 	processed := make(map[int]bool)
@@ -2127,13 +2024,13 @@ func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer i
 		if len(group) == 1 {
 			// Single block, just copy it
 			blockIdx := group[0]
-			err := b.copyDataBlock(writer, allBlocks[blockIdx], currentOffset, newDataBlocks)
+			err := b.copyDataBlock(ctx, writer, allBlocks[blockIdx], currentOffset, newDataBlocks, fileEntries)
 			if err != nil {
 				return fmt.Errorf("failed to copy data block: %w", err)
 			}
 		} else {
 			// Multiple blocks, merge them
-			err := b.mergeDataBlocks(ctx, writer, allBlocks, group, partitionID, currentOffset, newDataBlocks)
+			err := b.mergeDataBlocks(ctx, writer, allBlocks, group, partitionID, currentOffset, newDataBlocks, fileEntries)
 			if err != nil {
 				return fmt.Errorf("failed to merge data blocks: %w", err)
 			}
@@ -2143,24 +2040,61 @@ func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer i
 	return nil
 }
 
-// copyDataBlock copies a single data block to the output file
-func (b *BloomSearchEngine) copyDataBlock(writer io.Writer, blockWithFile blockWithFile, currentOffset *int, newDataBlocks *[]DataBlockMetadata) error {
-	// Seek to the start of the source block
-	if _, err := blockWithFile.file.Seek(int64(blockWithFile.block.Offset), 0); err != nil {
-		return fmt.Errorf("failed to seek to source block: %w", err)
+// copyDataBlock copies a single data block — filter section and row data —
+// to the output file verbatim, then re-streams the block's rows purely for
+// entry collection so the merged file's rebuilt file-level filters cover the
+// copied rows too. Both the filter section (its CRC, via parseFilterSection)
+// and the row data (see decodeBlockRowData) are verified before anything is
+// written: a corrupt source block fails the merge instead of propagating the
+// corruption into the output file.
+func (b *BloomSearchEngine) copyDataBlock(ctx context.Context, writer io.Writer, bwf blockWithFile, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets) error {
+	block := bwf.block
+	if block.BloomFiltersSize < 0 || block.BloomFiltersSize > block.Size {
+		return fmt.Errorf("invalid bloom filter section size %d (block size %d)", block.BloomFiltersSize, block.Size)
 	}
 
-	// Stream copy the entire block (bloom filters + hash + row data) as raw bytes
-	copied, err := io.CopyN(writer, blockWithFile.file, int64(blockWithFile.block.Size))
+	file, err := b.dataStore.OpenFile(ctx, bwf.filePointer)
 	if err != nil {
-		return fmt.Errorf("failed to copy block data: %w", err)
+		return fmt.Errorf("failed to open source file for block copy: %w", err)
 	}
-	if copied != int64(blockWithFile.block.Size) {
-		return fmt.Errorf("incomplete copy: expected %d bytes, copied %d bytes", blockWithFile.block.Size, copied)
+	defer file.Close()
+
+	if _, err := file.Seek(int64(block.Offset), io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to source block: %w", err)
+	}
+	raw := make([]byte, block.Size)
+	if _, err := io.ReadFull(file, raw); err != nil {
+		return fmt.Errorf("failed to read block data: %w", err)
+	}
+
+	if block.BloomFiltersSize > 0 {
+		if _, err := parseFilterSection(raw[:block.BloomFiltersSize]); err != nil {
+			return fmt.Errorf("failed to verify copied block filter section: %w", err)
+		}
+	}
+
+	rowData, err := decodeBlockRowData(raw[block.BloomFiltersSize:], &block)
+	if err != nil {
+		return fmt.Errorf("failed to verify copied block row data: %w", err)
+	}
+	scanner := blockRowScanner{data: rowData}
+	for {
+		rowBytes, ok, err := scanner.next()
+		if err != nil {
+			return fmt.Errorf("error reading from data block: %w", err)
+		}
+		if !ok {
+			break
+		}
+		fileEntries.indexRow(rowBytes, b.config.Tokenizer)
+	}
+
+	if _, err := writer.Write(raw); err != nil {
+		return fmt.Errorf("failed to copy block data: %w", err)
 	}
 
 	// Create new block metadata with updated offset (everything else stays the same)
-	newBlockMetadata := blockWithFile.block // copy the struct
+	newBlockMetadata := block // copy the struct
 	newBlockMetadata.Offset = *currentOffset
 
 	*newDataBlocks = append(*newDataBlocks, newBlockMetadata)
@@ -2169,335 +2103,158 @@ func (b *BloomSearchEngine) copyDataBlock(writer io.Writer, blockWithFile blockW
 	return nil
 }
 
-// mergeDataBlocks merges multiple data blocks into a single optimized data block using streaming
-func (b *BloomSearchEngine) mergeDataBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, groupIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata) error {
-	// Create streaming readers for each block. Every reader opens its own
-	// file handle: blocks from the same source file sharing one seeking
-	// handle would clobber each other's positions as the round-robin merge
-	// interleaves reads.
-	var readers []*dataBlockRowReader
-	defer func() {
-		for _, reader := range readers {
-			reader.Close()
-		}
-	}()
-
-	var mergedBloomFilters *BloomFilters
+// mergeDataBlocks merges multiple data blocks into a single data block,
+// rebuilding the block's bloom filters from its rows: every row is fed
+// through the shared walker/tokenizer into fresh entry sets, and exact-sized
+// filters are built once the merged block is complete. Because the filter
+// section precedes the row data on disk but is only known after every row has
+// streamed through, the compressed row data is buffered in memory (bounded by
+// the row-group size budget) until the block completes.
+//
+// Blocks are loaded one at a time, each through its own file handle, so
+// blocks from the same source file never interleave reads on a shared seek
+// position.
+func (b *BloomSearchEngine) mergeDataBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, groupIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets) error {
+	blockEntries := newBloomEntrySets()
 	var mergedMinMaxIndexes map[string]MinMaxIndex
 
-	for i, blockIdx := range groupIndices {
-		blockWithFile := allBlocks[blockIdx]
-
-		// Create streaming reader for this block
-		reader, err := b.newDataBlockRowReader(ctx, blockWithFile.filePointer, blockWithFile.block)
-		if err != nil {
-			return fmt.Errorf("failed to create row reader for data block: %w", err)
-		}
-		readers = append(readers, reader)
-
-		// Merge bloom filters
-		if i == 0 {
-			mergedBloomFilters = reader.bloomFilters
-			mergedMinMaxIndexes = blockWithFile.block.MinMaxIndexes
-		} else {
-			mergedBloomFilters, err = b.mergeBloomFiltersStruct(mergedBloomFilters, reader.bloomFilters)
-			if err != nil {
-				return fmt.Errorf("failed to merge bloom filters: %w", err)
-			}
-			mergedMinMaxIndexes = b.mergeMinMaxIndexes(mergedMinMaxIndexes, blockWithFile.block.MinMaxIndexes)
-		}
-	}
-
-	// Stream merge the data blocks. The merged block's bloom params come from
-	// the source blocks (dataBlocksAreMergeable requires them to be
-	// identical) so the metadata describes the filters that were actually
-	// merged, not the current config.
-	sourceBlock := allBlocks[groupIndices[0]].block
-	newBlockMetadata, err := b.streamMergeDataBlocks(writer, readers, partitionID, mergedBloomFilters, mergedMinMaxIndexes, *currentOffset, sourceBlock.BloomExpectedItems, sourceBlock.BloomFalsePositiveRate)
-	if err != nil {
-		return fmt.Errorf("failed to stream merge data blocks: %w", err)
-	}
-
-	*newDataBlocks = append(*newDataBlocks, *newBlockMetadata)
-	*currentOffset += newBlockMetadata.Size
-
-	return nil
-}
-
-// streamMergeDataBlocks performs streaming merge of multiple data block readers
-func (b *BloomSearchEngine) streamMergeDataBlocks(writer io.Writer, readers []*dataBlockRowReader, partitionID string, bloomFilters *BloomFilters, minMaxIndexes map[string]MinMaxIndex, offset int, bloomExpectedItems uint, bloomFalsePositiveRate float64) (*DataBlockMetadata, error) {
-	// Serialize and write bloom filters
-	_, _, bloomFiltersSize, err := b.writeBloomFiltersWithHash(writer, bloomFilters)
-	if err != nil {
-		return nil, fmt.Errorf("failed to write bloom filters: %w", err)
-	}
-
-	// Stream compressed row data directly to the output writer while tracking bytes and checksum.
-	rowDataCounter := &countingWriter{writer: writer}
+	var compressed bytes.Buffer
 	rowDataHasher := crc32.New(crc32cTable)
-	rowDataDest := io.MultiWriter(rowDataCounter, rowDataHasher)
-
-	uncompressedSize := 0
-	rowCount := 0
-
-	compressionEncoders, err := b.createCompressionWriter(rowDataDest)
+	compressionEncoders, err := b.createCompressionWriter(io.MultiWriter(&compressed, rowDataHasher))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create compression writer: %w", err)
+		return fmt.Errorf("failed to create compression writer: %w", err)
 	}
 	rowDataWriter := compressionEncoders.writer
 
-	// Stream merge all readers (simple round-robin for now, could be more sophisticated)
-	for {
-		hasData := false
+	uncompressedSize := 0
+	rowCount := 0
+	var lengthBytes [LengthPrefixSize]byte
 
-		// Check each reader and write any available rows
-		for _, reader := range readers {
-			if reader.hasMore && reader.err == nil {
-				rowBytes := reader.getCurrentRow()
-				if rowBytes != nil {
-					hasData = true
+	for i, blockIdx := range groupIndices {
+		bwf := allBlocks[blockIdx]
 
-					if len(rowBytes) > 0xFFFFFFFF {
-						return nil, fmt.Errorf("row too large: %d bytes exceeds maximum", len(rowBytes))
-					}
-
-					// Write length prefix and row data
-					lengthBytes := make([]byte, LengthPrefixSize)
-					binary.LittleEndian.PutUint32(lengthBytes, uint32(len(rowBytes)))
-
-					if _, err := rowDataWriter.Write(lengthBytes); err != nil {
-						return nil, fmt.Errorf("failed to write row length: %w", err)
-					}
-					if _, err := rowDataWriter.Write(rowBytes); err != nil {
-						return nil, fmt.Errorf("failed to write row data: %w", err)
-					}
-
-					uncompressedSize += len(rowBytes) + LengthPrefixSize
-					rowCount++
-				}
-			} else {
-			}
-
-			// Check for reader errors
-			if reader.err != nil {
-				return nil, fmt.Errorf("error reading from data block: %w", reader.err)
-			}
+		if i == 0 {
+			mergedMinMaxIndexes = bwf.block.MinMaxIndexes
+		} else {
+			mergedMinMaxIndexes = b.mergeMinMaxIndexes(mergedMinMaxIndexes, bwf.block.MinMaxIndexes)
 		}
 
-		// If no readers have data, we're done
-		if !hasData {
-			break
+		rowData, err := b.loadBlockRowData(ctx, bwf.filePointer, bwf.block)
+		if err != nil {
+			return fmt.Errorf("failed to read data block rows: %w", err)
+		}
+
+		scanner := blockRowScanner{data: rowData}
+		for {
+			rowBytes, ok, scanErr := scanner.next()
+			if scanErr != nil {
+				return fmt.Errorf("error reading from data block: %w", scanErr)
+			}
+			if !ok {
+				break
+			}
+
+			blockEntries.indexRow(rowBytes, b.config.Tokenizer)
+
+			binary.LittleEndian.PutUint32(lengthBytes[:], uint32(len(rowBytes)))
+			if _, err := rowDataWriter.Write(lengthBytes[:]); err != nil {
+				return fmt.Errorf("failed to write row length: %w", err)
+			}
+			if _, err := rowDataWriter.Write(rowBytes); err != nil {
+				return fmt.Errorf("failed to write row data: %w", err)
+			}
+
+			uncompressedSize += len(rowBytes) + LengthPrefixSize
+			rowCount++
 		}
 	}
 
 	// Finalize compression
 	if err := compressionEncoders.finalizeCompression(); err != nil {
-		return nil, fmt.Errorf("failed to finalize compression: %w", err)
+		return fmt.Errorf("failed to finalize compression: %w", err)
 	}
 
-	rowDataHash := rowDataHasher.Sum32()
-	totalSize := bloomFiltersSize + rowDataCounter.count
+	// Every row has streamed through: build the block's exact-sized filters
+	// and write the block as [filter section][compressed row data].
+	blockFilters := blockEntries.buildFilters(b.config.BloomFalsePositiveRate)
+	filterSection, err := encodeFilterSection(&blockFilters)
+	if err != nil {
+		return fmt.Errorf("failed to encode bloom filters: %w", err)
+	}
+	if _, err := writer.Write(filterSection); err != nil {
+		return fmt.Errorf("failed to write bloom filters: %w", err)
+	}
+	if _, err := writer.Write(compressed.Bytes()); err != nil {
+		return fmt.Errorf("failed to write merged row data: %w", err)
+	}
 
-	return &DataBlockMetadata{
+	blockEntries.unionInto(fileEntries)
+
+	totalSize := len(filterSection) + compressed.Len()
+	*newDataBlocks = append(*newDataBlocks, DataBlockMetadata{
 		PartitionID:      partitionID,
 		Rows:             rowCount,
-		Offset:           offset,
+		Offset:           *currentOffset,
 		Size:             totalSize,
-		BloomFiltersSize: bloomFiltersSize,
-		MinMaxIndexes:    minMaxIndexes,
-		// Compression reflects how the merged row data was just written
-		// (current config); the bloom params reflect the source filters.
+		BloomFiltersSize: len(filterSection),
+		MinMaxIndexes:    mergedMinMaxIndexes,
+		// Compression and bloom params both reflect what was just built with
+		// the current config.
 		Compression:            b.config.RowDataCompression,
 		UncompressedSize:       uncompressedSize,
-		RowDataHash:            rowDataHash,
-		BloomExpectedItems:     bloomExpectedItems,
-		BloomFalsePositiveRate: bloomFalsePositiveRate,
-	}, nil
+		RowDataHash:            rowDataHasher.Sum32(),
+		HasRowDataHash:         true,
+		BloomEntryCounts:       blockEntries.counts(),
+		BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
+	})
+	*currentOffset += totalSize
+
+	return nil
 }
 
-// countingWriter tracks streamed compressed row bytes for block metadata sizing.
-type countingWriter struct {
-	writer io.Writer
-	count  int
-}
-
-func (w *countingWriter) Write(p []byte) (int, error) {
-	n, err := w.writer.Write(p)
-	w.count += n
-	return n, err
-}
-
-// dataBlockRowReader provides streaming access to rows from a data block.
-// Each reader owns its file handle, so multiple readers over blocks of the
-// same source file never disturb each other's positions; Close releases it.
-type dataBlockRowReader struct {
-	file          io.ReadSeekCloser
-	rowDataReader io.Reader
-	bloomFilters  *BloomFilters
-	hasMore       bool
-	currentRow    []byte
-	err           error
-	hashReader    *hashCalculatingReader
-	expectedHash  uint32
-	hashVerified  bool
-	zstdDecoder   *zstd.Decoder
-}
-
-// newDataBlockRowReader creates a streaming reader for a data block, opening
-// a dedicated file handle for it. Callers must Close the reader.
-func (b *BloomSearchEngine) newDataBlockRowReader(ctx context.Context, filePointer []byte, blockMetadata DataBlockMetadata) (*dataBlockRowReader, error) {
+// loadBlockRowData opens a dedicated handle on the block's source file and
+// returns the block's verified, decompressed row data (see readBlockRowData
+// for the verification order and bounds). The handle is closed before
+// returning — callers work from the in-memory copy.
+func (b *BloomSearchEngine) loadBlockRowData(ctx context.Context, filePointer []byte, block DataBlockMetadata) ([]byte, error) {
 	file, err := b.dataStore.OpenFile(ctx, filePointer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open source file for row reader: %w", err)
 	}
-
-	// Read bloom filters first
-	blockBloomFilters, err := ReadDataBlockBloomFilters(file, blockMetadata)
-	if err != nil {
-		file.Close()
-		return nil, fmt.Errorf("failed to read bloom filters: %w", err)
-	}
-
-	// Seek to row data
-	rowDataOffset := int64(blockMetadata.Offset + blockMetadata.BloomFiltersSize)
-	if _, err := file.Seek(rowDataOffset, 0); err != nil {
-		file.Close()
-		return nil, fmt.Errorf("failed to seek to row data: %w", err)
-	}
-
-	// Create streaming reader for compressed data with hash calculation
-	compressedRowDataSize := blockMetadata.Size - blockMetadata.BloomFiltersSize
-	limitedReader := io.LimitReader(file, int64(compressedRowDataSize))
-
-	// Create hash-calculating reader to verify hash while streaming
-	hashReader := newHashCalculatingReader(limitedReader, int64(compressedRowDataSize))
-
-	// Create appropriate decompression reader based on compression type
-	var rowDataReader io.Reader
-	var zstdDec *zstd.Decoder
-	switch normalizeCompression(blockMetadata.Compression) {
-	case CompressionNone:
-		rowDataReader = hashReader
-	case CompressionSnappy:
-		rowDataReader = snappy.NewReader(hashReader)
-	case CompressionZstd:
-		// Use streaming zstd decompression
-		decoder, err := zstd.NewReader(hashReader)
-		if err != nil {
-			file.Close()
-			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
-		}
-		rowDataReader = decoder
-		zstdDec = decoder
-	default:
-		file.Close()
-		return nil, fmt.Errorf("unsupported compression type: %s", blockMetadata.Compression)
-	}
-
-	// Hash will be verified when EOF is reached (or no verification needed if no hash)
-	hashAlreadyVerified := blockMetadata.RowDataHash == 0
-
-	reader := &dataBlockRowReader{
-		file:          file,
-		rowDataReader: rowDataReader,
-		bloomFilters:  blockBloomFilters,
-		hasMore:       true,
-		hashReader:    hashReader,
-		expectedHash:  blockMetadata.RowDataHash,
-		hashVerified:  hashAlreadyVerified,
-	}
-	if zstdDec != nil {
-		reader.zstdDecoder = zstdDec
-	}
-
-	// Read the first row to initialize
-	reader.next()
-
-	return reader, nil
+	defer file.Close()
+	return readBlockRowData(file, &block)
 }
 
-// Close releases the reader's decoder and file handle (idempotent).
-func (r *dataBlockRowReader) Close() {
-	r.closeDecoder()
-	if r.file != nil {
-		r.file.Close()
-		r.file = nil
-	}
-}
-
-// next reads the next row from the stream
-func (r *dataBlockRowReader) next() {
-	if !r.hasMore || r.err != nil {
-		return
-	}
-
-	var lengthBytes [LengthPrefixSize]byte
-	n, err := io.ReadFull(r.rowDataReader, lengthBytes[:])
-	if err == io.EOF {
-		r.hasMore = false
-		// Verify hash if we haven't already and we have a hash to verify
-		if !r.hashVerified && r.expectedHash != 0 && r.hashReader != nil {
-			computedHash := r.hashReader.Sum32()
-			if computedHash != r.expectedHash {
-				r.err = fmt.Errorf("row data hash mismatch: expected %x, got %x", r.expectedHash, computedHash)
-				r.closeDecoder()
-				return
-			}
-			r.hashVerified = true
-		}
-		r.closeDecoder()
-		return
-	}
-	if err != nil || n != LengthPrefixSize {
-		r.err = fmt.Errorf("failed to read row length: %w", err)
-		r.hasMore = false
-		r.closeDecoder()
-		return
-	}
-
-	rowLength := binary.LittleEndian.Uint32(lengthBytes[:])
-	if cap(r.currentRow) < int(rowLength) {
-		r.currentRow = make([]byte, int(rowLength))
-	} else {
-		r.currentRow = r.currentRow[:int(rowLength)]
-	}
-	n, err = io.ReadFull(r.rowDataReader, r.currentRow)
-	if err != nil || n != int(rowLength) {
-		r.err = fmt.Errorf("failed to read row data: %w", err)
-		r.hasMore = false
-		r.closeDecoder()
-		return
-	}
-}
-
-// closeDecoder closes the zstd decoder if present (idempotent)
-func (r *dataBlockRowReader) closeDecoder() {
-	if r.zstdDecoder != nil {
-		r.zstdDecoder.Close()
-		r.zstdDecoder = nil
-	}
-}
-
-// getCurrentRow returns the current row and advances to the next
-func (r *dataBlockRowReader) getCurrentRow() []byte {
-	if !r.hasMore || r.err != nil {
-		return nil
-	}
-
-	// Copy to preserve contents across advance when buffers are reused
-	out := make([]byte, len(r.currentRow))
-	copy(out, r.currentRow)
-	r.next() // advance to next row
-	return out
-}
-
-// writeFileMetadataAndFooter writes the file metadata and footer to complete the file
+// writeFileMetadataAndFooter completes a file with the v2 footer: the
+// file-level filter section (binary, see encodeFilterSection), the metadata
+// JSON — which carries no filter bytes, only the section's size — its CRC32C
+// and length, the file version, and the magic bytes.
 func (b *BloomSearchEngine) writeFileMetadataAndFooter(writer io.Writer, metadata *FileMetadata) error {
+	// Write the file-level filter section
+	filterSection, err := encodeFilterSection(&metadata.BloomFilters)
+	if err != nil {
+		return fmt.Errorf("failed to encode file bloom filters: %w", err)
+	}
+	if _, err := writer.Write(filterSection); err != nil {
+		return fmt.Errorf("failed to write file bloom filters: %w", err)
+	}
+
 	// Write file metadata
-	metadataBytes, metadataHashBytes := metadata.Bytes()
+	metadataBytes, err := json.Marshal(fileMetadataV2JSON{
+		BloomFalsePositiveRate: metadata.BloomFalsePositiveRate,
+		BloomEntryCounts:       metadata.BloomEntryCounts,
+		FileFilterSectionSize:  len(filterSection),
+		DataBlocks:             metadata.DataBlocks,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal file metadata: %w", err)
+	}
 	if _, err := writer.Write(metadataBytes); err != nil {
 		return fmt.Errorf("failed to write file metadata: %w", err)
 	}
+
+	metadataHashBytes := make([]byte, HashSize)
+	binary.LittleEndian.PutUint32(metadataHashBytes, crc32.Checksum(metadataBytes, crc32cTable))
 	if _, err := writer.Write(metadataHashBytes); err != nil {
 		return fmt.Errorf("failed to write file metadata hash: %w", err)
 	}
@@ -2522,47 +2279,4 @@ func (b *BloomSearchEngine) writeFileMetadataAndFooter(writer io.Writer, metadat
 	}
 
 	return nil
-}
-
-// hashCalculatingReader wraps an io.Reader and calculates checksum as data is read
-type hashCalculatingReader struct {
-	reader    io.Reader
-	hasher    hash.Hash32
-	totalRead int64
-	limit     int64
-}
-
-func newHashCalculatingReader(reader io.Reader, limit int64) *hashCalculatingReader {
-	return &hashCalculatingReader{
-		reader: reader,
-		hasher: crc32.New(crc32cTable),
-		limit:  limit,
-	}
-}
-
-func (h *hashCalculatingReader) Read(p []byte) (n int, err error) {
-	if h.totalRead >= h.limit {
-		return 0, io.EOF
-	}
-
-	// Don't read more than our limit
-	if int64(len(p)) > h.limit-h.totalRead {
-		p = p[:h.limit-h.totalRead]
-	}
-
-	n, err = h.reader.Read(p)
-	if n > 0 {
-		h.hasher.Write(p[:n])
-		h.totalRead += int64(n)
-	}
-	return n, err
-}
-
-func (h *hashCalculatingReader) Sum64() uint64 {
-	// Maintain compatibility with callers expecting Sum64; derive from 32-bit checksum
-	return uint64(h.hasher.Sum32())
-}
-
-func (h *hashCalculatingReader) Sum32() uint32 {
-	return h.hasher.Sum32()
 }

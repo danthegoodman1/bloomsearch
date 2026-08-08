@@ -478,12 +478,9 @@ func TestPropertyNoFalseNegatives(t *testing.T) {
 	engine := newTestEngine(t, func(config *BloomSearchEngineConfig) {
 		config.MaxBufferedRows = numRows * 2
 		config.MaxBufferedBytes = 512 << 20
-		// Small filters keep the ~2000 queries below fast: every query re-reads
-		// the file-level filters from the footer, and the default 100k-item
-		// sizing makes that the dominant cost. A higher false positive rate
-		// cannot cause false negatives, which is all this test asserts.
-		config.FileBloomExpectedItems = 2_000
 		config.MaxRowGroupRows = 2_000
+		// A higher false positive rate cannot cause false negatives, which is
+		// all this test asserts.
 		config.BloomFalsePositiveRate = 0.01
 	})
 	ingestAndFlush(t, engine, rows)

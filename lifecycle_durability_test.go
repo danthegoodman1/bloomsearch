@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bits-and-blooms/bloom/v3"
 )
 
 // --- test doubles ---
@@ -1122,18 +1124,20 @@ func TestMergeSameFileBlocks(t *testing.T) {
 	}
 }
 
-func TestMergeStampsSourceParams(t *testing.T) {
+// TestMergeStampsRebuiltParams asserts that merged metadata describes the
+// filters the merge actually built: rebuilt from the merged rows' measured
+// entry counts at the merging engine's configured false positive rate, not
+// the sources' parameters.
+func TestMergeStampsRebuiltParams(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
 	oldParams := func(config *BloomSearchEngineConfig) {
-		config.FileBloomExpectedItems = 100
 		config.BloomFalsePositiveRate = 0.01
 		config.MaxRowGroupRows = 50
 		config.RowDataCompression = CompressionNone
 	}
 	newParams := func(config *BloomSearchEngineConfig) {
-		config.FileBloomExpectedItems = 300
 		config.BloomFalsePositiveRate = 0.02
 		config.MaxRowGroupRows = 75
 		config.RowDataCompression = CompressionNone
@@ -1171,20 +1175,36 @@ func TestMergeStampsSourceParams(t *testing.T) {
 		t.Fatalf("expected 1 merged file, got %d", len(maybeFiles))
 	}
 	merged := maybeFiles[0].Metadata
-	if merged.BloomExpectedItems != 100 || merged.BloomFalsePositiveRate != 0.01 {
-		t.Fatalf("merged file metadata must carry SOURCE bloom params (100, 0.01), got (%d, %v)",
-			merged.BloomExpectedItems, merged.BloomFalsePositiveRate)
+	if merged.BloomFalsePositiveRate != 0.02 {
+		t.Fatalf("merged file metadata must carry the REBUILT filters' fpr (0.02), got %v",
+			merged.BloomFalsePositiveRate)
+	}
+	// Both rows share the field "id" and have distinct tokens old1/old2.
+	if merged.BloomEntryCounts.Fields != 1 || merged.BloomEntryCounts.Tokens != 2 || merged.BloomEntryCounts.FieldTokens != 2 {
+		t.Fatalf("merged file metadata must carry measured entry counts (1 field, 2 tokens, 2 fieldtokens), got %+v",
+			merged.BloomEntryCounts)
+	}
+	// The rebuilt file-level filters are sized from those measured counts.
+	wantTokenFilter := bloom.NewWithEstimates(2, 0.02)
+	if got := merged.BloomFilters.TokenBloomFilter.Cap(); got != wantTokenFilter.Cap() {
+		t.Fatalf("merged file token filter must be sized from measured counts: want m=%d, got m=%d",
+			wantTokenFilter.Cap(), got)
 	}
 	for _, block := range merged.DataBlocks {
-		if block.BloomExpectedItems != 50 || block.BloomFalsePositiveRate != 0.01 {
-			t.Fatalf("merged block metadata must carry SOURCE bloom params (50, 0.01), got (%d, %v)",
-				block.BloomExpectedItems, block.BloomFalsePositiveRate)
+		if block.BloomFalsePositiveRate != 0.02 {
+			t.Fatalf("merged block metadata must carry the REBUILT filters' fpr (0.02), got %v",
+				block.BloomFalsePositiveRate)
+		}
+		if block.BloomEntryCounts.Fields != 1 || block.BloomEntryCounts.Tokens != 2 || block.BloomEntryCounts.FieldTokens != 2 {
+			t.Fatalf("merged block metadata must carry measured entry counts, got %+v", block.BloomEntryCounts)
+		}
+		if !block.HasRowDataHash {
+			t.Fatalf("merged block must carry an explicit row data hash")
 		}
 	}
 
-	// New-config files must still group correctly in a later merge: the
-	// merged old file groups by its (true) source params instead of being
-	// mixed with new-param files and failing bloom.Merge.
+	// Files written under yet another config must merge with the rebuilt
+	// file in a later pass: filter params impose no mergeability constraint.
 	ingestAndFlush(engineNew, "new1")
 	ingestAndFlush(engineNew, "new2")
 	if _, err := engineNew.Merge(ctx); err != nil {
@@ -1397,7 +1417,6 @@ func TestConfigValidationTable(t *testing.T) {
 		{"zero MaxBufferedBytes", func(c *BloomSearchEngineConfig) { c.MaxBufferedBytes = 0 }},
 		{"zero MaxBufferedTime", func(c *BloomSearchEngineConfig) { c.MaxBufferedTime = 0 }},
 		{"zero IngestBufferSize", func(c *BloomSearchEngineConfig) { c.IngestBufferSize = 0 }},
-		{"zero FileBloomExpectedItems", func(c *BloomSearchEngineConfig) { c.FileBloomExpectedItems = 0 }},
 		{"zero BloomFalsePositiveRate", func(c *BloomSearchEngineConfig) { c.BloomFalsePositiveRate = 0 }},
 		{"BloomFalsePositiveRate of 1", func(c *BloomSearchEngineConfig) { c.BloomFalsePositiveRate = 1 }},
 		{"zero MaxQueryConcurrency", func(c *BloomSearchEngineConfig) { c.MaxQueryConcurrency = 0 }},

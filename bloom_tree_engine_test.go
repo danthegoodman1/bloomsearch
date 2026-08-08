@@ -107,7 +107,6 @@ func TestBloomTreeEngineFlushMaxRows(t *testing.T) {
 	config.MaxBufferedRows = 3                // Flush after 3 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit (won't trigger)
 	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
-	config.FileBloomExpectedItems = 100       // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
 
 	// Create and start engine
@@ -164,7 +163,6 @@ func TestBloomTreeEngineFlushMaxBytes(t *testing.T) {
 	config.MaxBufferedRows = 100              // Large row limit (won't trigger)
 	config.MaxBufferedBytes = 200             // Small byte limit (will trigger)
 	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
-	config.FileBloomExpectedItems = 100       // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
 
 	// Create and start engine
@@ -222,7 +220,6 @@ func TestBloomTreeEngineFlushMaxTime(t *testing.T) {
 	config.MaxBufferedRows = 100             // Large row limit (won't trigger)
 	config.MaxBufferedBytes = 1024 * 1024    // Large byte limit (won't trigger)
 	config.MaxBufferedTime = 1 * time.Second // Small time limit (will trigger)
-	config.FileBloomExpectedItems = 100      // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01     // Slightly higher false positive rate
 
 	// Create and start engine
@@ -459,7 +456,6 @@ func TestBloomSearchEngineQueryEndToEndUncompressed(t *testing.T) {
 	config.MaxBufferedRows = 2                // Flush after 2 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
 	config.MaxBufferedTime = 10 * time.Second // Large time limit
-	config.FileBloomExpectedItems = 100       // Smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
 	config.RowDataCompression = CompressionNone
 
@@ -608,7 +604,6 @@ func TestBloomSearchEngineQueryEndToEndZstd(t *testing.T) {
 	config.MaxBufferedRows = 2                // Flush after 2 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
 	config.MaxBufferedTime = 10 * time.Second // Large time limit
-	config.FileBloomExpectedItems = 100       // Smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
 	config.RowDataCompression = CompressionZstd
 
@@ -757,7 +752,6 @@ func TestBloomSearchEngineQueryEndToEndSnappy(t *testing.T) {
 	config.MaxBufferedRows = 2                // Flush after 2 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
 	config.MaxBufferedTime = 10 * time.Second // Large time limit
-	config.FileBloomExpectedItems = 100       // Smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
 	config.RowDataCompression = CompressionSnappy
 
@@ -907,7 +901,6 @@ func TestBloomSearchEngineMergeEndToEndUncompressed(t *testing.T) {
 	config.MaxBufferedRows = 2                // Flush after 2 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
 	config.MaxBufferedTime = 10 * time.Second // Large time limit
-	config.FileBloomExpectedItems = 100       // Smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
 	config.RowDataCompression = CompressionNone
 	config.MaxFilesToMergePerOperation = 5 // Allow merging up to 5 files
@@ -945,7 +938,7 @@ func TestBloomSearchEngineMergeEndToEndUncompressed(t *testing.T) {
 		{"id": 6.0, "name": "Frank", "level": "debug", "service": "cache"},
 	}
 
-	// Fourth batch of test data (will use different bloom filter parameters)
+	// Fourth batch of test data (written under a different bloom config)
 	batch4 := []map[string]any{
 		{"id": 7.0, "name": "Grace", "level": "warn", "service": "monitoring"},
 		{"id": 8.0, "name": "Henry", "level": "info", "service": "logging"},
@@ -975,13 +968,13 @@ func TestBloomSearchEngineMergeEndToEndUncompressed(t *testing.T) {
 		t.Fatalf("Failed to stop engine: %v", err)
 	}
 
-	// Create new engine with different bloom filter parameters for batch 4
-	// This will create a file that can't be merged with the others
+	// Create new engine with a different bloom false positive rate for batch
+	// 4. Merge rebuilds filters from row data, so this file still merges with
+	// the others; the differing config must not break anything.
 	configDifferent := DefaultBloomSearchEngineConfig()
 	configDifferent.MaxBufferedRows = 2
 	configDifferent.MaxBufferedBytes = 1024 * 1024
 	configDifferent.MaxBufferedTime = 10 * time.Second
-	configDifferent.FileBloomExpectedItems = 200  // Different expected items
 	configDifferent.BloomFalsePositiveRate = 0.02 // Different false positive rate
 	configDifferent.RowDataCompression = CompressionNone
 	configDifferent.MaxFilesToMergePerOperation = 5
@@ -1053,7 +1046,7 @@ func TestBloomSearchEngineMergeEndToEndUncompressed(t *testing.T) {
 		NewQuery().FieldToken("service", "auth"),
 		2, expectedAuthRows)
 
-	// Test queries targeting data from the single unmergeable file (batch 4)
+	// Test queries targeting data from the differently-configured file (batch 4)
 	runQueryTest(t, engine, ctx, "token search for 'grace' should match single file row",
 		NewQuery().Token("grace"),
 		1, []map[string]any{batch4[0]})
@@ -1186,7 +1179,6 @@ func TestBloomSearchEngineMergeWithPartitionsAndMinMax(t *testing.T) {
 	config.MaxBufferedRows = 3                // Flush after 3 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit
 	config.MaxBufferedTime = 10 * time.Second // Large time limit
-	config.FileBloomExpectedItems = 100       // Smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Higher false positive rate
 	config.RowDataCompression = CompressionNone
 	config.MaxFilesToMergePerOperation = 5
@@ -1772,7 +1764,6 @@ func TestBloomSearchEngineQueryRegexFinalStageAndOr(t *testing.T) {
 	config.MaxBufferedRows = 4
 	config.MaxBufferedBytes = 1024 * 1024
 	config.MaxBufferedTime = 10 * time.Second
-	config.FileBloomExpectedItems = 100
 	config.BloomFalsePositiveRate = 0.01
 	config.RowDataCompression = CompressionNone
 
@@ -1856,7 +1847,6 @@ func TestBloomSearchEngineRegexFieldGuardPrunesFiles(t *testing.T) {
 	config.MaxBufferedRows = 1
 	config.MaxBufferedBytes = 1024 * 1024
 	config.MaxBufferedTime = 10 * time.Second
-	config.FileBloomExpectedItems = 100
 	config.BloomFalsePositiveRate = 0.01
 	config.RowDataCompression = CompressionNone
 
@@ -1923,7 +1913,6 @@ func TestBloomSearchEngineQueryProcessesAllBlocksWithBoundedConcurrency(t *testi
 	config.MaxBufferedRows = 1
 	config.MaxBufferedBytes = 1024 * 1024
 	config.MaxBufferedTime = 10 * time.Second
-	config.FileBloomExpectedItems = 100
 	config.BloomFalsePositiveRate = 0.01
 	config.RowDataCompression = CompressionNone
 	config.MaxQueryConcurrency = 2
@@ -2069,7 +2058,6 @@ func TestBloomSearchEngineFileLevelBloomRetainsInFlightRowsAcrossFlushes(t *test
 	config.MaxBufferedRows = 1000
 	config.MaxBufferedBytes = 1024 * 1024
 	config.MaxBufferedTime = 1 * time.Hour
-	config.FileBloomExpectedItems = 100
 	config.BloomFalsePositiveRate = 0.01
 	config.RowDataCompression = CompressionNone
 

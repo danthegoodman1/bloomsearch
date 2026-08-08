@@ -32,7 +32,6 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	config.MaxBufferedRows = 3                // Flush after 3 rows
 	config.MaxBufferedBytes = 1024 * 1024     // Large byte limit (won't trigger)
 	config.MaxBufferedTime = 10 * time.Second // Large time limit (won't trigger)
-	config.FileBloomExpectedItems = 100       // Much smaller bloom filter
 	config.BloomFalsePositiveRate = 0.01      // Slightly higher false positive rate
 	config.RowDataCompression = CompressionNone
 
@@ -123,29 +122,19 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 
 	fmt.Printf("\n  Reading rows from Block:\n")
 
-	// Seek to the block offset
-	_, err = file.Seek(int64(block.Offset), 0)
-	assert.NoError(t, err)
-
-	// First, read the bloom filters from the beginning of the data block
-	bloomFiltersSize := block.BloomFiltersSize
-	bloomFiltersBytes := make([]byte, bloomFiltersSize-HashSize) // exclude hash
-	_, err = file.Read(bloomFiltersBytes)
-	assert.NoError(t, err)
-
-	// Read the bloom filters hash
-	bloomFiltersHashBytes := make([]byte, HashSize)
-	_, err = file.Read(bloomFiltersHashBytes)
-	assert.NoError(t, err)
-
-	// Verify and parse bloom filters
-	bloomFilters, err := DataBlockBloomFiltersFromBytesWithHash(bloomFiltersBytes, bloomFiltersHashBytes)
+	// First, read and verify the bloom filter section at the beginning of
+	// the data block
+	bloomFilters, err := ReadDataBlockBloomFilters(file, block)
 	assert.NoError(t, err)
 	assert.NotNil(t, bloomFilters.FieldBloomFilter, "Field bloom filter should exist")
 	assert.NotNil(t, bloomFilters.TokenBloomFilter, "Token bloom filter should exist")
 	assert.NotNil(t, bloomFilters.FieldTokenBloomFilter, "Field+Token bloom filter should exist")
 
 	fmt.Printf("  Bloom filters loaded successfully from data block\n")
+
+	// Position at the row data that follows the filter section
+	_, err = file.Seek(int64(block.Offset+block.BloomFiltersSize), 0)
+	assert.NoError(t, err)
 
 	// Now read the row data
 	// (block.Size - BloomFiltersSize) gives us the row data size

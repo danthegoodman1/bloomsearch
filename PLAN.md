@@ -194,12 +194,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 5A: Entry-count-based filter sizing + new knobs + observability counts | Missing: implementation + FPR measurement test. |
-| Incomplete | Work | 5B: Binary filter encoding; format v2 with v1 read compat | Missing: implementation + cross-version tests + size delta. |
-| Incomplete | Work | 5C: Conditional filter reads; filters dropped post-file-test | Missing: implementation + per-query memory measurement. |
-| Incomplete | Work | 5D: Verify-before-emit; bounded allocations; explicit hash-presence flag | Missing: implementation + corruption tests. |
-| Incomplete | Work | 5E: Merge-time filter rebuild (or README de-claim) | Missing: implementation + param-mismatch merge test, or doc change. |
-| Incomplete | Gate | Selective benchmark shows real pruning; v1 compat; no corrupt row emitted | Missing: benchmark artifact + passing tests. |
+| Complete | Work | 5A: Entry-count-based filter sizing + observability counts | `bloomEntrySets` at ingest, exact-sized filters at flush; `FileBloomExpectedItems` knob and `BloomExpectedItems` metadata deleted (filters self-describe m/k); `BloomEntryCounts` recorded. Tests: `TestMeasuredFilterSizing`, `TestFalsePositiveRateWithinBudget` (measured ~0.011 vs 0.01 configured). |
+| Complete | Work | 5B: Binary filter encoding; format v2 with v1 read compat | Presence-flagged binary sections with CRC; metadata JSON filter-free; version dispatch (content-based for block sections — reviewer-verified unambiguous); FILE_FORMAT.md rewritten and hex-dump-verified. Tests: `TestV1FilesRemainReadable`, `TestV2FormatRoundTrip`, `TestV1FilterSectionInsideV2Container`. Storage: −86.3% (882KB→120KB/file on bench dataset). |
+| Complete | Work | 5C: Conditional filter reads; filters dropped post-file-test | Block filter reads skipped when no bloom conditions; file filters nil'd before job enqueue. Tests: `TestNoFilterReadWhenNoBloomConditions` (byte-range tracker + positive control), `TestFileFiltersReleasedAfterFileTest`. |
+| Complete | Work | 5D: Verify-before-emit; bounded allocations; explicit hash-presence flag | `readBlockRowData`/`blockRowScanner`: CRC before decompression, exact `UncompressedSize` buffer, bounded row prefixes; `HasRowDataHash` (v1 0-sentinel translated); unified block reader (Phase 7C half done early). Tests: corruption subtests in `TestV2FormatRoundTrip`, `TestOversizeRowLengthRejected`. |
+| Complete | Work | 5E: Merge-time filter rebuild | Mergeability drops bloom-param rules; merged blocks rebuild filters from re-streamed rows; raw-copied blocks verified (filter section + row data) and re-streamed for entry collection so file-level filters stay strong. Tests: `TestMergeRebuildsFilters`, `TestMergeAbortsOnCorruptSourceBlock` (3 subtests, red-checked), `TestMergeStampsRebuiltParams`. |
+| Complete | Gate | Selective benchmark shows real pruning; v1 compat; no corrupt row emitted | Reviewer-reproduced (interleaved benchstat): TokenMiss 75.9→0.28ms (−99.6%, file-level pruning works), Hit 86.3→7.2ms (−91.7%), Regex −88.7%, Ingest −36% time (+47% allocs, honest tradeoff), Merge −60% (+722% allocs → Phase 6). `go test -race` ok (7.6s, coordinator-verified). One review round, approve-with-should-fixes all landed. |
 
 ## Phase 6: Hot-path performance
 
