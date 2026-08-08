@@ -2,7 +2,6 @@ package bloomsearch
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -18,10 +17,6 @@ type FileSystemDataStore struct {
 	// drawFileName returns a candidate base name (without extension) for
 	// CreateFile; overridden in tests to force reservation collisions.
 	drawFileName func() string
-}
-
-type FileSystemDataStoreFilePointer struct {
-	ID string
 }
 
 func NewFileSystemDataStore(rootDir string) *FileSystemDataStore {
@@ -215,119 +210,20 @@ func (fs *FileSystemDataStore) TombstoneFile(ctx context.Context, filePointerByt
 	return errors.Join(errs...)
 }
 
-// readFileMetadata reads the file metadata from a bloom file, returning it
-// with the file size.
-func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata, int64, error) {
+// readFileMetadata opens filePath and reads its footer through the public
+// ReadFileMetadata parser.
+func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to open file %s: %w", filePath, err)
+		return nil, fmt.Errorf("failed to open file %s: %w", filePath, err)
 	}
 	defer file.Close()
 
-	// Get file size
-	stat, err := file.Stat()
+	metadata, _, err := ReadFileMetadata(file)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to stat file %s: %w", filePath, err)
+		return nil, fmt.Errorf("failed to read metadata from %s: %w", filePath, err)
 	}
-	fileSize := stat.Size()
-
-	// Check if file is large enough to contain the footer
-	// Footer: [8 bytes magic] + [4 bytes version] + [4 bytes metadata length] + [HashSize bytes metadata hash]
-	minFooterSize := int64(8 + 4 + 4 + HashSize)
-	if fileSize < minFooterSize {
-		return nil, 0, fmt.Errorf("file %s is too small to be a valid bloom file", filePath)
-	}
-
-	// Read magic bytes from the end
-	magicBytes := make([]byte, 8)
-	_, err = file.ReadAt(magicBytes, fileSize-8)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to read magic bytes from %s: %w", filePath, err)
-	}
-
-	// Verify magic bytes
-	if string(magicBytes) != MagicBytes {
-		return nil, 0, fmt.Errorf("invalid magic bytes in file %s", filePath)
-	}
-
-	// Read file version
-	versionBytes := make([]byte, 4)
-	_, err = file.ReadAt(versionBytes, fileSize-8-4)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to read version from %s: %w", filePath, err)
-	}
-	version := binary.LittleEndian.Uint32(versionBytes)
-
-	// Read metadata length
-	metadataLengthBytes := make([]byte, 4)
-	_, err = file.ReadAt(metadataLengthBytes, fileSize-8-4-4)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to read metadata length from %s: %w", filePath, err)
-	}
-	metadataLength := binary.LittleEndian.Uint32(metadataLengthBytes)
-
-	// Read metadata hash
-	metadataHashBytes := make([]byte, HashSize)
-	_, err = file.ReadAt(metadataHashBytes, fileSize-8-4-4-int64(HashSize))
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to read metadata hash from %s: %w", filePath, err)
-	}
-
-	// Read metadata
-	metadataOffset := fileSize - 8 - 4 - 4 - int64(HashSize) - int64(metadataLength)
-	if metadataOffset < 0 {
-		return nil, 0, fmt.Errorf("metadata length %d exceeds file size in %s", metadataLength, filePath)
-	}
-	metadataBytes := make([]byte, metadataLength)
-	_, err = file.ReadAt(metadataBytes, metadataOffset)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to read metadata from %s: %w", filePath, err)
-	}
-
-	// Parse and verify metadata, dispatching on the file version.
-	switch version {
-	case FileVersionV1:
-		// v1: the file-level bloom filters are embedded in the metadata JSON.
-		metadata, err := FileMetadataFromBytesWithHash(metadataBytes, metadataHashBytes)
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to parse metadata from %s: %w", filePath, err)
-		}
-		return metadata, fileSize, nil
-
-	case FileVersionV2:
-		// v2: the metadata JSON carries no filter bytes; the file-level
-		// filters live in a binary section immediately preceding it.
-		metadataV2, err := fileMetadataV2FromBytesWithHash(metadataBytes, metadataHashBytes)
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to parse metadata from %s: %w", filePath, err)
-		}
-
-		metadata := &FileMetadata{
-			BloomFalsePositiveRate: metadataV2.BloomFalsePositiveRate,
-			BloomEntryCounts:       metadataV2.BloomEntryCounts,
-			DataBlocks:             metadataV2.DataBlocks,
-		}
-
-		if metadataV2.FileFilterSectionSize < 0 || int64(metadataV2.FileFilterSectionSize) > metadataOffset {
-			return nil, 0, fmt.Errorf("invalid file filter section size %d in %s", metadataV2.FileFilterSectionSize, filePath)
-		}
-		if metadataV2.FileFilterSectionSize > 0 {
-			filterSection := make([]byte, metadataV2.FileFilterSectionSize)
-			if _, err := file.ReadAt(filterSection, metadataOffset-int64(metadataV2.FileFilterSectionSize)); err != nil {
-				return nil, 0, fmt.Errorf("failed to read file bloom filters from %s: %w", filePath, err)
-			}
-			filters, err := parseFilterSection(filterSection)
-			if err != nil {
-				return nil, 0, fmt.Errorf("failed to parse file bloom filters from %s: %w", filePath, err)
-			}
-			metadata.BloomFilters = *filters
-		}
-
-		return metadata, fileSize, nil
-
-	default:
-		return nil, 0, fmt.Errorf("unsupported file version %d in file %s", version, filePath)
-	}
+	return metadata, nil
 }
 
 func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
@@ -348,9 +244,7 @@ func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query 
 		// Read file metadata from bloom file. Unreadable or invalid files
 		// (partial writes, foreign files dropped in the directory) are
 		// skipped rather than failing the whole query.
-		// TODO(Phase 7): report skipped files through the injectable
-		// structured logger once it lands.
-		fileMetadata, fileSize, err := fs.readFileMetadata(filePath)
+		fileMetadata, err := fs.readFileMetadata(filePath)
 		if err != nil {
 			continue
 		}
@@ -363,7 +257,6 @@ func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query 
 			maybeFiles = append(maybeFiles, MaybeFile{
 				PointerBytes: []byte(filePath),
 				Metadata:     *fileMetadata,
-				Size:         int(fileSize),
 			})
 		}
 	}

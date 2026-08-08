@@ -147,12 +147,16 @@ func TestGenerateSyntheticData(t *testing.T) {
 
 	for i, file := range maybeFiles {
 		totalRowGroups += len(file.Metadata.DataBlocks)
-		totalFileSize += int64(file.Size)
+		var fileSize int64
+		for _, block := range file.Metadata.DataBlocks {
+			fileSize += int64(block.Size)
+		}
+		totalFileSize += fileSize
 
 		fmt.Printf("File %d: %d row groups, %s\n",
 			i+1,
 			len(file.Metadata.DataBlocks),
-			formatBytes(int64(file.Size)))
+			formatBytes(fileSize))
 	}
 
 	fmt.Printf("\nSummary:\n")

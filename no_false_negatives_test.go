@@ -188,13 +188,13 @@ func TestFieldWithDelimiterInKey(t *testing.T) {
 	if len(results) != 0 {
 		t.Fatalf("FieldRegex(\"\", ^xyz$): expected no rows (empty field path is nonexistent), got %v", results)
 	}
-	compiledEmptyField, err := CompileRegexQuery(emptyFieldQuery.Regex)
+	compiledEmptyField, err := compileRegexQuery(emptyFieldQuery.Regex)
 	if err != nil {
 		t.Fatalf("Failed to compile empty-field regex query: %v", err)
 	}
 	rowJSON := gjson.Parse(`{"id":4,".a":"xyz"}`)
-	if TestGJSONForQuery(rowJSON, nil, compiledEmptyField, ".", BasicWhitespaceLowerTokenizer) {
-		t.Fatal("TestGJSONForQuery with FieldRegex(\"\", ^xyz$): expected false to match the bloom guard's empty-path skip")
+	if testGJSONForQuery(rowJSON, nil, compiledEmptyField, ".", BasicWhitespaceLowerTokenizer) {
+		t.Fatal("testGJSONForQuery with FieldRegex(\"\", ^xyz$): expected false to match the bloom guard's empty-path skip")
 	}
 }
 

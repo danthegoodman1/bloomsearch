@@ -23,6 +23,17 @@ Files are written as **version 2**. Version 1 files (bloom filters JSON-encoded 
 
 Readers locate the footer from the end of the file: magic bytes, version, metadata length, metadata CRC32C, then the metadata JSON. The version field selects the decoder — v1 metadata embeds the file-level filters as JSON; v2 metadata carries no filter bytes.
 
+## Public API
+
+External DataStore/MetaStore implementations and tooling can parse and produce this format without reimplementing the framing:
+
+- `ReadFileMetadata(r io.ReadSeeker) (*FileMetadata, int64, error)` — locates, verifies, and decodes the footer (v1 and v2), returning the metadata with the file-level filters decoded, plus the file size. This is what `FileSystemDataStore` uses to serve `GetMaybeFilesForQuery`.
+- `WriteFileFooter(w io.Writer, metadata *FileMetadata) error` — writes the v2 footer (filter section, metadata JSON, CRC32C, length, version, magic bytes) after the last data block.
+- `ReadDataBlockBloomFilters(r io.ReadSeeker, block DataBlockMetadata) (*BloomFilters, error)` — reads and verifies one block's filter section.
+- `ReadDataBlockRowData(r io.ReadSeeker, block *DataBlockMetadata) ([]byte, error)` — reads, verifies (CRC before decompression, output bounded by `UncompressedSize`), and decompresses one block's row data.
+- `NewBlockRowScanner(rowData []byte) *BlockRowScanner` — iterates the length-prefixed rows of a decoded row data section.
+- `FileMetadataFromBytesWithHash(metadata, hash []byte) (*FileMetadata, error)` — verifies and decodes a standalone v1 metadata payload.
+
 ## Bloom Filter Sections
 
 Block-level and file-level bloom filters share one binary framing:
@@ -94,4 +105,4 @@ The compression type and uncompressed size are stored in the data block metadata
 v1 files differ from v2 in two ways, both handled transparently on read:
 
 - Block filter sections are JSON-encoded (`[filters JSON][uint32 CRC32C]`).
-- The file metadata JSON embeds the file-level bloom filters (JSON+base64) directly, along with the configured `BloomExpectedItems` sizing the filters were built from; there is no separate file-level filter section.
+- The file metadata JSON embeds the file-level bloom filters (JSON+base64) directly, along with the configured expected-item counts v1 filters were sized from (today's reader ignores those counts — v1 filters self-describe their parameters); there is no separate file-level filter section.

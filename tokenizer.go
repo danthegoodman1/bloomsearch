@@ -15,9 +15,9 @@ import (
 // walker (pathWalker in row_matcher.go), which makes disagreement between
 // them — the source of every false negative — impossible by construction.
 // forEachPathValue here is the reference enumeration with identical semantics,
-// used by the exported Test* helpers and by the property/differential tests,
-// which cross-validate the two implementations; the two walkers must stay
-// emission-for-emission identical.
+// used by the in-package test helpers (testJSONFor*/testGJSONFor*) and by the
+// property/differential tests, which cross-validate the two implementations;
+// the two walkers must stay emission-for-emission identical.
 //
 // Field path semantics:
 //   - Paths are object keys joined with the delimiter. Keys are always treated
@@ -362,39 +362,39 @@ func (s *rowMatchSets) matchesRegexExpression(expression *compiledRegexExpressio
 	}
 }
 
-// TestJSONForField tests if a field path exists in JSON (including
+// testJSONForField tests if a field path exists in JSON (including
 // intermediate object/array paths).
-func TestJSONForField(jsonStr, fieldPath, delimiter string) bool {
-	return TestGJSONForField(gjson.Parse(jsonStr), fieldPath, delimiter)
+func testJSONForField(jsonStr, fieldPath, delimiter string) bool {
+	return testGJSONForField(gjson.Parse(jsonStr), fieldPath, delimiter)
 }
 
-// TestJSONForToken tests if any primitive leaf value tokenizes to the token.
-func TestJSONForToken(jsonStr, token string, tokenizer ValueTokenizerFunc) bool {
-	return TestGJSONForToken(gjson.Parse(jsonStr), token, tokenizer)
+// testJSONForToken tests if any primitive leaf value tokenizes to the token.
+func testJSONForToken(jsonStr, token string, tokenizer ValueTokenizerFunc) bool {
+	return testGJSONForToken(gjson.Parse(jsonStr), token, tokenizer)
 }
 
-// TestJSONForFieldToken tests if a primitive leaf at exactly the field path
+// testJSONForFieldToken tests if a primitive leaf at exactly the field path
 // tokenizes to the token.
-func TestJSONForFieldToken(jsonStr, fieldPath, delimiter, token string, tokenizer ValueTokenizerFunc) bool {
-	return TestGJSONForFieldToken(gjson.Parse(jsonStr), fieldPath, delimiter, token, tokenizer)
+func testJSONForFieldToken(jsonStr, fieldPath, delimiter, token string, tokenizer ValueTokenizerFunc) bool {
+	return testGJSONForFieldToken(gjson.Parse(jsonStr), fieldPath, delimiter, token, tokenizer)
 }
 
-// TestGJSONForField is TestJSONForField over a pre-parsed value.
-func TestGJSONForField(value gjson.Result, fieldPath, delimiter string) bool {
+// testGJSONForField is testJSONForField over a pre-parsed value.
+func testGJSONForField(value gjson.Result, fieldPath, delimiter string) bool {
 	sets := buildRowMatchSets(value, delimiter, nil, rowQueryNeeds{fields: true})
 	_, ok := sets.paths[fieldPath]
 	return ok
 }
 
-// TestGJSONForToken is TestJSONForToken over a pre-parsed value.
-func TestGJSONForToken(value gjson.Result, token string, tokenizer ValueTokenizerFunc) bool {
+// testGJSONForToken is testJSONForToken over a pre-parsed value.
+func testGJSONForToken(value gjson.Result, token string, tokenizer ValueTokenizerFunc) bool {
 	sets := buildRowMatchSets(value, ".", tokenizer, rowQueryNeeds{tokens: true})
 	_, ok := sets.tokens[token]
 	return ok
 }
 
-// TestGJSONForFieldToken is TestJSONForFieldToken over a pre-parsed value.
-func TestGJSONForFieldToken(value gjson.Result, fieldPath, delimiter, token string, tokenizer ValueTokenizerFunc) bool {
+// testGJSONForFieldToken is testJSONForFieldToken over a pre-parsed value.
+func testGJSONForFieldToken(value gjson.Result, fieldPath, delimiter, token string, tokenizer ValueTokenizerFunc) bool {
 	sets := buildRowMatchSets(value, delimiter, tokenizer, rowQueryNeeds{
 		fieldTokenPaths: map[string]struct{}{fieldPath: {}},
 	})
@@ -402,21 +402,9 @@ func TestGJSONForFieldToken(value gjson.Result, fieldPath, delimiter, token stri
 	return ok
 }
 
-// TestJSONForBloomCondition tests a JSON document against a single bloom condition.
-func TestJSONForBloomCondition(jsonBytes []byte, condition *BloomCondition, delimiter string, tokenizer ValueTokenizerFunc) bool {
-	if condition == nil {
-		return true
-	}
-	expression := &BloomExpression{
-		ExpressionType: BloomExpressionCondition,
-		Condition:      condition,
-	}
-	return TestJSONForBloomQuery(jsonBytes, &BloomQuery{Expression: expression}, delimiter, tokenizer)
-}
-
-// TestJSONForBloomQuery tests a JSON document against a bloom query.
-func TestJSONForBloomQuery(jsonBytes []byte, bloomQuery *BloomQuery, delimiter string, tokenizer ValueTokenizerFunc) bool {
-	return TestGJSONForQuery(gjson.ParseBytes(jsonBytes), bloomQuery, nil, delimiter, tokenizer)
+// testJSONForBloomQuery tests a JSON document against a bloom query.
+func testJSONForBloomQuery(jsonBytes []byte, bloomQuery *BloomQuery, delimiter string, tokenizer ValueTokenizerFunc) bool {
+	return testGJSONForQuery(gjson.ParseBytes(jsonBytes), bloomQuery, nil, delimiter, tokenizer)
 }
 
 type compiledRegexCondition struct {
@@ -434,7 +422,7 @@ type compiledRegexQuery struct {
 	expression *compiledRegexExpression
 }
 
-func CompileRegexQuery(regexQuery *RegexQuery) (*compiledRegexQuery, error) {
+func compileRegexQuery(regexQuery *RegexQuery) (*compiledRegexQuery, error) {
 	if regexQuery == nil || regexQuery.Expression == nil {
 		return nil, nil
 	}
@@ -487,10 +475,10 @@ func compileRegexExpression(expression *RegexExpression) (*compiledRegexExpressi
 	}
 }
 
-// TestGJSONForQuery tests a parsed row against a query's bloom and regex
+// testGJSONForQuery tests a parsed row against a query's bloom and regex
 // expressions. The row is enumerated once through the shared walker into
 // per-row match sets, then each expression tree is evaluated against them.
-func TestGJSONForQuery(value gjson.Result, bloomQuery *BloomQuery, regexQuery *compiledRegexQuery, delimiter string, tokenizer ValueTokenizerFunc) bool {
+func testGJSONForQuery(value gjson.Result, bloomQuery *BloomQuery, regexQuery *compiledRegexQuery, delimiter string, tokenizer ValueTokenizerFunc) bool {
 	var bloomExpression *BloomExpression
 	if bloomQuery != nil {
 		bloomExpression = bloomQuery.Expression
@@ -515,4 +503,9 @@ func TestGJSONForQuery(value gjson.Result, bloomQuery *BloomQuery, regexQuery *c
 		return false
 	}
 	return true
+}
+
+// makeFieldTokenKey creates a key for field-token bloom filter entries
+func makeFieldTokenKey(field, token string) string {
+	return field + "::" + token
 }

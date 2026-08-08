@@ -97,8 +97,8 @@ func TestQueryExpressionJSONRoundTrip(t *testing.T) {
 		{`{"other":"x","message":"timeout"}`, false},
 	}
 	for _, c := range bloomCases {
-		originalGot := TestJSONForBloomQuery([]byte(c.row), original.Bloom, ".", BasicWhitespaceLowerTokenizer)
-		decodedGot := TestJSONForBloomQuery([]byte(c.row), decoded.Bloom, ".", BasicWhitespaceLowerTokenizer)
+		originalGot := testJSONForBloomQuery([]byte(c.row), original.Bloom, ".", BasicWhitespaceLowerTokenizer)
+		decodedGot := testJSONForBloomQuery([]byte(c.row), decoded.Bloom, ".", BasicWhitespaceLowerTokenizer)
 		if originalGot != c.want {
 			t.Fatalf("bloom %s: original evaluated to %v, want %v", c.row, originalGot, c.want)
 		}
@@ -108,11 +108,11 @@ func TestQueryExpressionJSONRoundTrip(t *testing.T) {
 	}
 
 	// Regex semantics over sample rows.
-	originalRegex, err := CompileRegexQuery(original.Regex)
+	originalRegex, err := compileRegexQuery(original.Regex)
 	if err != nil {
 		t.Fatalf("failed to compile original regex query: %v", err)
 	}
-	decodedRegex, err := CompileRegexQuery(decoded.Regex)
+	decodedRegex, err := compileRegexQuery(decoded.Regex)
 	if err != nil {
 		t.Fatalf("failed to compile decoded regex query: %v", err)
 	}
@@ -126,8 +126,8 @@ func TestQueryExpressionJSONRoundTrip(t *testing.T) {
 	}
 	for _, c := range regexCases {
 		row := gjson.Parse(c.row)
-		originalGot := TestGJSONForQuery(row, nil, originalRegex, ".", BasicWhitespaceLowerTokenizer)
-		decodedGot := TestGJSONForQuery(row, nil, decodedRegex, ".", BasicWhitespaceLowerTokenizer)
+		originalGot := testGJSONForQuery(row, nil, originalRegex, ".", BasicWhitespaceLowerTokenizer)
+		decodedGot := testGJSONForQuery(row, nil, decodedRegex, ".", BasicWhitespaceLowerTokenizer)
 		if originalGot != c.want {
 			t.Fatalf("regex %s: original evaluated to %v, want %v", c.row, originalGot, c.want)
 		}

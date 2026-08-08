@@ -257,9 +257,9 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 7A: slog injection; stdout eliminated | Missing: implementation + grep gate. |
-| Incomplete | Work | 7B: API surface pruned | Missing: diff + `go vet`/apidiff note. |
-| Incomplete | Work | 7C: Public footer/block reader in file_format.go; single block-read implementation | Missing: implementation + external-store usage example. |
-| Incomplete | Work | 7D: Engine file split | Missing: mechanical refactor, suite green. |
-| Incomplete | Work | 7E: README/PERFORMANCE truth pass + Example funcs | Missing: doc diff + compiling examples. |
-| Incomplete | Gate | Docs verifiable; examples compile; no stdout | Missing: doc test + grep gate run. |
+| Complete | Work | 7A: slog injection; stdout eliminated | `Config.Logger` (nil → discard); all ~25 printf sites replaced/deleted; merge summary gated on `Enabled(Debug)`; grep gate zero `fmt.Print` in non-test files (coordinator-verified); output-checked `Example` enforces silence. |
+| Complete | Work | 7B: API surface pruned | `TestJSONFor*`/`CompileRegexQuery`/`Send*WithContext` unexported; utils.go, `NullDataStore`, `MaybeFile.Size`, `PrintFiles` deleted (zero references, reviewer-grepped); `NullMetaStore` → test file; deadcode reports only the intentional prefilter-translation surface. |
+| Complete | Work | 7C: Public footer/block reader in file_format.go | `WriteFileFooter` + `ReadFileMetadata` (v1+v2 dispatch) public; FS store is a consumer; `BlockRowScanner`/`ReadDataBlockRowData` exported; miss-path allocs held at 516 (regression caught and fixed pre-review). |
+| Complete | Work | 7D: Engine file split | bloom_tree_engine.go → engine.go/ingest.go/flush.go/query_exec.go/merge.go; purity proven by reviewer (42 function bodies extracted and diffed; every delta attributed to 7A/7B/7C). |
+| Complete | Work | 7E: README/PERFORMANCE truth pass + Example funcs | README rewritten; claim-by-claim audit (25+ mappings) independently verified by reviewer — "nothing false"; TTL/CoordinatedMetaStore/distributed marked not-implemented; PERFORMANCE.md lead table measured (baseline binary rebuilt from commit 2393763, same machine/day); FILE_FORMAT.md public-API section. |
+| Complete | Gate | Docs verifiable; examples compile; no stdout | `go test -race -count=1 ./...` ok (8.0s, coordinator-verified); grep gate 0; output-checked Example passes; benchmarks neutral (geomean +0.1%, allocs bit-identical, reviewer-interleaved). One review round, approve with four one-line doc fixes landed. |

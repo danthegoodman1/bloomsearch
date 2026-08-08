@@ -15,7 +15,7 @@ import (
 
 // TestCompiledMatcherEquivalence differentially tests the compiled per-query
 // matcher (the engine's scan path) against the set-based reference
-// (buildRowMatchSets via TestGJSONForQuery): every (row, query) pair must get
+// (buildRowMatchSets via testGJSONForQuery): every (row, query) pair must get
 // the identical verdict from both, under the fast-path tokenizer and a custom
 // one. Rows come from the property-test corpus plus handcrafted case-folding
 // and structure edge cases; queries are derived from the rows (so both hit and
@@ -152,7 +152,7 @@ func TestCompiledMatcherEquivalence(t *testing.T) {
 
 	for _, tok := range tokenizers {
 		for _, nq := range queries {
-			compiledRegex, err := CompileRegexQuery(nq.query.Regex)
+			compiledRegex, err := compileRegexQuery(nq.query.Regex)
 			if err != nil {
 				t.Fatalf("[%s] %s: failed to compile regex query: %v", tok.name, nq.description, err)
 			}
@@ -160,7 +160,7 @@ func TestCompiledMatcherEquivalence(t *testing.T) {
 			scratch := newRowMatchScratch(matcher)
 
 			for i, rowBytes := range rowBytesList {
-				want := TestGJSONForQuery(gjson.ParseBytes(rowBytes), nq.query.Bloom, compiledRegex, ".", tok.fn)
+				want := testGJSONForQuery(gjson.ParseBytes(rowBytes), nq.query.Bloom, compiledRegex, ".", tok.fn)
 				got := matcher.matchRowBytes(rowBytes, scratch)
 				if got != want {
 					t.Fatalf("[%s] verdict mismatch for %s on row %d:\ncompiled=%v reference=%v\nrow: %s",
@@ -197,7 +197,7 @@ func TestFieldTokenJoinedKeyCollisionPinned(t *testing.T) {
 	)).Build()
 
 	// The reference accepts via the joined-key collision.
-	if !TestGJSONForQuery(gjson.ParseBytes(rowBytes), collision.Bloom, nil, ".", BasicWhitespaceLowerTokenizer) {
+	if !testGJSONForQuery(gjson.ParseBytes(rowBytes), collision.Bloom, nil, ".", BasicWhitespaceLowerTokenizer) {
 		t.Fatal("reference no longer exhibits the joined-key collision; update the carve-out documentation if this is intentional")
 	}
 	// The compiled matcher compares (path, token) pairs and rejects.
@@ -226,7 +226,7 @@ func TestFieldTokenJoinedKeyCollisionPinned(t *testing.T) {
 // TestMatchedRowNoAliasing guards the unsafe-view design of the scan path:
 // matching parses a zero-copy view of the block buffer, but delivered maps
 // must be materialized from an independent copy. Rows are scanned and
-// materialized exactly as processDataBlock does (blockRowScanner →
+// materialized exactly as processDataBlock does (BlockRowScanner →
 // matchRowBytes → materializeRow), then the entire block buffer is overwritten
 // (simulating release/reuse) and the delivered maps must be unchanged.
 func TestMatchedRowNoAliasing(t *testing.T) {
@@ -262,9 +262,9 @@ func TestMatchedRowNoAliasing(t *testing.T) {
 	scratch := newRowMatchScratch(matcher)
 
 	var delivered []map[string]any
-	scanner := blockRowScanner{data: blockBuf}
+	scanner := NewBlockRowScanner(blockBuf)
 	for {
-		rowBytes, ok, err := scanner.next()
+		rowBytes, ok, err := scanner.Next()
 		if err != nil {
 			t.Fatalf("scanner error: %v", err)
 		}

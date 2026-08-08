@@ -5,17 +5,16 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	bloomsearch "github.com/danthegoodman1/bloomsearch"
 )
 
 // Example mirrors the README quick start: ingest rows, flush them to durable
-// storage, then stream the matching rows back through the query cursor.
-//
-// The example is compile-checked rather than output-checked (no Output
-// comment): the engine currently logs progress to stdout, which would
-// interleave with the example's own output. Phase 7 moves engine logging to
-// an injectable slog.Logger, after which this example can assert its output.
+// storage, then stream the matching rows back through the query cursor. The
+// engine is silent by default (diagnostics go to the discard logger unless
+// BloomSearchEngineConfig.Logger is set), so the output below is exactly what
+// the example itself prints.
 func Example() {
 	dir, err := os.MkdirTemp("", "bloomsearch-example")
 	if err != nil {
@@ -73,7 +72,15 @@ func Example() {
 	stats := results.Stats()
 	fmt.Printf("scanned %d rows across %d blocks\n", stats.RowsScanned, stats.BlocksProcessed)
 
-	if err := engine.Stop(ctx); err != nil {
+	// Stop with a deadline: ctx expiry is the only way a wedged shutdown
+	// aborts.
+	stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := engine.Stop(stopCtx); err != nil {
 		log.Fatal(err)
 	}
+
+	// Output:
+	// auth login timeout for user
+	// scanned 2 rows across 1 blocks
 }

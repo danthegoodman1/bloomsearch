@@ -401,7 +401,7 @@ func TestV2FormatRoundTrip(t *testing.T) {
 	}
 	datPath := string(written[0].PointerBytes)
 
-	readBack, _, err := dataStore.readFileMetadata(datPath)
+	readBack, err := dataStore.readFileMetadata(datPath)
 	if err != nil {
 		t.Fatalf("failed to read metadata back: %v", err)
 	}
@@ -488,14 +488,14 @@ func TestV2FormatRoundTrip(t *testing.T) {
 
 	t.Run("corrupt file filter section", func(t *testing.T) {
 		_, corruptPath := corruptAt(t, fileFilterOffset)
-		if _, _, err := dataStore.readFileMetadata(corruptPath); err == nil {
+		if _, err := dataStore.readFileMetadata(corruptPath); err == nil {
 			t.Fatalf("expected error reading metadata with corrupt file filter section")
 		}
 	})
 
 	t.Run("corrupt metadata JSON", func(t *testing.T) {
 		_, corruptPath := corruptAt(t, metadataOffset)
-		if _, _, err := dataStore.readFileMetadata(corruptPath); err == nil {
+		if _, err := dataStore.readFileMetadata(corruptPath); err == nil {
 			t.Fatalf("expected error reading corrupt metadata")
 		}
 	})
@@ -553,7 +553,7 @@ func TestOversizeRowLengthRejected(t *testing.T) {
 	// Locate the row data start from the (valid) metadata and stamp an
 	// absurd length into the first row's prefix.
 	store := NewFileSystemDataStore(dir)
-	metadata, _, err := store.readFileMetadata(path)
+	metadata, err := store.readFileMetadata(path)
 	if err != nil {
 		t.Fatalf("failed to read v1 metadata: %v", err)
 	}

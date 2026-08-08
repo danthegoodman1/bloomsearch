@@ -2,7 +2,6 @@ package bloomsearch
 
 import (
 	"context"
-	"fmt"
 	"sync"
 )
 
@@ -63,24 +62,4 @@ func (s *MemoryMetaStore) GetMaybeFilesForQuery(ctx context.Context, prefilter *
 	}
 
 	return result, nil
-}
-
-// PrintFiles prints all files in the metastore for debugging
-func (s *MemoryMetaStore) PrintFiles() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	fmt.Println("Files in metastore:")
-	for pointer, metadata := range s.files {
-		fmt.Printf("  File: %s\n", pointer)
-		fmt.Printf("    DataBlocks: %d\n", len(metadata.DataBlocks))
-		for i, block := range metadata.DataBlocks {
-			fmt.Printf("      Block %d: Partition=%s, Size=%d, Rows=%d",
-				i, block.PartitionID, block.Size, block.Rows)
-			if len(block.MinMaxIndexes) > 0 {
-				fmt.Printf(", MinMax=%v", block.MinMaxIndexes)
-			}
-			fmt.Println()
-		}
-	}
 }

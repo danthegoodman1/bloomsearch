@@ -22,7 +22,10 @@ type MetaStore interface {
 	// indexes, data blocks missing that metadata are excluded.
 	GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error)
 
-	// Update atomically performes a set of operations on the MetaStore.
+	// Update atomically performs a set of operations on the MetaStore. The
+	// engine only calls Update after the corresponding DataStore writes have
+	// been durably published (writer.Close succeeded), so a committed pointer
+	// always references a complete file.
 	Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error
 }
 
@@ -41,18 +44,4 @@ type MaybeFile struct {
 	PointerBytes []byte
 	// The FileMetadata.DataBlocks may choose to be a filtered list instead of the full list of data blocks
 	Metadata FileMetadata
-	// The size of the file in bytes
-	Size int
-}
-
-// TESTING
-
-type NullMetaStore struct{}
-
-func (n *NullMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
-	return nil, nil
-}
-
-func (n *NullMetaStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {
-	return nil
 }

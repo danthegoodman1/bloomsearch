@@ -113,6 +113,159 @@ func FileMetadataFromBytesWithHash(bytes []byte, expectedHashBytes []byte) (*Fil
 	return &metadata, nil
 }
 
+// WriteFileFooter completes a bloom file by writing the v2 footer to w: the
+// file-level filter section (binary, see encodeFilterSection), the metadata
+// JSON — which carries no filter bytes, only the section's size — its CRC32C
+// and length, the file version, and the magic bytes. The engine calls it
+// after the last data block. It covers the footer only: data blocks (and
+// their filter sections) are written by the engine, so producing whole files
+// outside the engine still requires it.
+func WriteFileFooter(w io.Writer, metadata *FileMetadata) error {
+	// Write the file-level filter section
+	filterSection, err := encodeFilterSection(&metadata.BloomFilters)
+	if err != nil {
+		return fmt.Errorf("failed to encode file bloom filters: %w", err)
+	}
+	if _, err := w.Write(filterSection); err != nil {
+		return fmt.Errorf("failed to write file bloom filters: %w", err)
+	}
+
+	// Write file metadata
+	metadataBytes, err := json.Marshal(fileMetadataV2JSON{
+		BloomFalsePositiveRate: metadata.BloomFalsePositiveRate,
+		BloomEntryCounts:       metadata.BloomEntryCounts,
+		FileFilterSectionSize:  len(filterSection),
+		DataBlocks:             metadata.DataBlocks,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal file metadata: %w", err)
+	}
+	if _, err := w.Write(metadataBytes); err != nil {
+		return fmt.Errorf("failed to write file metadata: %w", err)
+	}
+
+	metadataHashBytes := make([]byte, HashSize)
+	binary.LittleEndian.PutUint32(metadataHashBytes, crc32.Checksum(metadataBytes, crc32cTable))
+	if _, err := w.Write(metadataHashBytes); err != nil {
+		return fmt.Errorf("failed to write file metadata hash: %w", err)
+	}
+
+	// Write metadata length
+	metadataLengthBytes := make([]byte, LengthPrefixSize)
+	binary.LittleEndian.PutUint32(metadataLengthBytes, uint32(len(metadataBytes)))
+	if _, err := w.Write(metadataLengthBytes); err != nil {
+		return fmt.Errorf("failed to write file metadata length: %w", err)
+	}
+
+	// Write version
+	versionBytes := make([]byte, VersionPrefixSize)
+	binary.LittleEndian.PutUint32(versionBytes, FileVersion)
+	if _, err := w.Write(versionBytes); err != nil {
+		return fmt.Errorf("failed to write file version: %w", err)
+	}
+
+	// Write magic bytes
+	if _, err := w.Write([]byte(MagicBytes)); err != nil {
+		return fmt.Errorf("failed to write magic bytes: %w", err)
+	}
+
+	return nil
+}
+
+// ReadFileMetadata locates, verifies, and decodes a bloom file's footer,
+// returning the file's metadata (with the file-level bloom filters decoded
+// into FileMetadata.BloomFilters) and the file's total size in bytes. It
+// dispatches on the footer's version field and reads both v1 and v2 files, so
+// external DataStore/MetaStore implementations can parse bloom files without
+// reimplementing the footer framing. r's seek position on return is
+// unspecified.
+func ReadFileMetadata(r io.ReadSeeker) (*FileMetadata, int64, error) {
+	fileSize, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to determine file size: %w", err)
+	}
+
+	// The fixed-size footer tail, read in one shot:
+	// [metadata hash][metadata length][version][magic bytes]
+	footer := make([]byte, HashSize+LengthPrefixSize+VersionPrefixSize+len(MagicBytes))
+	if fileSize < int64(len(footer)) {
+		return nil, 0, fmt.Errorf("file (%d bytes) is too small to be a valid bloom file", fileSize)
+	}
+	if err := readFullAt(r, footer, fileSize-int64(len(footer))); err != nil {
+		return nil, 0, fmt.Errorf("failed to read file footer: %w", err)
+	}
+
+	if string(footer[len(footer)-len(MagicBytes):]) != MagicBytes {
+		return nil, 0, errors.New("invalid magic bytes")
+	}
+	version := binary.LittleEndian.Uint32(footer[HashSize+LengthPrefixSize:])
+	metadataLength := binary.LittleEndian.Uint32(footer[HashSize:])
+	metadataHashBytes := footer[:HashSize]
+
+	metadataOffset := fileSize - int64(len(footer)) - int64(metadataLength)
+	if metadataOffset < 0 {
+		return nil, 0, fmt.Errorf("metadata length %d exceeds file size %d", metadataLength, fileSize)
+	}
+	metadataBytes := make([]byte, metadataLength)
+	if err := readFullAt(r, metadataBytes, metadataOffset); err != nil {
+		return nil, 0, fmt.Errorf("failed to read metadata: %w", err)
+	}
+
+	// Parse and verify metadata, dispatching on the file version.
+	switch version {
+	case FileVersionV1:
+		// v1: the file-level bloom filters are embedded in the metadata JSON.
+		metadata, err := FileMetadataFromBytesWithHash(metadataBytes, metadataHashBytes)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to parse metadata: %w", err)
+		}
+		return metadata, fileSize, nil
+
+	case FileVersionV2:
+		// v2: the metadata JSON carries no filter bytes; the file-level
+		// filters live in a binary section immediately preceding it.
+		metadataV2, err := fileMetadataV2FromBytesWithHash(metadataBytes, metadataHashBytes)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to parse metadata: %w", err)
+		}
+
+		metadata := &FileMetadata{
+			BloomFalsePositiveRate: metadataV2.BloomFalsePositiveRate,
+			BloomEntryCounts:       metadataV2.BloomEntryCounts,
+			DataBlocks:             metadataV2.DataBlocks,
+		}
+
+		if metadataV2.FileFilterSectionSize < 0 || int64(metadataV2.FileFilterSectionSize) > metadataOffset {
+			return nil, 0, fmt.Errorf("invalid file filter section size %d", metadataV2.FileFilterSectionSize)
+		}
+		if metadataV2.FileFilterSectionSize > 0 {
+			filterSection := make([]byte, metadataV2.FileFilterSectionSize)
+			if err := readFullAt(r, filterSection, metadataOffset-int64(metadataV2.FileFilterSectionSize)); err != nil {
+				return nil, 0, fmt.Errorf("failed to read file bloom filters: %w", err)
+			}
+			filters, err := parseFilterSection(filterSection)
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to parse file bloom filters: %w", err)
+			}
+			metadata.BloomFilters = *filters
+		}
+
+		return metadata, fileSize, nil
+
+	default:
+		return nil, 0, fmt.Errorf("unsupported file version %d", version)
+	}
+}
+
+// readFullAt seeks to off and fills buf.
+func readFullAt(r io.ReadSeeker, buf []byte, off int64) error {
+	if _, err := r.Seek(off, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := io.ReadFull(r, buf)
+	return err
+}
+
 // fileMetadataV2FromBytesWithHash verifies and decodes a v2 metadata payload
 // (JSON without filter bytes). The caller resolves the file filter section
 // via FileFilterSectionSize.
@@ -395,12 +548,13 @@ func decodeBlockRowDataInto(dst []byte, compressed []byte, block *DataBlockMetad
 	}
 }
 
-// readBlockRowData reads a block's compressed row data fully (bounded by the
-// block's metadata Size) and returns the verified, decompressed row bytes;
-// see decodeBlockRowData for the verification order and bounds. The returned
+// ReadDataBlockRowData reads a block's compressed row data fully (bounded by
+// the block's metadata Size) and returns the verified, decompressed row bytes
+// — length-prefixed rows, iterated with a BlockRowScanner; see
+// decodeBlockRowData for the verification order and bounds. The returned
 // buffer is plainly allocated and safe to retain (the merge path retains
 // views into it via custom-tokenizer output; see bloomEntrySets.indexRow).
-func readBlockRowData(file io.ReadSeeker, block *DataBlockMetadata) ([]byte, error) {
+func ReadDataBlockRowData(file io.ReadSeeker, block *DataBlockMetadata) ([]byte, error) {
 	compressedSize := block.Size - block.BloomFiltersSize
 	if block.BloomFiltersSize < 0 || compressedSize < 0 {
 		return nil, fmt.Errorf("invalid block sizes (size %d, bloom filter section %d)", block.Size, block.BloomFiltersSize)
@@ -417,15 +571,15 @@ func readBlockRowData(file io.ReadSeeker, block *DataBlockMetadata) ([]byte, err
 	return decodeBlockRowData(compressed, block)
 }
 
-// readPooledBlockRowData is readBlockRowData with both the compressed and
+// readPooledBlockRowData is ReadDataBlockRowData with both the compressed and
 // decompressed buffers drawn from the scan buffer pool. The caller must call
 // release exactly once, only after no view into the returned buffer can be
 // dereferenced again: the buffer will be handed to another block scan and
 // overwritten. The query scan path qualifies — row matching parses transient
 // views and delivered rows are materialized from independent copies — which is
 // exactly what TestMatchedRowNoAliasing guards. The merge path must keep using
-// readBlockRowData: its entry-set indexing can retain custom-tokenizer output
-// aliasing the buffer.
+// ReadDataBlockRowData: its entry-set indexing can retain custom-tokenizer
+// output aliasing the buffer.
 func readPooledBlockRowData(file io.ReadSeeker, block *DataBlockMetadata) (rowData []byte, release func(), err error) {
 	compressedSize := block.Size - block.BloomFiltersSize
 	if block.BloomFiltersSize < 0 || compressedSize < 0 {
@@ -468,19 +622,25 @@ func readPooledBlockRowData(file io.ReadSeeker, block *DataBlockMetadata) (rowDa
 	return rowData, func() { putScanBuffer(rowData) }, nil
 }
 
-// blockRowScanner iterates the length-prefixed rows of a decoded row data
-// section. Every row is a subslice of the section — no per-row allocation —
-// and row lengths are validated against the remaining data, so a corrupt
-// length prefix produces an error instead of an oversized read.
-type blockRowScanner struct {
+// BlockRowScanner iterates the length-prefixed rows of a decoded row data
+// section (as returned by ReadDataBlockRowData). Every row is a subslice of
+// the section — no per-row allocation — and row lengths are validated against
+// the remaining data, so a corrupt length prefix produces an error instead of
+// an oversized read.
+type BlockRowScanner struct {
 	data []byte
 	pos  int
 }
 
-// next returns the next row's bytes. ok is false once the section is
-// exhausted; a malformed length prefix or a row length exceeding the
-// remaining data returns an error.
-func (s *blockRowScanner) next() (row []byte, ok bool, err error) {
+// NewBlockRowScanner returns a scanner over a decoded row data section.
+func NewBlockRowScanner(rowData []byte) *BlockRowScanner {
+	return &BlockRowScanner{data: rowData}
+}
+
+// Next returns the next row's bytes (a subslice of the section, valid as long
+// as the section is). ok is false once the section is exhausted; a malformed
+// length prefix or a row length exceeding the remaining data returns an error.
+func (s *BlockRowScanner) Next() (row []byte, ok bool, err error) {
 	if s.pos == len(s.data) {
 		return nil, false, nil
 	}

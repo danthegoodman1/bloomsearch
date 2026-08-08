@@ -349,7 +349,7 @@ func newRowMatchScratch(m *compiledRowMatcher) *rowMatchScratch {
 }
 
 // compileRowMatcher compiles the row-level bloom and regex expressions of a
-// query. regexQuery must already be pattern-compiled (CompileRegexQuery).
+// query. regexQuery must already be pattern-compiled (compileRegexQuery).
 func compileRowMatcher(bloomQuery *BloomQuery, regexQuery *compiledRegexQuery, delimiter string, tokenizer ValueTokenizerFunc) *compiledRowMatcher {
 	m := &compiledRowMatcher{
 		delimiter:  delimiter,

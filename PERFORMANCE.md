@@ -1,447 +1,56 @@
-# Performance Testing
+# Performance
 
-## Phase 6 hot-path results (benchstat, interleaved before/after)
-
-`go test -bench` suite (`bench_test.go`), 4 interleaved runs per side on an M3 Max
-(baseline = Phase 5 HEAD 9bd6a6c, new = compiled row matcher + entry-set scratch
-reuse + pooled codecs/buffers + batched row delivery):
+Measured with the committed benchmark suite (`bench_test.go`):
 
 ```
-                       │  baseline   │      phase 6        vs base
-                       │   sec/op    │   sec/op
-Ingest-16                3.974µ ± ∞    3.315µ ± ∞   -16.58% (p=0.029 n=4)
-QueryFieldTokenHit-16    7.042m ± ∞    3.481m ± ∞   -50.57% (p=0.029 n=4)
-QueryTokenMiss-16        268.6µ ± ∞    271.2µ ± ∞         ~ (p=0.886 n=4)
-QueryRegex-16           10.232m ± ∞    4.149m ± ∞   -59.45% (p=0.029 n=4)
-Merge-16                 28.94m ± ∞    28.79m ± ∞         ~ (p=0.886 n=4)
-
-                       │  allocs/op  │  allocs/op
-Ingest-16                 50.00 ± ∞     21.00 ± ∞   -58.00% (p=0.029 n=4)
-QueryFieldTokenHit-16   264.46k ± ∞    68.58k ± ∞   -74.07% (p=0.029 n=4)
-QueryTokenMiss-16         512.0 ± ∞     516.0 ± ∞    +0.78% (p=0.029 n=4)
-QueryRegex-16           360.85k ± ∞    64.62k ± ∞   -82.09% (p=0.029 n=4)
-Merge-16                 84.89k ± ∞    12.84k ± ∞   -84.88% (p=0.029 n=4)
-
-                       │    B/op     │    B/op
-Ingest-16               2.006Ki ± ∞   1.129Ki ± ∞   -43.71% (p=0.029 n=4)
-QueryFieldTokenHit-16  26.956Mi ± ∞   7.652Mi ± ∞   -71.61% (p=0.029 n=4)
-QueryTokenMiss-16       382.8Ki ± ∞   381.1Ki ± ∞    -0.46% (p=0.029 n=4)
-QueryRegex-16          47.211Mi ± ∞   7.529Mi ± ∞   -84.05% (p=0.029 n=4)
-Merge-16                6.812Mi ± ∞   3.605Mi ± ∞   -47.08% (p=0.029 n=4)
+go test -bench=. -benchmem -run='^$'
 ```
 
-Ingest throughput metric: 251.7k → 301.7k rows/s (+19.9%). The
-`TestPropertyNoFalseNegatives` end-to-end property test (thousands of derived
-queries) runs ~0.57s → ~0.48s.
+## Results (August 2026)
 
-## Earlier exploration
+Apple M3 Max (darwin/arm64), Go 1.26, 2-3 sequential runs per side (the
+deltas of 2.4×-262× dwarf the <1% run-to-run variance). "v1 baseline" is the
+pre-overhaul engine at the commit that recorded it (`2393763`, JSON bloom
+encoding, filters sized from configured guesses); "current" is the v2 engine
+(measured filter sizing, binary format, compiled row matcher, pooled codecs),
+both run on the same machine on the same day.
 
-I've explored using:
+| Benchmark               | v1 baseline        | current            | time        |
+| ----------------------- | ------------------ | ------------------ | ----------- |
+| `Ingest` (per row)      | 8.1µs, 104 allocs  | 3.3µs, 21 allocs   | −59% (2.4×) |
+| `QueryFieldTokenHit`    | 79.9ms, 264k allocs| 3.5ms, 68.6k allocs| −96% (23×)  |
+| `QueryTokenMiss`        | 69.9ms, 689 allocs | 0.27ms, 516 allocs | −99.6% (262×) |
+| `QueryRegex`            | 79.9ms, 269k allocs| 4.1ms, 64.6k allocs| −95% (19×)  |
+| `Merge`                 | 54.2ms, 10.3k allocs| 29.3ms, 12.8k allocs| −46% (1.8×) |
 
-1. Per-file concurrency instead of per-block
-2. Alterantive JSON serialization
-3. Buffered IO for the FileStore implementation
+Benchmark shapes: queries scan a 10-file × 2,000-row dataset
+(`QueryFieldTokenHit` matches ~20% of rows, `QueryTokenMiss` matches nothing,
+`QueryRegex` is a bloom-narrowed regex final filter); `Merge` combines 6
+files × 500 rows; `Ingest` measures end-to-end batches of 100 through the
+public API (~300k rows/s single-actor).
 
-And did not see any performance gains outside of error, often seeing reduced performance.
+The `QueryTokenMiss` delta is the hierarchical index working: file-level bloom
+filters disqualify every file, so the query reads no block data at all. In the
+v1 baseline the same query scanned all 20,000 rows because saturated filters
+pruned nothing. Merge allocations rose vs the baseline because merge now
+verifies every source block (CRC + decompression bounds) and rebuilds filters
+from row data rather than OR-ing bits.
 
-## Primitive test
+**Storage**: the v2 binary filter encoding plus measured sizing cut the
+benchmark dataset's files from 882KB to 120KB each (−86.3%) versus v1's
+JSON+base64 filters sized from configured guesses.
 
-Uncompressed, query concurrency 100, M3 Max 128GB, 1.6GB dataset (~167MB per file * 10)
+## Methodology
 
-Random 00-09 partitions, no minmax indexes, testing FileStore for DataStore + MetaStore
+Comparisons are made with `benchstat` over interleaved runs of two compiled
+test binaries (before/after), `-count=3` or more per side, on an otherwise
+idle machine, so machine drift lands on both sides. Per-phase benchstat
+reports (with p-values) are recorded in the git history of this file and in
+PLAN.md's status ledgers.
 
-### Token search
+## History
 
-Search for `apple` as a token in any field:
-
-```
-=== Query Results: token_match ===
-Total query time: 649.983542ms
-Blocks processed: 100
-Total rows processed: 11214340
-Total bytes processed: 1.6 GB
-Results returned: 1
-System throughput: 17080402 rows/sec, 2.5 GB/sec
-Concurrency factor: 51.3x (combined worker time: 33.342631585s)
-Query selectivity: 0.00% (1 results / 11214340 rows)
-
---- Found Results ---
-Result 1: {
-  "SbdXwyPEKen": [
-    "UdoPpw"
-  ],
-  "b9DVOMloi": "aPplE", <-- "apple" when lowercase
-  "loJ7iQtrw": [
-    "H41F3mi",
-    "Xr9J",
-    "n0DQx"
-  ]
-}
-```
-
-### Field search
-
-Searching for field `SbdXwyPEKen`
-
-```
-=== Query Results: field_match ===
-Total query time: 638.450959ms
-Blocks processed: 100
-Total rows processed: 11214340
-Total bytes processed: 1.6 GB
-Results returned: 1
-System throughput: 17564920 rows/sec, 2.6 GB/sec
-Concurrency factor: 55.6x (combined worker time: 35.488950715s)
-Query selectivity: 0.00% (1 results / 11214340 rows)
-
---- Found Results ---
-Result 1: {
-  "SbdXwyPEKen": [
-    "UdoPpw"
-  ],
-  "b9DVOMloi": "aPplE",
-  "loJ7iQtrw": [
-    "H41F3mi",
-    "Xr9J",
-    "n0DQx"
-  ]
-}
-```
-
-### Field:Token search
-
-Search for `"b9DVOMloi": "aPplE"` field:token
-
-```
-=== Query Results: field_token_match ===
-Total query time: 667.9685ms
-Blocks processed: 100
-Total rows processed: 11214340
-  Block test_dat[123364032]: 187677.8 rows/s, 28.1 MB/s bytes/s, 112187 rows, 597.763792ms skipped=true
-Total bytes processed: 1.6 GB
-Results returned: 1
-System throughput: 16788726 rows/sec, 2.5 GB/sec
-Concurrency factor: 53.0x (combined worker time: 35.428038502s)
-Query selectivity: 0.00% (1 results / 11214340 rows)
-
---- Found Results ---
-Result 1: {
-  "SbdXwyPEKen": [
-    "UdoPpw"
-  ],
-  "b9DVOMloi": "aPplE",
-  "loJ7iQtrw": [
-    "H41F3mi",
-    "Xr9J",
-    "n0DQx"
-  ]
-}
-```
-
-### Throughput during flush
-
-Because flushing is handled by a dedicated goroutine, there is zero impact on ingestion rate:
-
-```
-Batch 446000: Generated 395.4 MB (38.6%), throughput: 13.4 MB/s
-Batch 448000: Generated 397.1 MB (38.8%), throughput: 13.4 MB/s
-FLUSH TRIGGER: Partition '04' hit max bytes (10485976 >= 10485760)
-FLUSH STARTING: 10 partitions, 1124400 total rows, 104504550 total bytes
-  Partition '07': 112079 rows, 10423227 bytes
-  Partition '00': 112185 rows, 10436494 bytes
-  Partition '02': 112827 rows, 10483631 bytes
-  Partition '01': 112149 rows, 10426135 bytes
-  Partition '05': 112386 rows, 10432702 bytes
-  Partition '09': 112699 rows, 10479087 bytes
-  Partition '06': 112284 rows, 10436478 bytes
-  Partition '04': 112813 rows, 10485976 bytes
-  Partition '08': 112412 rows, 10425104 bytes
-  Partition '03': 112566 rows, 10475716 bytes
-Batch 450000: Generated 398.9 MB (39.0%), throughput: 13.4 MB/s
-Batch 452000: Generated 400.7 MB (39.1%), throughput: 13.4 MB/s
-```
-
-## Primitive test (Snappy)
-
-Snappy query concurrency 100, M3 Max 128GB, 1.8GB dataset (~186MB per file * 10)
-
-### Token search ("taco")
-
-```
-=== Query Results: token_match ===
-Total query time: 728.656042ms
-Blocks processed: 100
-Total rows processed: 11212020
-Total bytes processed: 1.8 GB
-Results returned: 6
-System throughput: 15387260 rows/sec, 2.5 GB/sec
-Peak worker throughput: 958261 rows/sec, 158.1 MB/sec
-Concurrency factor: 51.2x (combined worker time: 37.334941618s)
-Query selectivity: 0.00% (6 results / 11212020 rows)
-
---- Found Results ---
-Result 1: {
-  "9kO": [
-    "sF1l",
-    "3wt3xAN"
-  ],
-  "MuSA53GrAf": "kcCZgBYEXGd",
-  "PjzOzduLekEp": "sGBvG1S8d",
-  "raB": [
-    "UEXOUwNOtz"
-  ],
-  "uUB1": [
-    "FUuj9PSs",
-    "TAcO",
-    "IhSZXh"
-  ]
-}
-Result 2: {
-  "3jal": [
-    "1l1pgZX5",
-    "QTQ"
-  ],
-  "9QFcEIL2LsEC": [
-    "xAjP1jW8",
-    "XQp",
-    "esYtAu8jQ"
-  ],
-  "Jc7E16nwFM": "6OMuS",
-  "pYxfh7wt": [
-    "TaCO"
-  ]
-}
-Result 3: {
-  "9mxnqrTj": [
-    "Qc8Dmwy7",
-    "01G5",
-    "AqfM"
-  ],
-  "DL5lI0nPA": [
-    "5oqO"
-  ],
-  "IVdolTU2ixm": [
-    "TAcO"
-  ]
-}
-Result 4: {
-  "1DeVxs": "zCq8Rj207iU",
-  "ZcXcbv9": [
-    "TACO",
-    "OPKQUBnB8I0"
-  ]
-}
-Result 5: {
-  "9GI0SGLt": "UneTkafr",
-  "Bx2": [
-    "SzR6zd7",
-    "ztKUq",
-    "NhfYFDz"
-  ],
-  "JZTTuGuBz": [
-    "tACO",
-    "I0I4RTvXB",
-    "wRV8NLFieWoI"
-  ],
-  "UzvfVoa0xA3c": [
-    "EwcVU6ybN"
-  ]
-}
-Result 6: {
-  "PfSrwgFMz3SU": [
-    "b3oZOGs",
-    "Hr4",
-    "3IAxepeyG9V9"
-  ],
-  "RnOgyeK0k8qd": [
-    "LAOdmZB93zi",
-    "RNj",
-    "UY7NL8eD"
-  ],
-  "SMkpswQ8RMZ": [
-    "GKZWfnETM"
-  ],
-  "kzL": "SFkhlt",
-  "o6tVhfN9": "taco"
-}
-✅ Query token_match completed successfully
-```
-
-### Field search ("SMkpswQ8RMZ")
-
-```
-=== Query Results: field_match ===
-Total query time: 656.878459ms
-Blocks processed: 100
-Total rows processed: 11212020
-Total bytes processed: 1.8 GB
-Results returned: 1
-System throughput: 17068637 rows/sec, 2.8 GB/sec
-Peak worker throughput: 1321213 rows/sec, 217.8 MB/sec
-Concurrency factor: 53.5x (combined worker time: 35.128201959s)
-Query selectivity: 0.00% (1 results / 11212020 rows)
-
---- Found Results ---
-Result 1: {
-  "PfSrwgFMz3SU": [
-    "b3oZOGs",
-    "Hr4",
-    "3IAxepeyG9V9"
-  ],
-  "RnOgyeK0k8qd": [
-    "LAOdmZB93zi",
-    "RNj",
-    "UY7NL8eD"
-  ],
-  "SMkpswQ8RMZ": [
-    "GKZWfnETM"
-  ],
-  "kzL": "SFkhlt",
-  "o6tVhfN9": "taco"
-}
-✅ Query field_match completed successfully
-```
-
-
-### Field Token `.FieldToken("SMkpswQ8RMZ", "gkzwfnetm")`
-
-```
-=== Query Results: field_token_match ===
-Total query time: 702.44675ms
-Blocks processed: 100
-Total rows processed: 11212020
-Total bytes processed: 1.8 GB
-Results returned: 1
-System throughput: 15961381 rows/sec, 2.6 GB/sec
-Peak worker throughput: 910399 rows/sec, 150.1 MB/sec
-Concurrency factor: 48.6x (combined worker time: 34.138204917s)
-Query selectivity: 0.00% (1 results / 11212020 rows)
-
---- Found Results ---
-Result 1: {
-  "PfSrwgFMz3SU": [
-    "b3oZOGs",
-    "Hr4",
-    "3IAxepeyG9V9"
-  ],
-  "RnOgyeK0k8qd": [
-    "LAOdmZB93zi",
-    "RNj",
-    "UY7NL8eD"
-  ],
-  "SMkpswQ8RMZ": [
-    "GKZWfnETM"
-  ],
-  "kzL": "SFkhlt",
-  "o6tVhfN9": "taco"
-}
-✅ Query field_token_match completed successfully
-```
-
-## Primitive test (ZSTD)
-
-ZSTD compression level 1, query concurrency 100, M3 Max 128GB, 1.3GB dataset (~137.6MB per file * 10)
-
-Random 00-09 partitions, no minmax indexes, testing FileStore for DataStore + MetaStore
-
-### Field search
-
-Searching for field `NOVNKQcRlOF5`
-
-```
-=== Query Results: field_match ===
-Total query time: 618.642042ms
-Blocks processed: 100
-Total rows processed: 11215240
-Total bytes processed: 1.3 GB
-Results returned: 1
-System throughput: 18128803 rows/sec, 2.2 GB/sec
-Peak worker throughput: 1440506 rows/sec, 177.0 MB/sec
-Concurrency factor: 52.9x (combined worker time: 32.696153084s)
-Query selectivity: 0.00% (1 results / 11215240 rows)
-
---- Found Results ---
-Result 1: {
-  "NOVNKQcRlOF5": "T8iJte",
-  "Qcunk": [
-    "VlH7V",
-    "mjxyN"
-  ],
-  "d8OwE": [
-    "uj5C3Cx4EDGX"
-  ],
-  "lMS5d9me": "jm8hz",
-  "ugS": [
-    "3WHJfFLG",
-    "TAcO"
-  ]
-}
-```
-
-### Token search
-
-Search for `t8ijte` as a token in any field:
-
-```
-=== Query Results: token_match ===
-Total query time: 639.600917ms
-Blocks processed: 100
-Total rows processed: 11215240
-Total bytes processed: 1.3 GB
-Results returned: 1
-System throughput: 17534747 rows/sec, 2.1 GB/sec
-Peak worker throughput: 1438881 rows/sec, 176.1 MB/sec
-Concurrency factor: 50.0x (combined worker time: 32.004213128s)
-Query selectivity: 0.00% (1 results / 11215240 rows)
-
---- Found Results ---
-Result 1: {
-  "NOVNKQcRlOF5": "T8iJte",
-  "Qcunk": [
-    "VlH7V",
-    "mjxyN"
-  ],
-  "d8OwE": [
-    "uj5C3Cx4EDGX"
-  ],
-  "lMS5d9me": "jm8hz",
-  "ugS": [
-    "3WHJfFLG",
-    "TAcO"
-  ]
-}
-```
-
-### Field:Token search
-
-Search for `"NOVNKQcRlOF5": "t8ijte"` field:token
-
-```
-=== Query Results: field_token_match ===
-Total query time: 639.403ms
-Blocks processed: 100
-Total rows processed: 11215240
-Total bytes processed: 1.3 GB
-Results returned: 1
-System throughput: 17540174 rows/sec, 2.1 GB/sec
-Peak worker throughput: 990409 rows/sec, 121.4 MB/sec
-Concurrency factor: 51.4x (combined worker time: 32.881143075s)
-Query selectivity: 0.00% (1 results / 11215240 rows)
-
---- Found Results ---
-Result 1: {
-  "NOVNKQcRlOF5": "T8iJte",
-  "Qcunk": [
-    "VlH7V",
-    "mjxyN"
-  ],
-  "d8OwE": [
-    "uj5C3Cx4EDGX"
-  ],
-  "lMS5d9me": "jm8hz",
-  "ugS": [
-    "3WHJfFLG",
-    "TAcO"
-  ]
-}
-```
+Results older than the August 2026 numbers above — including the 2023-era
+load-test transcripts that previously filled this file — predate the v2 file
+format, the measured filter sizing, and the cursor query API, and describe a
+design that no longer exists. See this file's git history for them.
