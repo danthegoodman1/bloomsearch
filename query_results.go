@@ -80,7 +80,7 @@ type Results struct {
 	rowsMatched atomic.Int64
 
 	mu         sync.Mutex
-	blockErrs  []error
+	errs       []error // recorded block-scan and MetaStore-iteration failures
 	blockStats []BlockStats
 	duration   time.Duration
 	finished   bool // all workers finished; duration frozen
@@ -121,9 +121,10 @@ func newResults(ctx context.Context) *Results {
 // calls keep returning false.
 //
 // Cancellation is terminal: after the Query context is canceled, Next returns
-// false promptly (bounded by the workers observing cancellation), rows
-// already buffered but not yet delivered are dropped, and Err returns the
-// context error.
+// false once the query pipeline — the file stage pulling from the MetaStore
+// iterator and the block workers — has observed the cancellation and exited
+// (bounded: see Close), rows already buffered but not yet delivered are
+// dropped, and Err returns the context error.
 func (r *Results) Next() bool {
 	if r.iterDone {
 		return false
@@ -147,10 +148,11 @@ func (r *Results) Next() bool {
 	case batch, ok := <-r.rowChan:
 		if !ok {
 			// Clean completion: all workers finished and every buffered row
-			// has been delivered. Block errors (if any) are the terminal
-			// state; the query deliberately continued past them because
-			// partial results are valuable for search.
-			r.finish(r.joinedBlockErrs())
+			// has been delivered. Recorded errors (failed blocks, a failed
+			// MetaStore iteration), if any, are the terminal state; the query
+			// deliberately continued past them because partial results are
+			// valuable for search.
+			r.finish(r.joinedErrs())
 			return false
 		}
 		// Workers only deliver non-empty batches.
@@ -174,10 +176,11 @@ func (r *Results) Row() map[string]any {
 // nil before then):
 //
 //   - nil on clean completion;
-//   - the per-block errors joined with errors.Join when blocks failed — a
-//     block failure records its error and the query continues with other
-//     blocks, so errors are surfaced here without discarding the partial
-//     results, and never silently dropped;
+//   - the recorded errors joined with errors.Join when parts of the query
+//     failed — a block-scan failure continues with the other blocks, and a
+//     MetaStore iteration failure stops pulling candidate files while
+//     already-dispatched blocks finish — so errors are surfaced here without
+//     discarding the partial results, and never silently dropped;
 //   - the Query context's error (matching errors.Is) when the query was
 //     canceled, so a canceled query is never mistaken for a complete one;
 //   - after a deliberate Close, whatever terminal state existed before Close
@@ -217,10 +220,12 @@ func (r *Results) Stats() QueryStats {
 }
 
 // Close terminates the query early: it cancels the query's internal context,
-// waits for the block workers to wind down (bounded — every internal send
-// honors that context, and global query-semaphore slots are released as the
-// workers exit), and freezes the terminal state. Close is idempotent, safe to
-// call concurrently with Next, and always returns nil: Close is not an error
+// waits for the query pipeline — the file stage pulling from the MetaStore
+// iterator and the block workers — to wind down (bounded: every internal
+// send honors that context, global query-semaphore slots are released as the
+// workers exit, and the MetaStore contract requires iterators to honor ctx),
+// and freezes the terminal state. Close is idempotent, safe to call
+// concurrently with Next, and always returns nil: Close is not an error
 // state, so a subsequent Err returns whatever terminal state existed before
 // Close (nil if none). A closed Results is not reusable.
 func (r *Results) Close() error {
@@ -228,7 +233,7 @@ func (r *Results) Close() error {
 		r.cancel()
 		<-r.done
 
-		err := r.joinedBlockErrs()
+		err := r.joinedErrs()
 		r.mu.Lock()
 		if !r.finalized {
 			r.finalized = true
@@ -240,8 +245,8 @@ func (r *Results) Close() error {
 }
 
 // terminate handles a Next that observed cancellation or Close: stop the
-// workers, wait for them to wind down (bounded — they honor the internal
-// context), and freeze the terminal state.
+// pipeline, wait for it to wind down (bounded — see Close), and freeze the
+// terminal state.
 func (r *Results) terminate() bool {
 	r.cancel()
 	<-r.done
@@ -250,8 +255,8 @@ func (r *Results) terminate() bool {
 	if cerr := r.callerCtx.Err(); cerr != nil {
 		err = fmt.Errorf("query canceled: %w", cerr)
 	} else {
-		// Close path: keep whatever block errors existed before Close.
-		err = r.joinedBlockErrs()
+		// Close path: keep whatever recorded errors existed before Close.
+		err = r.joinedErrs()
 	}
 	r.finish(err)
 	return false
@@ -273,10 +278,10 @@ func (r *Results) finish(err error) {
 	r.cancel()
 }
 
-func (r *Results) joinedBlockErrs() error {
+func (r *Results) joinedErrs() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return errors.Join(r.blockErrs...)
+	return errors.Join(r.errs...)
 }
 
 // deliver hands a non-empty batch of matched rows to the cursor, transferring
@@ -346,16 +351,25 @@ func (r *Results) recordBlockStats(stats BlockStats) {
 	r.mu.Unlock()
 }
 
-// recordBlockError records a block-processing failure. The query continues
-// with other blocks; the error surfaces from Err once iteration finishes.
-func (r *Results) recordBlockError(err error) {
+// recordQueryError records a failure the query survived — a MetaStore
+// iterator yielding an error mid-iteration stops further pulls while
+// already-dispatched block jobs finish and deliver their rows. The error
+// surfaces from Err, joined with any others, once iteration finishes.
+func (r *Results) recordQueryError(err error) {
 	r.mu.Lock()
-	r.blockErrs = append(r.blockErrs, err)
+	r.errs = append(r.errs, err)
 	r.mu.Unlock()
 }
 
+// recordBlockError records a block-processing failure. The query continues
+// with other blocks; the error surfaces from Err once iteration finishes.
+func (r *Results) recordBlockError(err error) {
+	r.recordQueryError(err)
+}
+
 // markWorkersDone freezes Duration and releases everything waiting on the
-// cursor: the row channel closes (Next drains any buffered rows, then reports
+// cursor once the query pipeline (file stage and block workers) has exited:
+// the row channel closes (Next drains any buffered rows, then reports
 // completion) and done closes (terminate and Close stop waiting).
 func (r *Results) markWorkersDone() {
 	r.mu.Lock()

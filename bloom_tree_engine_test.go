@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"strings"
 	"sync"
@@ -1605,7 +1606,7 @@ func TestBloomSearchEngineMergeStreamingOutputCompression(t *testing.T) {
 			flushAndWait(t, engine, ctx, []map[string]any{{"id": 1.0, "service": "merge"}}, "streaming output row 1")
 			flushAndWait(t, engine, ctx, []map[string]any{{"id": 2.0, "service": "merge"}}, "streaming output row 2")
 
-			beforeMergeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+			beforeMergeFiles, err := collectMaybeFiles(ctx, metaStore.GetMaybeFilesForQuery(ctx, nil))
 			if err != nil {
 				t.Fatalf("Failed to read files before merge: %v", err)
 			}
@@ -1617,7 +1618,7 @@ func TestBloomSearchEngineMergeStreamingOutputCompression(t *testing.T) {
 				t.Fatalf("Merge failed: %v", err)
 			}
 
-			afterMergeFiles, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+			afterMergeFiles, err := collectMaybeFiles(ctx, metaStore.GetMaybeFilesForQuery(ctx, nil))
 			if err != nil {
 				t.Fatalf("Failed to read files after merge: %v", err)
 			}
@@ -1722,7 +1723,7 @@ func TestBloomSearchEngineMergeTombstonesDeletedFiles(t *testing.T) {
 	flushAndWait(t, engine, ctx, []map[string]any{{"id": 1.0, "service": "merge"}}, "tombstone row 1")
 	flushAndWait(t, engine, ctx, []map[string]any{{"id": 2.0, "service": "merge"}}, "tombstone row 2")
 
-	maybeFilesBeforeMerge, err := metaStore.GetMaybeFilesForQuery(ctx, nil)
+	maybeFilesBeforeMerge, err := collectMaybeFiles(ctx, metaStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("Failed to get files before merge: %v", err)
 	}
@@ -1940,7 +1941,7 @@ func TestBloomSearchEngineQueryProcessesAllBlocksWithBoundedConcurrency(t *testi
 		flushAndWait(t, engine, ctx, []map[string]any{row}, fmt.Sprintf("bounded worker row %d", i))
 	}
 
-	maybeFiles, err := dataStore.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, dataStore.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("Failed to read metadata for verification: %v", err)
 	}
@@ -2018,7 +2019,7 @@ func (s *blockingFirstFlushWriteStore) TombstoneFile(ctx context.Context, filePo
 	return s.base.TombstoneFile(ctx, filePointerBytes)
 }
 
-func (s *blockingFirstFlushWriteStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
+func (s *blockingFirstFlushWriteStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) iter.Seq2[MaybeFile, error] {
 	return s.base.GetMaybeFilesForQuery(ctx, query)
 }
 
@@ -2233,7 +2234,7 @@ func TestBloomSearchEngineStopFlushesPendingBufferedRows(t *testing.T) {
 		t.Fatalf("Expected no pending flush requests after stop, got %d", got)
 	}
 
-	maybeFiles, err := dataStore.GetMaybeFilesForQuery(context.Background(), nil)
+	maybeFiles, err := collectMaybeFiles(context.Background(), dataStore.GetMaybeFilesForQuery(context.Background(), nil))
 	if err != nil {
 		t.Fatalf("Failed to read files after stop: %v", err)
 	}

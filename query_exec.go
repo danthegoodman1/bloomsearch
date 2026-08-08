@@ -121,12 +121,27 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 	return
 }
 
+// queryJobBuffer is the block-job channel's buffer. It only smooths the
+// hand-off between the file stage and the block workers; the total number of
+// candidate files buffered anywhere in a query is bounded by the worker count
+// plus this constant, never by the candidate count.
+const queryJobBuffer = 16
+
 // Query starts a query and returns a Results cursor streaming the matching
-// rows. Everything that can fail fast — regex compilation, the MetaStore
-// lookup, prefilter enforcement, and file-level bloom pruning — runs
-// synchronously and returns (nil, err) without starting anything. On success
-// the engine owns every channel and goroutine behind the cursor; see Results
-// for the iteration, error, cancellation, and stats contracts.
+// rows. Only pre-iteration setup (regex compilation) can fail fast with
+// (nil, err); everything else — the MetaStore iteration, prefilter
+// enforcement, file-level bloom pruning, and block scans — runs behind the
+// cursor, which the engine fully owns (see Results for the iteration, error,
+// cancellation, and stats contracts).
+//
+// Candidate files stream from the MetaStore iterator through a bounded
+// pipeline: a file stage pulls one file at a time, prunes it, and fans its
+// data blocks out to the block workers, so per-query memory scales with the
+// in-flight window (worker count plus constant channel buffers), not with
+// the candidate-file count. A MetaStore error mid-iteration stops further
+// pulls but lets already-dispatched block jobs finish and deliver their
+// rows; the error surfaces from Results.Err joined with any block errors —
+// the same partial-results philosophy as block errors.
 //
 // Queries are independent of the ingest lifecycle: a stopped engine still
 // serves queries, because reads touch only the MetaStore and DataStore.
@@ -151,144 +166,120 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 
 	pruneBloomQuery := AndBloomQueries(rowBloomQuery, RegexFieldGuardBloomQuery(query.Regex))
 
-	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
-	if err != nil {
-		return nil, err
-	}
-
-	// The engine enforces strict prefilter semantics itself: MetaStore-side
-	// prefiltering is only an optimization, so re-filter whatever the store
-	// returned. FilterDataBlocks allocates a new slice, and MaybeFile is a
-	// value, so the store's own metadata is never mutated. Files left with no
-	// matching blocks are dropped.
-	prefilteredFiles := make([]MaybeFile, 0, len(maybeFiles))
-	for _, maybeFile := range maybeFiles {
-		maybeFile.Metadata.DataBlocks = FilterDataBlocks(maybeFile.Metadata.DataBlocks, query.Prefilter)
-		if len(maybeFile.Metadata.DataBlocks) == 0 {
-			continue
-		}
-		prefilteredFiles = append(prefilteredFiles, maybeFile)
-	}
-	maybeFiles = prefilteredFiles
-
 	// A query without bloom conditions cannot be disqualified by any filter:
 	// skip filter evaluation entirely, and downstream, skip reading the block
 	// filter sections (see processDataBlock).
 	hasBloomConditions := pruneBloomQuery != nil && pruneBloomQuery.Expression != nil
 
-	// Test file-level bloom filters, using concurrency only above a threshold
-	const concurrencyThreshold = 20
+	r := newResults(ctx)
 
-	// Once a file has passed (or skipped) the file-level test, its filters
-	// have served their purpose: release them before block jobs are built so
-	// per-query memory stops scaling with candidate-file size.
-	var matchingFiles []MaybeFile
-	if !hasBloomConditions || len(maybeFiles) < concurrencyThreshold {
-		// Sequential evaluation for small numbers of files
-		matchingFiles = make([]MaybeFile, 0, len(maybeFiles))
-		for _, maybeFile := range maybeFiles {
-			if !hasBloomConditions || b.evaluateBloomFilters(
+	jobs := make(chan dataBlockJob, queryJobBuffer)
+
+	// Block workers are spawned on demand, one per job sent, until
+	// MaxQueryConcurrency are running: the job total is unknown up front
+	// (files stream from the MetaStore), and spawning against demand yields
+	// the same min(jobs, MaxQueryConcurrency) worker count the old upfront
+	// sizing produced — a fully pruned query spawns none. Each worker also
+	// watches the query context so cancellation winds workers down promptly
+	// even while the file stage is still draining the store iterator.
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+
+		slot := querySlot{sem: b.querySemaphore, ctx: r.ctx}
+		defer slot.release()
+		var scratch *rowMatchScratch
+		for {
+			select {
+			case job, ok := <-jobs:
+				if !ok {
+					return
+				}
+				if !slot.acquire() {
+					return
+				}
+				if scratch == nil {
+					scratch = newRowMatchScratch(rowMatcher)
+				}
+				b.processDataBlock(r, &slot, job, pruneBloomQuery, rowMatcher, scratch)
+				slot.release()
+			case <-r.ctx.Done():
+				return
+			}
+		}
+	}
+
+	// File stage: pull one candidate at a time from the MetaStore iterator and
+	// fan its blocks out to the workers. Exiting the range loop — on error,
+	// cancellation, or a blocked job send — runs the store iterator's deferred
+	// cleanup. File-level bloom tests are pure in-memory checks, so this
+	// single goroutine runs them inline without taking query-semaphore slots;
+	// the semaphore keeps bounding block scans exactly as before.
+	//
+	// The file stage holds its own WaitGroup token and is the only spawner,
+	// so the counter cannot reach zero — letting wg.Wait return — before it
+	// exits; worker spawns therefore never race wg.Wait, and the zero-worker
+	// query (empty iterator, everything pruned) completes when the file stage
+	// alone finishes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(jobs)
+
+		workersSpawned := 0
+		for maybeFile, err := range b.metaStore.GetMaybeFilesForQuery(r.ctx, query.Prefilter) {
+			if err != nil {
+				// Stop pulling; blocks already dispatched still finish, and
+				// the error surfaces from Results.Err.
+				r.recordQueryError(fmt.Errorf("MetaStore iteration failed: %w", err))
+				return
+			}
+			if r.ctx.Err() != nil {
+				return
+			}
+
+			// The engine enforces strict prefilter semantics itself:
+			// MetaStore-side prefiltering is only an optimization, so
+			// re-filter whatever the store yielded. FilterDataBlocks
+			// allocates a new slice when it filters, and MaybeFile is a
+			// value, so the store's own metadata is never mutated. Files
+			// left with no matching blocks are dropped.
+			maybeFile.Metadata.DataBlocks = FilterDataBlocks(maybeFile.Metadata.DataBlocks, query.Prefilter)
+			if len(maybeFile.Metadata.DataBlocks) == 0 {
+				continue
+			}
+
+			if hasBloomConditions && !b.evaluateBloomFilters(
 				maybeFile.Metadata.BloomFilters.FieldBloomFilter,
 				maybeFile.Metadata.BloomFilters.TokenBloomFilter,
 				maybeFile.Metadata.BloomFilters.FieldTokenBloomFilter,
 				pruneBloomQuery,
 			) {
-				maybeFile.Metadata.BloomFilters = BloomFilters{}
-				matchingFiles = append(matchingFiles, maybeFile)
+				continue
 			}
-		}
-	} else {
-		// Concurrent evaluation for larger numbers of files
-		var fileWg sync.WaitGroup
-		matchingFilesChan := make(chan MaybeFile, len(maybeFiles))
 
-		for _, maybeFile := range maybeFiles {
-			fileWg.Add(1)
-			go func(maybeFile MaybeFile) {
-				defer fileWg.Done()
+			// Once a file has passed (or skipped) the file-level test, its
+			// filters have served their purpose: release them before block
+			// jobs are built so per-query memory stops scaling with
+			// candidate-file filter size.
+			maybeFile.Metadata.BloomFilters = BloomFilters{}
 
-				if err := sendWithContext(ctx, b.querySemaphore, struct{}{}); err != nil {
-					return
-				}
-				defer func() { <-b.querySemaphore }()
-
-				if b.evaluateBloomFilters(
-					maybeFile.Metadata.BloomFilters.FieldBloomFilter,
-					maybeFile.Metadata.BloomFilters.TokenBloomFilter,
-					maybeFile.Metadata.BloomFilters.FieldTokenBloomFilter,
-					pruneBloomQuery,
-				) {
-					maybeFile.Metadata.BloomFilters = BloomFilters{}
-					sendWithContext(ctx, matchingFilesChan, maybeFile)
-				}
-			}(maybeFile)
-		}
-
-		go func() {
-			fileWg.Wait()
-			close(matchingFilesChan) // close to tell the range below to stop
-		}()
-
-		for matchingFile := range matchingFilesChan {
-			matchingFiles = append(matchingFiles, matchingFile)
-		}
-	}
-
-	if b.queryFilePruneHook != nil {
-		b.queryFilePruneHook(matchingFiles)
-	}
-
-	// Cancellation during setup surfaces as a query error rather than
-	// silently proceeding with whichever files happened to be evaluated.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	totalJobs := 0
-	for _, matchingFile := range matchingFiles {
-		totalJobs += len(matchingFile.Metadata.DataBlocks)
-	}
-
-	r := newResults(ctx)
-
-	if totalJobs == 0 {
-		r.markWorkersDone()
-		return r, nil
-	}
-
-	workerCount := min(b.config.MaxQueryConcurrency, totalJobs)
-	jobs := make(chan dataBlockJob, workerCount)
-
-	var wg sync.WaitGroup
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			slot := querySlot{sem: b.querySemaphore, ctx: r.ctx}
-			defer slot.release()
-			scratch := newRowMatchScratch(rowMatcher)
-			for job := range jobs {
-				if !slot.acquire() {
-					return
-				}
-				b.processDataBlock(r, &slot, job, pruneBloomQuery, rowMatcher, scratch)
-				slot.release()
+			if b.queryFilePruneHook != nil {
+				b.queryFilePruneHook(maybeFile)
 			}
-		}()
-	}
 
-	go func() {
-		defer close(jobs)
-
-		for _, matchingFile := range matchingFiles {
-			for _, blockMetadata := range matchingFile.Metadata.DataBlocks {
+			for _, blockMetadata := range maybeFile.Metadata.DataBlocks {
 				job := dataBlockJob{
-					filePointer:   matchingFile.PointerBytes,
+					filePointer:   maybeFile.PointerBytes,
 					blockMetadata: blockMetadata,
 				}
 				if err := sendWithContext(r.ctx, jobs, job); err != nil {
 					return
+				}
+				if workersSpawned < b.config.MaxQueryConcurrency {
+					workersSpawned++
+					wg.Add(1)
+					go worker()
 				}
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -226,42 +227,56 @@ func (fs *FileSystemDataStore) readFileMetadata(filePath string) (*FileMetadata,
 	return metadata, nil
 }
 
-func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) ([]MaybeFile, error) {
-	files, err := os.ReadDir(fs.rootDir)
-	if err != nil {
-		return nil, err
-	}
-
-	maybeFiles := make([]MaybeFile, 0, len(files))
-	for _, file := range files {
-		// Skip directories and non-bloom files
-		if file.IsDir() || !strings.HasSuffix(file.Name(), ".dat") {
-			continue
-		}
-
-		filePath := filepath.Join(fs.rootDir, file.Name())
-
-		// Read file metadata from bloom file. Unreadable or invalid files
-		// (partial writes, foreign files dropped in the directory) are
-		// skipped rather than failing the whole query.
-		fileMetadata, err := fs.readFileMetadata(filePath)
+// GetMaybeFilesForQuery streams each candidate file as the directory scan
+// proceeds: one file's metadata (footer decode, filters included) is in
+// memory per yield rather than the whole directory's.
+func (fs *FileSystemDataStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) iter.Seq2[MaybeFile, error] {
+	return func(yield func(MaybeFile, error) bool) {
+		files, err := os.ReadDir(fs.rootDir)
 		if err != nil {
-			continue
+			yield(MaybeFile{}, err)
+			return
 		}
 
-		// Filter data blocks based on query conditions
-		fileMetadata.DataBlocks = FilterDataBlocks(fileMetadata.DataBlocks, query)
+		for _, file := range files {
+			// Honor ctx on every entry, not just at yields: the skip paths
+			// (non-.dat entries, unreadable footers, fully pruned files)
+			// never yield, and a terminated query must not wait for the
+			// remaining scan.
+			if ctx.Err() != nil {
+				return
+			}
 
-		// Only include files that have matching data blocks (or all files if no query conditions)
-		if query == nil || len(fileMetadata.DataBlocks) > 0 {
-			maybeFiles = append(maybeFiles, MaybeFile{
+			// Skip directories and non-bloom files
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".dat") {
+				continue
+			}
+
+			filePath := filepath.Join(fs.rootDir, file.Name())
+
+			// Read file metadata from bloom file. Unreadable or invalid files
+			// (partial writes, foreign files dropped in the directory) are
+			// skipped rather than failing the whole query.
+			fileMetadata, err := fs.readFileMetadata(filePath)
+			if err != nil {
+				continue
+			}
+
+			// Filter data blocks based on query conditions
+			fileMetadata.DataBlocks = FilterDataBlocks(fileMetadata.DataBlocks, query)
+
+			// Only yield files that have matching data blocks (or all files if no query conditions)
+			if query != nil && len(fileMetadata.DataBlocks) == 0 {
+				continue
+			}
+			if !yield(MaybeFile{
 				PointerBytes: []byte(filePath),
 				Metadata:     *fileMetadata,
-			})
+			}, nil) {
+				return
+			}
 		}
 	}
-
-	return maybeFiles, nil
 }
 
 func (fs *FileSystemDataStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {

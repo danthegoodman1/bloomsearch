@@ -78,7 +78,7 @@ func TestFileSystemStoreFlushAndRead(t *testing.T) {
 	fmt.Println("\n--- Testing GetMaybeFilesForQuery ---")
 
 	// Read back all files (no query conditions)
-	maybeFiles, err := dataStore.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, dataStore.GetMaybeFilesForQuery(ctx, nil))
 	assert.NoError(t, err)
 	assert.Len(t, maybeFiles, 1, "Expected exactly 1 file")
 
@@ -283,7 +283,7 @@ func TestFileSystemStoreSkipsUnreadableFiles(t *testing.T) {
 		t.Fatalf("failed to write truncated file: %v", err)
 	}
 
-	maybeFiles, err := store.GetMaybeFilesForQuery(ctx, nil)
+	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
 	if err != nil {
 		t.Fatalf("GetMaybeFilesForQuery failed: %v", err)
 	}
