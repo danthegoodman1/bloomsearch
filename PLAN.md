@@ -51,15 +51,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 1A: Ingest indexes from marshaled JSON via shared walker; reflection walk deleted | Missing: implementation + regression tests (large int, struct, time, []byte). |
-| Incomplete | Work | 1B: Literal-key walking replaces gjson path Get in both walkers | Missing: implementation + metachar leak/miss tests. |
-| Incomplete | Work | 1C: Delimiter-in-key policy decided and applied both sides | Missing: decision note in code + dotted-key test. |
-| Incomplete | Work | 1D: Leaf/non-leaf field semantics unified across blooms, row check, regex guard | Missing: implementation + non-leaf Field/FieldRegex tests. |
-| Incomplete | Work | 1E: Regex matches raw field text | Missing: implementation + numeric-field regex test. |
-| Incomplete | Work | 1F: Null/empty-value policy consistent | Missing: implementation + null-field test. |
-| Incomplete | Work | 1G: MinMax conversions clamp (uint64/float/NaN) | Missing: implementation + overflow test. |
-| Incomplete | Test | Property test: every derivable query returns its row | Missing: test file + passing run. |
-| Incomplete | Gate | All Phase 1 regressions + property test green under `-race` | Missing: CI/test run evidence. |
+| Complete | Work | 1A: Ingest indexes from marshaled JSON via shared walker; reflection walk deleted | `forEachPathValue`/`leafTokenInput` in tokenizer.go; ingest walks marshaled bytes in `processIngestRequest`; `UniqueFields` deleted. Tests: `TestFieldTokenLargeInt`, `TestValueTypeEncodings`. |
+| Complete | Work | 1B: Literal-key walking replaces gjson path Get in both walkers | ForEach-only traversal, zero `Result.Get` path lookups. Test: `TestFieldMetacharKeys` (leak + miss directions). |
+| Complete | Work | 1C: Delimiter-in-key policy decided and applied both sides | Delimiter-split prefixes emitted as field paths via single-sourced `emitKeyPrefixPaths`; empty paths nonexistent for all condition types. Test: `TestFieldWithDelimiterInKey` (incl. regex-guard symmetry, reviewer's repro). |
+| Complete | Work | 1D: Leaf/non-leaf field semantics unified across blooms, row check, regex guard | Intermediate paths in field bloom; exact-path FieldToken (documented on builders). Test: `TestFieldNonLeafPath`. |
+| Complete | Work | 1E: Regex matches raw field text | `leafTokenInput` (.Str/.Raw) feeds regex; no `%v`. Test: `TestRegexNumericField`. |
+| Complete | Work | 1F: Null/empty-value policy consistent | Null/empty containers = field existence only, both sides. Test: `TestValueTypeEncodings` null case. |
+| Complete | Work | 1G: MinMax conversions clamp (uint64/float/NaN) | min_max.go clamps before conversion, NaN skipped; `EvaluateMinMaxCondition` saturation at int64 extremes. Test: `TestMinMaxOverflowClamp` (7 boundary cases + e2e). |
+| Complete | Test | Property test: every derivable query returns its row | `TestPropertyNoFalseNegatives`: ~2700 derived queries incl. independent delimiter-split-prefix derivation (non-circular). |
+| Complete | Gate | All Phase 1 regressions + property test green under `-race` | `go test -race -count=1 ./...` pass (19.4s, coordinator-verified). Reviewer approved after one blocker round (regex-guard prefix divergence, fixed in shared walker). Benchmarks vs baseline: ingest 33% faster/−68% allocs; queries within tolerance. |
 
 ## Phase 2: Engine-enforced prefilters and honest reference stores
 

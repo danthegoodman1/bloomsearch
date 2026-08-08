@@ -545,26 +545,47 @@ func (b *BloomSearchEngine) processIngestRequest(
 
 		// Process each row
 		for _, row := range rows {
-			// Add info to bloom filters
-			uniqueFields := UniqueFields(row, ".")
-			for _, field := range uniqueFields {
-				partitionBuffer.fieldBloomFilter.AddString(field.Path)
-				// Also add to file-level bloom filters
-				(*fileFieldBloomFilter).AddString(field.Path)
-
-				for _, value := range field.Values {
-					tokens := b.config.Tokenizer(value)
-					for _, token := range tokens {
-						partitionBuffer.tokenBloomFilter.AddString(token)
-						partitionBuffer.fieldTokenBloomFilter.AddString(makeFieldTokenKey(field.Path, token))
-						// Also add to file-level bloom filters
-						(*fileTokenBloomFilter).AddString(token)
-						(*fileFieldTokenBloomFilter).AddString(makeFieldTokenKey(field.Path, token))
-					}
-				}
+			// Serialize the row first: indexing walks the marshaled JSON bytes,
+			// the same canonical representation query-time row verification
+			// walks (see forEachPathValue in tokenizer.go)
+			rowBytes, err := json.Marshal(row)
+			if err != nil {
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to serialize row: %w", err))
+				return
 			}
 
-			// Check for minmax indexes
+			// Check if row is too large for uint32 length prefix
+			if len(rowBytes) > 0xFFFFFFFF {
+				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF))
+				return
+			}
+
+			// Add info to bloom filters: every path (including intermediate
+			// object/array paths) to the field filters, leaf-value tokens to the
+			// token filters, and exact-leaf-path::token pairs to the field-token
+			// filters
+			forEachPathValue(gjson.ParseBytes(rowBytes), ".", func(path string, value gjson.Result, isLeaf bool) {
+				partitionBuffer.fieldBloomFilter.AddString(path)
+				(*fileFieldBloomFilter).AddString(path)
+				if !isLeaf {
+					return
+				}
+				text, ok := leafTokenInput(value)
+				if !ok {
+					return
+				}
+				for _, token := range b.config.Tokenizer(text) {
+					fieldTokenKey := makeFieldTokenKey(path, token)
+					partitionBuffer.tokenBloomFilter.AddString(token)
+					partitionBuffer.fieldTokenBloomFilter.AddString(fieldTokenKey)
+					(*fileTokenBloomFilter).AddString(token)
+					(*fileFieldTokenBloomFilter).AddString(fieldTokenKey)
+				}
+			})
+
+			// Check for minmax indexes, reading Go-native values from the
+			// original row so numeric identity is preserved (conversions clamp
+			// out-of-range values, see min_max.go)
 			for _, index := range b.config.MinMaxIndexes {
 				if value, ok := row[index]; ok {
 					minVal, maxVal, isNumeric := ConvertToMinMaxInt64(value)
@@ -581,19 +602,6 @@ func (b *BloomSearchEngine) processIngestRequest(
 						}
 					}
 				}
-			}
-
-			// Serialize and store the row
-			rowBytes, err := json.Marshal(row)
-			if err != nil {
-				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to serialize row: %w", err))
-				return
-			}
-
-			// Check if row is too large for uint32 length prefix
-			if len(rowBytes) > 0xFFFFFFFF {
-				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("row too large: %d bytes exceeds maximum of %d bytes", len(rowBytes), 0xFFFFFFFF))
-				return
 			}
 
 			// Write length prefix (uint32) followed by row bytes

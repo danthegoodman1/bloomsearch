@@ -1,5 +1,7 @@
 package bloomsearch
 
+import "math"
+
 // QueryOperator represents the type of comparison operation
 type QueryOperator string
 
@@ -314,25 +316,37 @@ func EvaluateNumericCondition(value int64, condition NumericCondition) bool {
 	}
 }
 
-// EvaluateMinMaxCondition checks if a MinMaxIndex overlaps with the given condition
-// This is used for range-based filtering where we want to include data blocks that might contain matching values
+// EvaluateMinMaxCondition checks if a MinMaxIndex overlaps with the given condition.
+// This is used for range-based filtering where we want to include data blocks that might contain matching values.
+// A bound stored at an int64 extreme is treated as saturated (see MinMaxIndex):
+// Max == math.MaxInt64 may understate a larger true maximum and Min ==
+// math.MinInt64 may overstate a smaller true minimum, so operators whose
+// strict comparison at that exact boundary would exclude the block include it
+// instead.
 func EvaluateMinMaxCondition(minMaxIndex MinMaxIndex, condition NumericCondition) bool {
+	saturatedAbove := minMaxIndex.Max == math.MaxInt64
+	saturatedBelow := minMaxIndex.Min == math.MinInt64
+
 	switch condition.Operator {
 	case OpEqual:
-		// The range contains the target value
+		// The range contains the target value (saturated bounds already span
+		// every representable target)
 		return minMaxIndex.Min <= condition.Value && condition.Value <= minMaxIndex.Max
 	case OpNotEqual:
-		// The range might contain values other than the target value
-		return minMaxIndex.Min != condition.Value || minMaxIndex.Max != condition.Value
+		// The range might contain values other than the target value; a
+		// saturated bound might hide such values even when Min == Max == target
+		return minMaxIndex.Min != condition.Value || minMaxIndex.Max != condition.Value || saturatedAbove || saturatedBelow
 	case OpGreaterThan:
-		// The range has values greater than the target
-		return minMaxIndex.Max > condition.Value
+		// The range has values greater than the target; a saturated max might
+		// hide values greater than any target
+		return minMaxIndex.Max > condition.Value || saturatedAbove
 	case OpGreaterThanEqual:
 		// The range has values greater than or equal to the target
 		return minMaxIndex.Max >= condition.Value
 	case OpLessThan:
-		// The range has values less than the target
-		return minMaxIndex.Min < condition.Value
+		// The range has values less than the target; a saturated min might
+		// hide values less than any target
+		return minMaxIndex.Min < condition.Value || saturatedBelow
 	case OpLessThanEqual:
 		// The range has values less than or equal to the target
 		return minMaxIndex.Min <= condition.Value
@@ -352,8 +366,9 @@ func EvaluateMinMaxCondition(minMaxIndex MinMaxIndex, condition NumericCondition
 		// The ranges overlap
 		return minMaxIndex.Min <= condition.Max && condition.Min <= minMaxIndex.Max
 	case OpNotBetween:
-		// The range might contain values outside the target range
-		return minMaxIndex.Min < condition.Min || minMaxIndex.Max > condition.Max
+		// The range might contain values outside the target range; saturated
+		// bounds might hide values beyond any target range
+		return minMaxIndex.Min < condition.Min || minMaxIndex.Max > condition.Max || saturatedAbove || saturatedBelow
 	default:
 		return false
 	}
@@ -500,6 +515,12 @@ type RegexQuery struct {
 	Expression *RegexExpression `json:",omitempty"`
 }
 
+// Field matches rows where the field path exists, including intermediate
+// object/array paths: Field("user") matches {"user": {"name": "x"}}. Path
+// components are literal keys joined with the delimiter; a key containing the
+// delimiter behaves exactly like the equivalent nested path ({"a.b": 1} and
+// {"a": {"b": 1}} both match Field("a.b") and, via delimiter-split prefix
+// paths, Field("a")).
 func Field(field string) BloomExpression {
 	return BloomExpression{
 		expressionType: bloomExpressionCondition,
@@ -520,6 +541,12 @@ func Token(token string) BloomExpression {
 	}
 }
 
+// FieldToken matches rows where a primitive value at exactly the field path
+// tokenizes to the token. It does not match tokens at deeper paths:
+// FieldToken("user", "john") does not match {"user": {"name": "john"}} — use
+// FieldToken("user.name", "john") or Token("john") for that. Array elements
+// live at the array's own path, so FieldToken("tags", "admin") matches
+// {"tags": ["admin"]}.
 func FieldToken(field, token string) BloomExpression {
 	return BloomExpression{
 		expressionType: bloomExpressionCondition,
@@ -557,6 +584,9 @@ func flattenExpressions(expressions []BloomExpression, expressionType BloomExpre
 	return flattened
 }
 
+// FieldRegex matches rows where the pattern matches the text of any primitive
+// value at or beneath the field path (decoded text for strings, the raw JSON
+// literal for numbers and booleans; null values never match).
 func FieldRegex(field, pattern string) RegexExpression {
 	return RegexExpression{
 		expressionType: regexExpressionCondition,

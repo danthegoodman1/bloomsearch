@@ -43,24 +43,15 @@ func runQueryTest(t *testing.T, engine *BloomSearchEngine, ctx context.Context, 
 	t.Run(testName, func(t *testing.T) {
 		query := queryBuilder.Build()
 
-		// Execute query
+		// Execute query. Stats are not consumed: the engine never closes
+		// statsChan, so a goroutine ranging it would outlive the test and log
+		// after completion (a race detector failure).
 		resultChan := make(chan map[string]any, 100)
 		errorChan := make(chan error, 10)
-		statsChan := make(chan BlockStats, 10)
-		err := engine.Query(ctx, query, resultChan, errorChan, statsChan)
+		err := engine.Query(ctx, query, resultChan, errorChan, nil)
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-
-		// Print stats as they come in
-		go func() {
-			for stat := range statsChan {
-				t.Logf("Block %s[%d]: %s rows/s, %s",
-					string(stat.FilePointer), stat.BlockOffset,
-					FormatRate(stat.RowsProcessed, stat.Duration),
-					FormatBytesPerSecond(stat.BytesProcessed, stat.Duration))
-			}
-		}()
 
 		var results []map[string]any
 		var queryErr error
@@ -564,24 +555,15 @@ func TestBloomSearchEngineQueryEndToEndUncompressed(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Execute query
+			// Execute query. Stats are not consumed: the engine never closes
+			// statsChan, so a goroutine ranging it would outlive the test and
+			// log after completion (a race detector failure).
 			resultChan := make(chan map[string]any, 100)
 			errorChan := make(chan error, 10)
-			statsChan := make(chan BlockStats, 10)
-			err := engine.Query(ctx, tc.query, resultChan, errorChan, statsChan)
+			err := engine.Query(ctx, tc.query, resultChan, errorChan, nil)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
-
-			// Print stats as they come in
-			go func() {
-				for stat := range statsChan {
-					t.Logf("Block %s[%d]: %s rows/s, %s",
-						string(stat.FilePointer), stat.BlockOffset,
-						FormatRate(stat.RowsProcessed, stat.Duration),
-						FormatBytesPerSecond(stat.BytesProcessed, stat.Duration))
-				}
-			}()
 
 			var results []map[string]any
 			var queryErr error
@@ -736,24 +718,15 @@ func TestBloomSearchEngineQueryEndToEndZstd(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Execute query
+			// Execute query. Stats are not consumed: the engine never closes
+			// statsChan, so a goroutine ranging it would outlive the test and
+			// log after completion (a race detector failure).
 			resultChan := make(chan map[string]any, 100)
 			errorChan := make(chan error, 10)
-			statsChan := make(chan BlockStats, 10)
-			err := engine.Query(ctx, tc.query, resultChan, errorChan, statsChan)
+			err := engine.Query(ctx, tc.query, resultChan, errorChan, nil)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
-
-			// Print stats as they come in
-			go func() {
-				for stat := range statsChan {
-					t.Logf("Block %s[%d]: %s rows/s, %s",
-						string(stat.FilePointer), stat.BlockOffset,
-						FormatRate(stat.RowsProcessed, stat.Duration),
-						FormatBytesPerSecond(stat.BytesProcessed, stat.Duration))
-				}
-			}()
 
 			var results []map[string]any
 			var queryErr error
@@ -908,24 +881,15 @@ func TestBloomSearchEngineQueryEndToEndSnappy(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Execute query
+			// Execute query. Stats are not consumed: the engine never closes
+			// statsChan, so a goroutine ranging it would outlive the test and
+			// log after completion (a race detector failure).
 			resultChan := make(chan map[string]any, 100)
 			errorChan := make(chan error, 10)
-			statsChan := make(chan BlockStats, 10)
-			err := engine.Query(ctx, tc.query, resultChan, errorChan, statsChan)
+			err := engine.Query(ctx, tc.query, resultChan, errorChan, nil)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
-
-			// Print stats as they come in
-			go func() {
-				for stat := range statsChan {
-					t.Logf("Block %s[%d]: %s rows/s, %s",
-						string(stat.FilePointer), stat.BlockOffset,
-						FormatRate(stat.RowsProcessed, stat.Duration),
-						FormatBytesPerSecond(stat.BytesProcessed, stat.Duration))
-				}
-			}()
 
 			var results []map[string]any
 			var queryErr error
@@ -2328,7 +2292,7 @@ func TestBloomSearchEngineStopFlushesPendingBufferedRows(t *testing.T) {
 	config.MaxBufferedBytes = 1024 * 1024 * 1024
 	config.MaxBufferedTime = 1 * time.Hour
 	config.RowDataCompression = CompressionNone
-	config.Tokenizer = func(value any) []string {
+	config.Tokenizer = func(value string) []string {
 		blockOnce.Do(func() {
 			close(tokenizerEntered)
 			<-releaseTokenizer
