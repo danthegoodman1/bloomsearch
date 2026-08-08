@@ -354,6 +354,16 @@ func BenchmarkManyBlocksNeedleFanout(b *testing.B) {
 	benchManyBlockQueryFiles(b, NewQuery().Token(blockyMarkerToken).Build(), 32, 250*time.Microsecond, 8, true)
 }
 
+// BenchmarkManyBlocksNeedleS3Latency charges 20ms per request, in the range of
+// an S3 GET's time to first byte. The 250µs used above is closer to a local NVMe
+// read, so it understates what a request costs on object storage; at 20ms the
+// wall-clock difference converges on the request-count difference. Fewer files
+// here than the fanout case purely to keep the benchmark's runtime sane — run it
+// with -benchtime=3x.
+func BenchmarkManyBlocksNeedleS3Latency(b *testing.B) {
+	benchManyBlockQueryFiles(b, NewQuery().Token(blockyMarkerToken).Build(), 16, 20*time.Millisecond, 8, true)
+}
+
 // BenchmarkMerge merges 6 small files into one. Dataset rebuild is untimed.
 func BenchmarkMerge(b *testing.B) {
 	ctx := context.Background()
