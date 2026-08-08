@@ -180,7 +180,14 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 	// sets, so they too are sized for exact distinct counts.
 	fileEntries := newBloomEntrySets()
 
-	// For each partition buffer, write the data block to the data store
+	// Block filter sections are buffered here while the row data streams out,
+	// then written as one contiguous region after the last block — the layout
+	// that lets a query read every block's filters in one request. See
+	// blockFilterRegionWriter for the memory this costs.
+	var filterRegion blockFilterRegionWriter
+
+	// For each partition buffer, write the data block's row data to the data
+	// store and buffer its filter section.
 	for _, partitionBuffer := range flushReq.partitionBuffers {
 		// Finalize compression encoders before writing, then recycle them (the
 		// stream is complete; the compressed bytes live in the buffer).
@@ -193,17 +200,14 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 		compressedData = partitionBuffer.buffer.Bytes()
 
 		// Build the block's filters right-sized from the measured distinct
-		// entry counts and write them as the block's filter section.
+		// entry counts and buffer them for the file's filter region.
 		blockFilters := partitionBuffer.entries.buildFilters(b.config.BloomFalsePositiveRate)
 		filterSection, err := encodeFilterSection(&blockFilters)
 		if err != nil {
 			fail(fmt.Errorf("failed to encode bloom filters: %w", err), false)
 			return
 		}
-		if _, err := writer.Write(filterSection); err != nil {
-			fail(fmt.Errorf("failed to write bloom filters: %w", err), false)
-			return
-		}
+		filterOffset, filterSize := filterRegion.add(filterSection)
 
 		// Calculate hash of compressed row data (CRC32C)
 		rowDataHash := crc32.Checksum(compressedData, crc32cTable)
@@ -216,14 +220,14 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 
 		partitionBuffer.entries.unionInto(fileEntries)
 
-		dataBlockSize := len(filterSection) + len(compressedData)
-
 		fileMetadata.DataBlocks = append(fileMetadata.DataBlocks, DataBlockMetadata{
-			PartitionID:            partitionBuffer.partitionID,
-			Rows:                   partitionBuffer.rowCount,
-			Offset:                 currentOffset,
-			Size:                   dataBlockSize,
-			BloomFiltersSize:       len(filterSection),
+			PartitionID:   partitionBuffer.partitionID,
+			Rows:          partitionBuffer.rowCount,
+			RowDataOffset: currentOffset,
+			RowDataSize:   len(compressedData),
+			// Region-relative until filterRegion.finish rebases it below.
+			BloomFilterOffset:      filterOffset,
+			BloomFilterSize:        filterSize,
 			MinMaxIndexes:          partitionBuffer.minMaxIndexes,
 			Compression:            b.config.RowDataCompression,
 			UncompressedSize:       partitionBuffer.uncompressedSize,
@@ -233,8 +237,18 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 			BloomFalsePositiveRate: b.config.BloomFalsePositiveRate,
 		})
 
-		currentOffset += dataBlockSize
+		currentOffset += len(compressedData)
 	}
+
+	// Every block's row data is out: write their filter sections as one
+	// contiguous region and rebase the blocks' filter offsets onto it.
+	regionSize, err := filterRegion.finish(writer, currentOffset, fileMetadata.DataBlocks)
+	if err != nil {
+		fail(err, false)
+		return
+	}
+	fileMetadata.BlockFilterRegionOffset = currentOffset
+	fileMetadata.BlockFilterRegionSize = regionSize
 
 	fileMetadata.BloomFilters = fileEntries.buildFilters(b.config.BloomFalsePositiveRate)
 	fileMetadata.BloomEntryCounts = fileEntries.counts()

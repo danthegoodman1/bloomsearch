@@ -7,7 +7,6 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"io"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -18,8 +17,8 @@ import (
 
 // dataBlockJob is a scan job for one data block whose filters did not
 // disqualify it (see evaluateBlockFilters). filterDuration is the time the file
-// stage spent reading and evaluating this block's filter section, carried along
-// so the block's BlockStats.Duration still accounts for the whole block.
+// stage spent obtaining and evaluating this block's filter section, carried
+// along so the block's BlockStats.Duration still accounts for the whole block.
 type dataBlockJob struct {
 	filePointer    []byte
 	blockMetadata  DataBlockMetadata
@@ -28,10 +27,14 @@ type dataBlockJob struct {
 
 // fileFilterJob is one candidate file's block filter evaluation: the file
 // passed the prefilter and the file-level bloom test, and its blocks' filter
-// sections have yet to be read.
+// sections have yet to be read. The file's block filter region bounds come
+// along so the filter pass can reject block metadata pointing outside it
+// instead of reading (or allocating for) an arbitrary span.
 type fileFilterJob struct {
-	filePointer []byte
-	blocks      []DataBlockMetadata
+	filePointer        []byte
+	filterRegionOffset int
+	filterRegionSize   int
+	blocks             []DataBlockMetadata
 }
 
 // blockScanCandidate is one block that survived filter evaluation, as an index
@@ -43,16 +46,20 @@ type blockScanCandidate struct {
 	filterDuration time.Duration
 }
 
-// BlockStats describes one candidate data block of a query. RowsProcessed and
+// BlockStats describes one candidate data block of a query. BlockOffset
+// identifies the block within its file by its row data offset. RowsProcessed and
 // BytesProcessed report what the scan actually read — rows and uncompressed
 // row bytes (length prefix included) — so a bloom-skipped block reports zero.
 // TotalRows and TotalBytes are the block's metadata totals (TotalBytes is the
-// on-disk block size, bloom filters included).
+// block's full on-disk footprint, its filter section included).
 //
 // Duration is the time the block cost the query, which is where its work
-// happened: reading and evaluating the block's filter section for a block
-// pruned by its filters, and that plus the row data read and scan for a block
-// that was scanned. It excludes time the block spent queued between the two.
+// happened: its share of the file's block filter region read plus its own
+// filter evaluation for a block pruned by its filters, and that plus the row
+// data read and scan for a block that was scanned. The region read is shared —
+// one read covers every candidate block of the file — so it is amortized evenly
+// across them rather than charged to whichever block was evaluated first.
+// Duration excludes time the block spent queued between the two stages.
 type BlockStats struct {
 	FilePointer        []byte
 	BlockOffset        int
@@ -178,8 +185,9 @@ const (
 //   - the file stage pulls one candidate at a time, enforces the prefilter, and
 //     applies the in-memory file-level bloom test;
 //   - a file worker evaluates that file's data block filters, reading every
-//     section on one pooled handle in a forward pass (see evaluateBlockFilters),
-//     and dispatches only the blocks that survive;
+//     candidate block's section in a single read of the file's block filter
+//     region (see evaluateBlockFilters), and dispatches only the blocks that
+//     survive;
 //   - block workers scan those blocks concurrently, reusing the file's pooled
 //     handles rather than opening one per block (see fileHandlePool).
 //
@@ -219,9 +227,9 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 	r := newResults(ctx)
 
 	// One handle pool per query: each candidate file is opened once for its
-	// block filter pass, and its block scans borrow that handle back instead of
-	// opening their own. The pool is closed on teardown, after every worker has
-	// exited.
+	// block filter region read, and its block scans borrow that handle back
+	// instead of opening their own. The pool is closed on teardown, after every
+	// worker has exited.
 	handles := newFileHandlePool(b.dataStore)
 
 	fileJobs := make(chan fileFilterJob, queryFileJobBuffer)
@@ -307,14 +315,15 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 					return
 				}
 
-				// Reading the sections as one forward pass needs them in offset
-				// order; the dispatch below indexes the same ordering.
-				blocks := blocksByAscendingOffset(job.blocks)
+				// Blocks are evaluated and dispatched in ascending row data
+				// order, so a file's row data reads move forward through the
+				// file; the dispatch below indexes the same ordering.
+				blocks := blocksByAscendingRowDataOffset(job.blocks)
 
 				// One reference spans the filter pass and the dispatch that
 				// follows, so the file's handles cannot be closed in between.
 				handles.retain(job.filePointer)
-				survivors = b.evaluateBlockFilters(r, &slot, handles, job.filePointer, blocks, pruneBloomQuery, survivors[:0])
+				survivors = b.evaluateBlockFilters(r, &slot, handles, job, blocks, pruneBloomQuery, survivors[:0])
 				// The filter pass is the I/O this worker holds a semaphore slot
 				// for; dispatch can block on the block workers, and a slot held
 				// while blocked would park it for every other query (and, at a
@@ -407,8 +416,10 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 			}
 
 			job := fileFilterJob{
-				filePointer: maybeFile.PointerBytes,
-				blocks:      maybeFile.Metadata.DataBlocks,
+				filePointer:        maybeFile.PointerBytes,
+				filterRegionOffset: maybeFile.Metadata.BlockFilterRegionOffset,
+				filterRegionSize:   maybeFile.Metadata.BlockFilterRegionSize,
+				blocks:             maybeFile.Metadata.DataBlocks,
 			}
 			if err := sendWithContext(r.ctx, fileJobs, job); err != nil {
 				return
@@ -435,13 +446,15 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 	return r, nil
 }
 
-// blocksByAscendingOffset returns the blocks ordered by file offset, so a
-// file's filter sections are read as one forward pass. Metadata almost always
-// arrives in offset order (blocks are written in order), so the common case
-// only verifies it; when a store yields them out of order the sort runs on a
-// copy, because the slice belongs to the MetaStore's yielded metadata.
-func blocksByAscendingOffset(blocks []DataBlockMetadata) []DataBlockMetadata {
-	byOffset := func(a, b DataBlockMetadata) int { return cmp.Compare(a.Offset, b.Offset) }
+// blocksByAscendingRowDataOffset returns the blocks ordered by row data offset,
+// which is the order the file worker evaluates and dispatches them in, so a
+// file's row data reads move forward through the file instead of jumping back.
+// Metadata almost always arrives in that order (blocks are written in order), so
+// the common case only verifies it; when a store yields them out of order the
+// sort runs on a copy, because the slice belongs to the MetaStore's yielded
+// metadata.
+func blocksByAscendingRowDataOffset(blocks []DataBlockMetadata) []DataBlockMetadata {
+	byOffset := func(a, b DataBlockMetadata) int { return cmp.Compare(a.RowDataOffset, b.RowDataOffset) }
 	if slices.IsSortedFunc(blocks, byOffset) {
 		return blocks
 	}
@@ -451,34 +464,36 @@ func blocksByAscendingOffset(blocks []DataBlockMetadata) []DataBlockMetadata {
 }
 
 // evaluateBlockFilters evaluates one candidate file's data block filters,
-// appending the blocks that survived to dst as indexes into blocks (which must
-// be in ascending offset order).
+// appending the blocks that survived to dst as indexes into blocks.
 //
-// Every filter section is read on a single pooled handle in that order — one
-// open and a forward pass per file, instead of an open and a seek per block —
-// and each block's filter bytes are released as soon as that block has been
-// evaluated, so a file's filter traffic never accumulates in memory.
+// The file's filter sections are contiguous on disk, so the pass costs one open
+// and a read per chunk of the region rather than a read per block: a
+// blockFilterCursor reads up to blockFilterChunkTarget bytes at a time into a
+// pooled buffer and decodes each block's filters from it, so a file whose whole
+// region fits the cap costs a single read. The handle is held for the pass and
+// returned to the pool before the survivors are dispatched, so the file's first
+// block scan borrows it back; the chunk buffer is released when the pass ends.
 //
 // Pruned blocks are accounted for here: each records its BlockStats with
 // BloomFilterSkipped set, zero rows and bytes processed, and a Duration
-// covering its filter read and evaluation, which is all the block cost.
-// Surviving blocks carry that duration to their scan job so their own
-// BlockStats.Duration still covers the whole block.
+// covering its share of the open and of the chunk read that served it, plus its
+// own evaluation — all the block cost. Surviving blocks carry that duration to
+// their scan job so their own BlockStats.Duration still covers the whole block.
 //
 // Failures keep the query going, and the blocks already evaluated keep their
 // outcome:
 //
-//   - A section that read but does not parse is that block's problem alone: the
-//     block records an error and the pass continues on the same handle.
-//   - A handle that fails a seek or read (or a file that cannot be opened at
-//     all) makes the rest of the file unreadable: the handle is dropped, the
-//     file records one error, and the blocks that never got their turn still
-//     record the stats entry every block owes.
+//   - A section that does not parse is that block's problem alone: the block
+//     records an error and the pass continues with the rest of the region.
+//   - A file that cannot be opened, or whose chunk read fails, or whose metadata
+//     does not describe a readable region, makes the whole file unreadable: the
+//     handle is dropped, the file records one error, and every block still
+//     records the stats entry it owes.
 func (b *BloomSearchEngine) evaluateBlockFilters(
 	r *Results,
 	slot *querySlot,
 	handles *fileHandlePool,
-	filePointer []byte,
+	job fileFilterJob,
 	blocks []DataBlockMetadata,
 	pruneBloomQuery *BloomQuery,
 	dst []blockScanCandidate,
@@ -496,16 +511,6 @@ func (b *BloomSearchEngine) evaluateBlockFilters(
 		return dst
 	}
 
-	// The handle is opened lazily (blocks without a filter section need none)
-	// and returned to the pool on every exit, so the file's first block scan
-	// borrows it back instead of opening its own.
-	var handle io.ReadSeekCloser
-	defer func() {
-		if handle != nil {
-			handles.put(filePointer, handle)
-		}
-	}()
-
 	// fail records a filter-evaluation failure unless the query has terminated:
 	// after cancellation or Close, the terminal state already tells the story
 	// and errors provoked by the teardown itself are noise.
@@ -516,56 +521,95 @@ func (b *BloomSearchEngine) evaluateBlockFilters(
 		r.recordBlockError(err)
 	}
 
+	if r.ctx.Err() != nil {
+		// Cancellation is neither an error nor a block outcome: the blocks
+		// record nothing, exactly like blocks still queued for a scan when the
+		// query terminates.
+		return dst
+	}
+
+	regionStart, regionEnd, hasSections, err := planBlockFilterReads(blocks, job.filterRegionOffset, job.filterRegionSize)
+	if err != nil {
+		fail(fmt.Errorf("unusable block filter region metadata: %w", err))
+		recordUnreadBlocks(r, job.filePointer, blocks, 0)
+		return dst
+	}
+	if !hasSections {
+		// Nothing to read, so the file is never even opened: absent filters
+		// disqualify nothing and every candidate block goes on to be scanned.
+		for i := range blocks {
+			dst = append(dst, blockScanCandidate{index: i})
+		}
+		return dst
+	}
+
+	openStart := time.Now()
+	handle, err := handles.acquire(r.ctx, job.filePointer)
+	openDuration := time.Since(openStart)
+	if err != nil {
+		fail(fmt.Errorf("failed to open file: %w", err))
+		recordUnreadBlocks(r, job.filePointer, blocks, openDuration)
+		return dst
+	}
+	// A handle whose read failed has an unknown stream position and must not be
+	// lent to the file's next reader; a healthy one goes back for the block scans.
+	handleHealthy := true
+	defer func() {
+		if handleHealthy {
+			handles.put(job.filePointer, handle)
+		} else {
+			handles.discard(handle)
+		}
+	}()
+
+	cursor := blockFilterCursor{file: handle, blocks: blocks, regionStart: regionStart, regionEnd: regionEnd}
+	defer cursor.release()
+
+	// The open serves the whole pass, so every block carries an even share of it.
+	// hasSections guarantees at least one block.
+	openShare := openDuration / time.Duration(len(blocks))
+
 	for i := range blocks {
 		if r.ctx.Err() != nil {
-			// Cancellation is neither an error nor a block outcome: the
-			// remaining blocks record nothing, exactly like blocks still queued
-			// for a scan when the query terminates.
 			return dst
 		}
 
 		block := blocks[i]
 		blockStart := time.Now()
 
-		if handle == nil {
-			opened, err := handles.acquire(r.ctx, filePointer)
-			if err != nil {
-				fail(fmt.Errorf("failed to open file: %w", err))
-				recordUnreadBlocks(r, filePointer, blocks[i:], time.Since(blockStart))
-				return dst
-			}
-			handle = opened
-		}
-
-		filters, handleFailed, err := readDataBlockBloomFilters(handle, &block)
+		filters, readShare, readFailed, err := cursor.filtersFor(i)
 		if err != nil {
 			fail(fmt.Errorf("failed to read data block bloom filters: %w", err))
-			if handleFailed {
-				handles.discard(handle)
-				handle = nil
-				recordUnreadBlocks(r, filePointer, blocks[i:], time.Since(blockStart))
+			if readFailed {
+				handleHealthy = false
+				recordUnreadBlocks(r, job.filePointer, blocks[i:], openShare+readShare+time.Since(blockStart))
 				return dst
 			}
-			recordUnreadBlocks(r, filePointer, blocks[i:i+1], time.Since(blockStart))
+			recordUnreadBlocks(r, job.filePointer, blocks[i:i+1], openShare+readShare+time.Since(blockStart))
 			continue
 		}
 
-		if b.evaluateBloomFilters(
+		survived := b.evaluateBloomFilters(
 			filters.FieldBloomFilter,
 			filters.TokenBloomFilter,
 			filters.FieldTokenBloomFilter,
 			pruneBloomQuery,
-		) {
-			dst = append(dst, blockScanCandidate{index: i, filterDuration: time.Since(blockStart)})
+		)
+		// The block's cost: its share of the open and of the chunk read that
+		// served it, plus reading its filters out of that chunk and testing them.
+		duration := openShare + readShare + time.Since(blockStart)
+
+		if survived {
+			dst = append(dst, blockScanCandidate{index: i, filterDuration: duration})
 			continue
 		}
 
 		r.recordBlockStats(BlockStats{
-			FilePointer:        filePointer,
-			BlockOffset:        block.Offset,
+			FilePointer:        job.filePointer,
+			BlockOffset:        block.RowDataOffset,
 			TotalRows:          int64(block.Rows),
-			TotalBytes:         int64(block.Size),
-			Duration:           time.Since(blockStart),
+			TotalBytes:         int64(block.OnDiskSize()),
+			Duration:           duration,
 			BloomFilterSkipped: true,
 		})
 	}
@@ -586,9 +630,9 @@ func recordUnreadBlocks(r *Results, filePointer []byte, blocks []DataBlockMetada
 		}
 		r.recordBlockStats(BlockStats{
 			FilePointer: filePointer,
-			BlockOffset: block.Offset,
+			BlockOffset: block.RowDataOffset,
 			TotalRows:   int64(block.Rows),
-			TotalBytes:  int64(block.Size),
+			TotalBytes:  int64(block.OnDiskSize()),
 			Duration:    duration,
 		})
 	}
@@ -618,15 +662,16 @@ func (b *BloomSearchEngine) processDataBlock(
 	// Record stats on every exit path. RowsProcessed/BytesProcessed report what
 	// was actually scanned (zero when the scan failed before reading rows);
 	// TotalRows/TotalBytes remain the block's full counts. Duration includes the
-	// block's filter read and evaluation, which the file stage performed.
+	// block's filter evaluation and its share of the file's region read, which
+	// the file stage performed.
 	defer func() {
 		r.recordBlockStats(BlockStats{
 			FilePointer:    job.filePointer,
-			BlockOffset:    job.blockMetadata.Offset,
+			BlockOffset:    job.blockMetadata.RowDataOffset,
 			RowsProcessed:  rowsScanned,
 			BytesProcessed: bytesScanned,
 			TotalRows:      int64(job.blockMetadata.Rows),
-			TotalBytes:     int64(job.blockMetadata.Size),
+			TotalBytes:     int64(job.blockMetadata.OnDiskSize()),
 			Duration:       job.filterDuration + time.Since(blockStartTime),
 		})
 	}()

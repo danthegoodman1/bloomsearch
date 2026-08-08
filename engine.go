@@ -74,7 +74,7 @@ type BloomSearchEngine struct {
 
 	// queryFilePruneHook, when set (tests only), observes each file that
 	// survives the file-level bloom test, after its filters are released and
-	// before its block jobs are enqueued. It is called from the query's
+	// before its block filter job is enqueued. It is called from the query's
 	// file-stage goroutine, one file at a time.
 	queryFilePruneHook func(MaybeFile)
 }

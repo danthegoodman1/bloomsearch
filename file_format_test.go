@@ -2,23 +2,24 @@ package bloomsearch
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
-	"io"
+	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/bits-and-blooms/bloom/v3"
 )
 
-// --- 5A: measured filter sizing ---
+// --- measured filter sizing ---
 
 // TestMeasuredFilterSizing asserts filters are sized from the measured
 // distinct entry counts of the flushed rows — not from row counts or a
@@ -163,211 +164,224 @@ func TestFalsePositiveRateWithinBudget(t *testing.T) {
 	t.Logf("measured FPR %.4f (configured %.4f, %d/%d probes)", measured, configuredFPR, falsePositives, probeCount)
 }
 
-// --- 5B: v1 compatibility and v2 round trip ---
+// --- on-disk layout, round trip, and corruption ---
 
-// v1FileMetadataJSON and v1DataBlockMetadataJSON replicate the metadata shape
-// the v1 (pre-Phase-5) writer produced, bloom filters embedded and all.
-type v1FileMetadataJSON struct {
-	BloomFilters           BloomFilters
-	BloomExpectedItems     uint
-	BloomFalsePositiveRate float64
-	DataBlocks             []v1DataBlockMetadataJSON
+// rawTestBlock is one data block of a hand-rolled file (see writeRawTestFile).
+// filterCapacity, when non-zero, sizes the block's filters for that many entries
+// instead of for the rows it actually holds, which is how a test gets filter
+// sections of a chosen size without a corpus large enough to earn them.
+type rawTestBlock struct {
+	partitionID    string
+	rows           []map[string]any
+	filterCapacity uint
 }
 
-type v1DataBlockMetadataJSON struct {
-	Offset                 int
-	Size                   int
-	Rows                   int
-	BloomFiltersSize       int
-	MinMaxIndexes          map[string]MinMaxIndex `json:",omitempty"`
-	PartitionID            string                 `json:",omitempty"`
-	Compression            CompressionType        `json:",omitempty"`
-	UncompressedSize       int                    `json:",omitempty"`
-	RowDataHash            uint32                 `json:",omitempty"`
-	BloomExpectedItems     uint
-	BloomFalsePositiveRate float64
-}
-
-// v1TestBlock is one data block of a hand-rolled v1 file.
-type v1TestBlock struct {
-	partitionID string
-	rows        []map[string]any
-}
-
-// writeV1TestFile hand-rolls a v1-format file exactly as the pre-Phase-5
-// writer did: uncompressed data blocks of length-prefixed JSON rows behind
-// JSON+CRC bloom filter sections, and a footer whose metadata JSON embeds
-// the file-level filters. includeRowHash=false replicates v1's 0-sentinel
-// "no hash" blocks.
-func writeV1TestFile(t *testing.T, path string, blocks []v1TestBlock, includeRowHash bool) {
+// writeRawTestFile hand-rolls a file in the current format: uncompressed row
+// data blocks of length-prefixed JSON rows, then the block filter region, then
+// the footer through the exported WriteFileFooter. It lets a test produce
+// framing the engine never writes — a block with no row data hash, metadata
+// that lies about the layout — and doubles as coverage that an external writer
+// can build a readable file from the exported footer writer.
+//
+// mutate, when non-nil, sees the metadata just before the footer is written.
+func writeRawTestFile(t *testing.T, path string, blocks []rawTestBlock, includeRowHash bool, mutate func(*FileMetadata)) {
 	t.Helper()
 
-	const (
-		expectedItems = uint(1000)
-		fpr           = 0.01
-	)
-
-	newFilters := func() BloomFilters {
-		return BloomFilters{
-			FieldBloomFilter:      bloom.NewWithEstimates(expectedItems, fpr),
-			TokenBloomFilter:      bloom.NewWithEstimates(expectedItems, fpr),
-			FieldTokenBloomFilter: bloom.NewWithEstimates(expectedItems, fpr),
-		}
-	}
-	fileFilters := newFilters()
+	const fpr = 0.01
 
 	var out bytes.Buffer
-	var crcBytes [HashSize]byte
-	var blockMetadatas []v1DataBlockMetadataJSON
+	var filterRegion blockFilterRegionWriter
+	fileEntries := newBloomEntrySets()
+	metadata := FileMetadata{BloomFalsePositiveRate: fpr}
 
 	for _, block := range blocks {
-		blockFilters := newFilters()
-
+		entries := newBloomEntrySets()
 		var rowData bytes.Buffer
+		var lengthBytes [LengthPrefixSize]byte
 		for _, row := range block.rows {
 			rowBytes, err := json.Marshal(row)
 			if err != nil {
 				t.Fatalf("failed to marshal row: %v", err)
 			}
-			entries := newBloomEntrySets()
 			entries.indexRow(rowBytes, BasicWhitespaceLowerTokenizer)
-			for _, filters := range []BloomFilters{blockFilters, fileFilters} {
-				for entry := range entries.fields {
-					filters.FieldBloomFilter.AddString(entry)
-				}
-				for entry := range entries.tokens {
-					filters.TokenBloomFilter.AddString(entry)
-				}
-				for entry := range entries.fieldTokens {
-					filters.FieldTokenBloomFilter.AddString(entry)
-				}
-			}
-
-			var lengthBytes [LengthPrefixSize]byte
 			binary.LittleEndian.PutUint32(lengthBytes[:], uint32(len(rowBytes)))
 			rowData.Write(lengthBytes[:])
 			rowData.Write(rowBytes)
 		}
+		entries.unionInto(fileEntries)
 
-		// v1 block filter section: JSON + CRC32C.
-		blockFilterJSON, err := json.Marshal(&blockFilters)
-		if err != nil {
-			t.Fatalf("failed to marshal block filters: %v", err)
+		filters := entries.buildFilters(fpr)
+		if block.filterCapacity > 0 {
+			// Same entries, filters sized for a capacity the rows never justify.
+			filters = BloomFilters{
+				FieldBloomFilter:      bloom.NewWithEstimates(block.filterCapacity, fpr),
+				TokenBloomFilter:      bloom.NewWithEstimates(block.filterCapacity, fpr),
+				FieldTokenBloomFilter: bloom.NewWithEstimates(block.filterCapacity, fpr),
+			}
+			for entry := range entries.fields {
+				filters.FieldBloomFilter.AddString(entry)
+			}
+			for entry := range entries.tokens {
+				filters.TokenBloomFilter.AddString(entry)
+			}
+			for entry := range entries.fieldTokens {
+				filters.FieldTokenBloomFilter.AddString(entry)
+			}
 		}
-		offset := out.Len()
-		out.Write(blockFilterJSON)
-		binary.LittleEndian.PutUint32(crcBytes[:], crc32.Checksum(blockFilterJSON, crc32cTable))
-		out.Write(crcBytes[:])
-		bloomFiltersSize := len(blockFilterJSON) + HashSize
+		section, err := encodeFilterSection(&filters)
+		if err != nil {
+			t.Fatalf("failed to encode filter section: %v", err)
+		}
+		filterOffset, filterSize := filterRegion.add(section)
+
+		rowDataOffset := out.Len()
 		out.Write(rowData.Bytes())
 
-		rowDataHash := uint32(0)
-		if includeRowHash {
-			rowDataHash = crc32.Checksum(rowData.Bytes(), crc32cTable)
-		}
-
-		blockMetadatas = append(blockMetadatas, v1DataBlockMetadataJSON{
-			Offset:                 offset,
-			Size:                   bloomFiltersSize + rowData.Len(),
-			Rows:                   len(block.rows),
-			BloomFiltersSize:       bloomFiltersSize,
+		metadata.DataBlocks = append(metadata.DataBlocks, DataBlockMetadata{
 			PartitionID:            block.partitionID,
+			Rows:                   len(block.rows),
+			RowDataOffset:          rowDataOffset,
+			RowDataSize:            rowData.Len(),
+			BloomFilterOffset:      filterOffset,
+			BloomFilterSize:        filterSize,
 			Compression:            CompressionNone,
 			UncompressedSize:       rowData.Len(),
-			RowDataHash:            rowDataHash,
-			BloomExpectedItems:     expectedItems,
+			RowDataHash:            crc32.Checksum(rowData.Bytes(), crc32cTable),
+			HasRowDataHash:         includeRowHash,
+			BloomEntryCounts:       entries.counts(),
 			BloomFalsePositiveRate: fpr,
 		})
 	}
 
-	metadata := v1FileMetadataJSON{
-		BloomFilters:           fileFilters,
-		BloomExpectedItems:     expectedItems,
-		BloomFalsePositiveRate: fpr,
-		DataBlocks:             blockMetadatas,
-	}
-	metadataJSON, err := json.Marshal(metadata)
+	regionOffset := out.Len()
+	regionSize, err := filterRegion.finish(&out, regionOffset, metadata.DataBlocks)
 	if err != nil {
-		t.Fatalf("failed to marshal v1 metadata: %v", err)
+		t.Fatalf("failed to write block filter region: %v", err)
 	}
-	out.Write(metadataJSON)
-	binary.LittleEndian.PutUint32(crcBytes[:], crc32.Checksum(metadataJSON, crc32cTable))
-	out.Write(crcBytes[:])
+	metadata.BlockFilterRegionOffset = regionOffset
+	metadata.BlockFilterRegionSize = regionSize
+	metadata.BloomFilters = fileEntries.buildFilters(fpr)
+	metadata.BloomEntryCounts = fileEntries.counts()
 
-	var lengthBytes [LengthPrefixSize]byte
-	binary.LittleEndian.PutUint32(lengthBytes[:], uint32(len(metadataJSON)))
-	out.Write(lengthBytes[:])
-
-	var versionBytes [VersionPrefixSize]byte
-	binary.LittleEndian.PutUint32(versionBytes[:], FileVersionV1)
-	out.Write(versionBytes[:])
-	out.WriteString(MagicBytes)
-
+	if mutate != nil {
+		mutate(&metadata)
+	}
+	if err := WriteFileFooter(&out, &metadata); err != nil {
+		t.Fatalf("failed to write footer: %v", err)
+	}
 	if err := os.WriteFile(path, out.Bytes(), 0o600); err != nil {
-		t.Fatalf("failed to write v1 file: %v", err)
+		t.Fatalf("failed to write test file: %v", err)
 	}
 }
 
-// TestV1FilesRemainReadable proves v1 files stay fully queryable by the v2
-// engine and mergeable with v2 files (through the rebuild path).
-func TestV1FilesRemainReadable(t *testing.T) {
+// TestBlockFilterRegionLayout asserts the on-disk layout a multi-block file is
+// written in: every block's row data first, contiguous from offset 0, then one
+// contiguous block filter region holding every block's filter section, then the
+// file-level filter section and footer. This is the layout that lets a query
+// read a whole file's block filters in one request; the per-file read count is
+// asserted in TestQueryFilterReadsPerFileNotPerBlock.
+func TestBlockFilterRegionLayout(t *testing.T) {
+	const blocks = 5
+
 	dir := t.TempDir()
-	writeV1TestFile(t, filepath.Join(dir, "v1file.dat"), []v1TestBlock{{rows: []map[string]any{
-		{"id": "v1row1", "service": "auth"},
-		{"id": "v1row2", "service": "payment"},
-	}}}, true)
+	store := buildMultiBlockFiles(t, dir, 1, blocks, 3)
 
-	engine, store := newFileSystemStoreEngine(t, dir, nil)
 	ctx := context.Background()
-
-	// Queries against the v1 file, through every filter level.
-	if ids := rowIDs(collectQueryRows(t, engine, nil)); ids["v1row1"] != 1 || ids["v1row2"] != 1 {
-		t.Fatalf("match-all over v1 file: got %v", ids)
-	}
-	if ids := rowIDs(collectQueryRows(t, engine, NewQuery().Token("v1row1").Build())); ids["v1row1"] != 1 || len(ids) != 1 {
-		t.Fatalf("token query over v1 file: got %v", ids)
-	}
-	if ids := rowIDs(collectQueryRows(t, engine, NewQuery().FieldToken("service", "auth").Build())); ids["v1row1"] != 1 || len(ids) != 1 {
-		t.Fatalf("fieldtoken query over v1 file: got %v", ids)
-	}
-	if rows := collectQueryRows(t, engine, NewQuery().Token("zzzabsenttoken").Build()); len(rows) != 0 {
-		t.Fatalf("miss query over v1 file returned %d rows", len(rows))
-	}
-
-	// Write a v2 file alongside and merge: the v1 blocks go through the
-	// rebuild path (their rows re-streamed, filters rebuilt right-sized).
-	ingestAndFlush(t, engine, []map[string]any{
-		{"id": "v2row1", "service": "search"},
-		{"id": "v2row2", "service": "billing"},
-	})
-	if _, err := engine.Merge(ctx); err != nil {
-		t.Fatalf("merge of v1+v2 files failed: %v", err)
-	}
-
 	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
-	if err != nil {
-		t.Fatalf("failed to list files: %v", err)
+	if err != nil || len(maybeFiles) != 1 {
+		t.Fatalf("expected 1 file, got %d (err %v)", len(maybeFiles), err)
 	}
-	if len(maybeFiles) != 1 {
-		t.Fatalf("expected 1 merged file, got %d", len(maybeFiles))
+	metadata := maybeFiles[0].Metadata
+	if len(metadata.DataBlocks) != blocks {
+		t.Fatalf("expected %d blocks, got %d", blocks, len(metadata.DataBlocks))
 	}
 
-	ids := rowIDs(collectQueryRows(t, engine, nil))
-	for _, id := range []string{"v1row1", "v1row2", "v2row1", "v2row2"} {
-		if ids[id] != 1 {
-			t.Fatalf("expected row %s exactly once after merge, got %d (%v)", id, ids[id], ids)
+	// Row data occupies the front of the file, one block after another.
+	rowData := slices.Clone(metadata.DataBlocks)
+	slices.SortFunc(rowData, func(a, b DataBlockMetadata) int { return cmp.Compare(a.RowDataOffset, b.RowDataOffset) })
+	expectedOffset := 0
+	for i, block := range rowData {
+		if block.RowDataOffset != expectedOffset {
+			t.Fatalf("block %d row data starts at %d, want %d (row data must be contiguous from 0)", i, block.RowDataOffset, expectedOffset)
+		}
+		if block.RowDataSize <= 0 {
+			t.Fatalf("block %d has no row data: %+v", i, block)
+		}
+		expectedOffset += block.RowDataSize
+	}
+
+	// The region begins where the row data ends and holds every block's filter
+	// section, back to back, with nothing left over.
+	if metadata.BlockFilterRegionOffset != expectedOffset {
+		t.Fatalf("block filter region starts at %d, want %d (immediately after the row data)",
+			metadata.BlockFilterRegionOffset, expectedOffset)
+	}
+	filters := slices.Clone(metadata.DataBlocks)
+	slices.SortFunc(filters, func(a, b DataBlockMetadata) int { return cmp.Compare(a.BloomFilterOffset, b.BloomFilterOffset) })
+	expectedOffset = metadata.BlockFilterRegionOffset
+	for i, block := range filters {
+		if block.BloomFilterOffset != expectedOffset {
+			t.Fatalf("block %d filter section starts at %d, want %d (sections must be contiguous)", i, block.BloomFilterOffset, expectedOffset)
+		}
+		if block.BloomFilterSize <= 0 {
+			t.Fatalf("block %d has no filter section: %+v", i, block)
+		}
+		expectedOffset += block.BloomFilterSize
+	}
+	if got := metadata.BlockFilterRegionOffset + metadata.BlockFilterRegionSize; got != expectedOffset {
+		t.Fatalf("block filter region ends at %d, but its sections end at %d", got, expectedOffset)
+	}
+
+	// The region and the footer account for the whole file: the file-level
+	// filter section starts where the region ends.
+	raw, err := os.ReadFile(string(maybeFiles[0].PointerBytes))
+	if err != nil {
+		t.Fatalf("failed to read file: %v", err)
+	}
+	fileFilterOffset, _ := footerOffsets(t, raw)
+	if int64(expectedOffset) != fileFilterOffset {
+		t.Fatalf("block filter region ends at %d but the file-level filter section starts at %d", expectedOffset, fileFilterOffset)
+	}
+
+	// Every block's filters are readable one at a time from those offsets too.
+	file, err := store.OpenFile(ctx, maybeFiles[0].PointerBytes)
+	if err != nil {
+		t.Fatalf("failed to open file: %v", err)
+	}
+	defer file.Close()
+	for i, block := range metadata.DataBlocks {
+		blockFilters, err := ReadDataBlockBloomFilters(file, block)
+		if err != nil {
+			t.Fatalf("block %d filters unreadable: %v", i, err)
+		}
+		if blockFilters.TokenBloomFilter == nil {
+			t.Fatalf("block %d has no token filter", i)
 		}
 	}
-	if ids := rowIDs(collectQueryRows(t, engine, NewQuery().Token("v1row2").Build())); ids["v1row2"] != 1 || len(ids) != 1 {
-		t.Fatalf("token query over merged file: got %v", ids)
-	}
 }
 
-// TestV2FormatRoundTrip writes a v2 file, reads its metadata and filters back
+// footerOffsets returns the offsets of a file's file-level filter section and
+// its metadata JSON, parsed from the fixed footer tail.
+func footerOffsets(t *testing.T, raw []byte) (fileFilterOffset, metadataOffset int64) {
+	t.Helper()
+
+	fileSize := int64(len(raw))
+	tail := int64(len(MagicBytes) + VersionPrefixSize + LengthPrefixSize + HashSize)
+	metadataLength := int64(binary.LittleEndian.Uint32(raw[fileSize-tail+int64(HashSize):]))
+	metadataOffset = fileSize - tail - metadataLength
+
+	var payload fileMetadataJSON
+	if err := json.Unmarshal(raw[metadataOffset:metadataOffset+metadataLength], &payload); err != nil {
+		t.Fatalf("failed to parse metadata JSON: %v", err)
+	}
+	return metadataOffset - int64(payload.FileFilterSectionSize), metadataOffset
+}
+
+// TestFileFormatRoundTrip writes a file, reads its metadata and filters back
 // exactly, and then corrupts every section in turn: each corruption must
 // produce a clean error — no panic — and a corrupt block must emit zero rows
 // (verify-before-emit).
-func TestV2FormatRoundTrip(t *testing.T) {
+func TestFileFormatRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	metaStore := NewMemoryMetaStore()
 	dataStore := NewFileSystemDataStore(dir)
@@ -418,6 +432,10 @@ func TestV2FormatRoundTrip(t *testing.T) {
 		t.Fatalf("metadata scalars round trip mismatch: wrote (%v, %+v), read (%v, %+v)",
 			source.BloomFalsePositiveRate, source.BloomEntryCounts, readBack.BloomFalsePositiveRate, readBack.BloomEntryCounts)
 	}
+	if readBack.BlockFilterRegionOffset != source.BlockFilterRegionOffset || readBack.BlockFilterRegionSize != source.BlockFilterRegionSize {
+		t.Fatalf("block filter region round trip mismatch: wrote (%d, %d), read (%d, %d)",
+			source.BlockFilterRegionOffset, source.BlockFilterRegionSize, readBack.BlockFilterRegionOffset, readBack.BlockFilterRegionSize)
+	}
 	if !readBack.BloomFilters.FieldBloomFilter.Equal(source.BloomFilters.FieldBloomFilter) ||
 		!readBack.BloomFilters.TokenBloomFilter.Equal(source.BloomFilters.TokenBloomFilter) ||
 		!readBack.BloomFilters.FieldTokenBloomFilter.Equal(source.BloomFilters.FieldTokenBloomFilter) {
@@ -443,15 +461,7 @@ func TestV2FormatRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read pristine file: %v", err)
 	}
-	fileSize := int64(len(pristine))
-	metadataLength := int64(binary.LittleEndian.Uint32(pristine[fileSize-8-4-4 : fileSize-8-4]))
-	metadataOffset := fileSize - 8 - 4 - 4 - int64(HashSize) - metadataLength
-
-	var v2meta fileMetadataV2JSON
-	if err := json.Unmarshal(pristine[metadataOffset:metadataOffset+metadataLength], &v2meta); err != nil {
-		t.Fatalf("failed to parse v2 metadata JSON: %v", err)
-	}
-	fileFilterOffset := metadataOffset - int64(v2meta.FileFilterSectionSize)
+	fileFilterOffset, metadataOffset := footerOffsets(t, pristine)
 
 	// corruptAt returns a directory holding a copy of the file with one byte
 	// flipped at the given offset.
@@ -500,8 +510,8 @@ func TestV2FormatRoundTrip(t *testing.T) {
 		}
 	})
 
-	t.Run("corrupt block filter section", func(t *testing.T) {
-		corruptDir, _ := corruptAt(t, int64(block.Offset)+1)
+	t.Run("corrupt block filter section in the region", func(t *testing.T) {
+		corruptDir, _ := corruptAt(t, int64(block.BloomFilterOffset)+1)
 		rows, err := queryCorrupt(t, corruptDir, NewQuery().Token("alpha").Build())
 		if err == nil {
 			t.Fatalf("expected block error from corrupt filter section")
@@ -515,7 +525,7 @@ func TestV2FormatRoundTrip(t *testing.T) {
 		// Flip a byte in the middle of the row data: the CRC check must
 		// reject the block before any row is emitted, even though earlier
 		// rows in the block are intact.
-		corruptDir, _ := corruptAt(t, int64(block.Offset+block.BloomFiltersSize)+int64(block.Size-block.BloomFiltersSize)/2)
+		corruptDir, _ := corruptAt(t, int64(block.RowDataOffset+block.RowDataSize/2))
 		rows, err := queryCorrupt(t, corruptDir, nil)
 		if err == nil {
 			t.Fatalf("expected block error from corrupt row data")
@@ -527,7 +537,7 @@ func TestV2FormatRoundTrip(t *testing.T) {
 
 	t.Run("corrupt row length prefix", func(t *testing.T) {
 		// The first 4 row data bytes are the first row's length prefix.
-		corruptDir, _ := corruptAt(t, int64(block.Offset+block.BloomFiltersSize))
+		corruptDir, _ := corruptAt(t, int64(block.RowDataOffset))
 		rows, err := queryCorrupt(t, corruptDir, nil)
 		if err == nil {
 			t.Fatalf("expected block error from corrupt length prefix")
@@ -538,35 +548,233 @@ func TestV2FormatRoundTrip(t *testing.T) {
 	})
 }
 
+// TestUnsupportedFileVersionRejected asserts a file whose footer carries any
+// other version is rejected outright rather than parsed as if the layout
+// matched: earlier versions stored block filters immediately before their row
+// data, so misreading one would read filters from row data bytes.
+func TestUnsupportedFileVersionRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wrongversion.dat")
+	writeRawTestFile(t, path, []rawTestBlock{{rows: []map[string]any{{"id": "r1"}}}}, true, nil)
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read file: %v", err)
+	}
+	versionOffset := len(raw) - len(MagicBytes) - VersionPrefixSize
+	for _, version := range []uint32{1, 2, FileVersion + 1} {
+		binary.LittleEndian.PutUint32(raw[versionOffset:], version)
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatalf("failed to write file: %v", err)
+		}
+		if _, err := NewFileSystemDataStore(dir).readFileMetadata(path); err == nil {
+			t.Fatalf("version %d was accepted", version)
+		} else if !strings.Contains(err.Error(), "unsupported file version") {
+			t.Fatalf("version %d: want an unsupported-version error, got %v", version, err)
+		}
+	}
+}
+
+// TestBlockFilterRegionFramingRejected asserts metadata whose recorded framing
+// does not describe the file is rejected when the footer is read, before any
+// reader can seek or slice by it. The metadata's own CRC covers these values, so
+// they cannot be flipped in place — each case is written by a writer that
+// records a lie.
+func TestBlockFilterRegionFramingRejected(t *testing.T) {
+	blocks := []rawTestBlock{
+		{rows: []map[string]any{{"id": "r1"}}},
+		{rows: []map[string]any{{"id": "r2"}}},
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*FileMetadata)
+		want   string
+	}{
+		{
+			name:   "region larger than the file",
+			mutate: func(m *FileMetadata) { m.BlockFilterRegionSize += 1 << 20 },
+			want:   "does not fit in the file",
+		},
+		{
+			name:   "region offset past the file",
+			mutate: func(m *FileMetadata) { m.BlockFilterRegionOffset += 1 << 20 },
+			want:   "does not fit in the file",
+		},
+		{
+			name:   "negative region size",
+			mutate: func(m *FileMetadata) { m.BlockFilterRegionSize = -1 },
+			want:   "invalid block filter region",
+		},
+		{
+			name: "region truncated below its sections",
+			mutate: func(m *FileMetadata) {
+				m.BlockFilterRegionSize -= m.DataBlocks[1].BloomFilterSize
+			},
+			want: "outside the block filter region",
+		},
+		{
+			name: "block filter section before the region",
+			mutate: func(m *FileMetadata) {
+				m.DataBlocks[0].BloomFilterOffset = m.BlockFilterRegionOffset - 1
+			},
+			want: "outside the block filter region",
+		},
+		{
+			name:   "negative block filter size",
+			mutate: func(m *FileMetadata) { m.DataBlocks[0].BloomFilterSize = -1 },
+			want:   "invalid bloom filter section size",
+		},
+		{
+			name: "row data overlapping the region",
+			mutate: func(m *FileMetadata) {
+				m.DataBlocks[0].RowDataSize = m.BlockFilterRegionOffset + 1
+			},
+			want: "runs past the block filter region",
+		},
+		{
+			name:   "negative row data offset",
+			mutate: func(m *FileMetadata) { m.DataBlocks[0].RowDataOffset = -1 },
+			want:   "invalid row data location",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "framing.dat")
+			writeRawTestFile(t, path, blocks, true, tc.mutate)
+
+			_, err := NewFileSystemDataStore(dir).readFileMetadata(path)
+			if err == nil {
+				t.Fatalf("expected an error reading a file with %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want an error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// blockMutatingMetaStore yields the wrapped store's files with mutate applied to
+// each file's metadata, so a test can serve block metadata that does not match
+// the file on disk — what a MetaStore holding its own copy could do, and what
+// the footer reader's validation cannot catch.
+type blockMutatingMetaStore struct {
+	inner  MetaStore
+	mutate func(*FileMetadata)
+}
+
+func (s *blockMutatingMetaStore) GetMaybeFilesForQuery(ctx context.Context, query *QueryPrefilter) iter.Seq2[MaybeFile, error] {
+	return func(yield func(MaybeFile, error) bool) {
+		for file, err := range s.inner.GetMaybeFilesForQuery(ctx, query) {
+			if err != nil {
+				yield(MaybeFile{}, err)
+				return
+			}
+			file.Metadata.DataBlocks = slices.Clone(file.Metadata.DataBlocks)
+			s.mutate(&file.Metadata)
+			if !yield(file, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (s *blockMutatingMetaStore) Update(ctx context.Context, writes []WriteOperation, deletes []DeleteOperation) error {
+	return s.inner.Update(ctx, writes, deletes)
+}
+
+// TestQueryRejectsOutOfBoundsFilterMetadata: a MetaStore serving block metadata
+// whose filter sections fall outside the file's block filter region — or outside
+// the file entirely — makes the query fail cleanly with no rows and no panic,
+// rather than reading filters from whatever bytes those offsets land on. Filters
+// read from the wrong bytes could produce false negatives, so the read must
+// refuse rather than guess.
+func TestQueryRejectsOutOfBoundsFilterMetadata(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*FileMetadata)
+	}{
+		{"filter section past the region", func(m *FileMetadata) {
+			m.DataBlocks[0].BloomFilterOffset = m.BlockFilterRegionOffset + m.BlockFilterRegionSize
+		}},
+		{"filter section before the region", func(m *FileMetadata) {
+			m.DataBlocks[0].BloomFilterOffset = 0
+		}},
+		{"absurd filter section size", func(m *FileMetadata) {
+			m.DataBlocks[0].BloomFilterSize = 1 << 40
+		}},
+		{"region past the end of the file", func(m *FileMetadata) {
+			m.BlockFilterRegionOffset += 1 << 30
+			m.BlockFilterRegionSize = 1 << 20
+			for i := range m.DataBlocks {
+				m.DataBlocks[i].BloomFilterOffset += 1 << 30
+			}
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fsStore := buildMultiBlockFiles(t, dir, 1, 3, 4)
+			metaStore := &blockMutatingMetaStore{inner: fsStore, mutate: tc.mutate}
+
+			config := DefaultBloomSearchEngineConfig()
+			config.MaxBufferedTime = time.Hour
+			engine, err := NewBloomSearchEngine(config, metaStore, fsStore)
+			if err != nil {
+				t.Fatalf("failed to create engine: %v", err)
+			}
+
+			res, err := engine.Query(context.Background(), NewQuery().Token(blockTestMarkerToken).Build())
+			if err != nil {
+				t.Fatalf("query setup failed: %v", err)
+			}
+			defer res.Close()
+			rows := 0
+			for res.Next() {
+				rows++
+			}
+			if res.Err() == nil {
+				t.Fatalf("expected an error from unusable filter metadata")
+			}
+			if rows != 0 {
+				t.Fatalf("delivered %d rows from a file whose filter metadata is unusable", rows)
+			}
+		})
+	}
+}
+
 // TestOversizeRowLengthRejected corrupts a row length prefix in a block that
-// carries no row data hash (the v1 fail-open case, where no CRC can catch it
-// first): the scanner must reject the oversized length with a clean error
-// instead of attempting a giant allocation.
+// carries no row data hash, so no CRC can catch it first: the scanner must
+// reject the oversized length with a clean error instead of attempting a giant
+// allocation.
 func TestOversizeRowLengthRejected(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "v1nohash.dat")
-	writeV1TestFile(t, path, []v1TestBlock{{rows: []map[string]any{
+	path := filepath.Join(dir, "nohash.dat")
+	writeRawTestFile(t, path, []rawTestBlock{{rows: []map[string]any{
 		{"id": "r1"},
 		{"id": "r2"},
-	}}}, false /* includeRowHash: v1 no-hash sentinel */)
+	}}}, false /* includeRowHash */, nil)
 
 	// Locate the row data start from the (valid) metadata and stamp an
 	// absurd length into the first row's prefix.
 	store := NewFileSystemDataStore(dir)
 	metadata, err := store.readFileMetadata(path)
 	if err != nil {
-		t.Fatalf("failed to read v1 metadata: %v", err)
+		t.Fatalf("failed to read metadata: %v", err)
 	}
 	block := metadata.DataBlocks[0]
 	if block.HasRowDataHash {
-		t.Fatalf("test requires a hashless block (v1 sentinel)")
+		t.Fatalf("test requires a block with no row data hash")
 	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("failed to read file: %v", err)
 	}
-	binary.LittleEndian.PutUint32(raw[block.Offset+block.BloomFiltersSize:], 0xFFFFFF00)
+	binary.LittleEndian.PutUint32(raw[block.RowDataOffset:], 0xFFFFFF00)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatalf("failed to write corrupted file: %v", err)
 	}
@@ -593,73 +801,13 @@ func TestOversizeRowLengthRejected(t *testing.T) {
 	}
 }
 
-// --- 5C: conditional filter reads and file filter release ---
-
-// readRange records one Read against a tracked file handle.
-type readRange struct {
-	offset int64
-	length int
-}
-
-// readTrackingStore wraps FileSystemDataStore, recording the byte ranges of
-// every Read on handles opened through OpenFile.
-type readTrackingStore struct {
-	*FileSystemDataStore
-	mu    sync.Mutex
-	reads []readRange
-}
-
-func (s *readTrackingStore) OpenFile(ctx context.Context, filePointerBytes []byte) (io.ReadSeekCloser, error) {
-	file, err := s.FileSystemDataStore.OpenFile(ctx, filePointerBytes)
-	if err != nil {
-		return nil, err
-	}
-	return &readTrackingFile{file: file, store: s}, nil
-}
-
-func (s *readTrackingStore) record(offset int64, length int) {
-	s.mu.Lock()
-	s.reads = append(s.reads, readRange{offset: offset, length: length})
-	s.mu.Unlock()
-}
-
-func (s *readTrackingStore) snapshot() []readRange {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]readRange(nil), s.reads...)
-}
-
-type readTrackingFile struct {
-	file  io.ReadSeekCloser
-	store *readTrackingStore
-	pos   int64
-}
-
-func (f *readTrackingFile) Read(p []byte) (int, error) {
-	n, err := f.file.Read(p)
-	if n > 0 {
-		f.store.record(f.pos, n)
-		f.pos += int64(n)
-	}
-	return n, err
-}
-
-func (f *readTrackingFile) Seek(offset int64, whence int) (int64, error) {
-	pos, err := f.file.Seek(offset, whence)
-	if err == nil {
-		f.pos = pos
-	}
-	return pos, err
-}
-
-func (f *readTrackingFile) Close() error {
-	return f.file.Close()
-}
+// --- conditional filter reads and file filter release ---
 
 // TestNoFilterReadWhenNoBloomConditions asserts that a query without bloom
-// conditions never reads a block's filter section: scans jump straight to the
-// row data. A bloom-conditioned control query proves the tracker sees filter
-// reads when they do happen.
+// conditions never reads into the block filter region: scans go straight to the
+// row data, and the file is never even opened for a filter pass. A
+// bloom-conditioned control query proves the tracker sees filter reads when they
+// do happen.
 func TestNoFilterReadWhenNoBloomConditions(t *testing.T) {
 	dir := t.TempDir()
 	seedEngine, fsStore := newFileSystemStoreEngine(t, dir, nil)
@@ -671,7 +819,7 @@ func TestNoFilterReadWhenNoBloomConditions(t *testing.T) {
 	seedEngine.Stop(stopCtx)
 	cancel()
 
-	tracking := &readTrackingStore{FileSystemDataStore: fsStore}
+	tracking := &instrumentedDataStore{inner: fsStore}
 	config := DefaultBloomSearchEngineConfig()
 	config.MaxBufferedTime = time.Hour
 	engine, err := NewBloomSearchEngine(config, fsStore, tracking)
@@ -690,19 +838,21 @@ func TestNoFilterReadWhenNoBloomConditions(t *testing.T) {
 	if err != nil || len(maybeFiles) != 1 {
 		t.Fatalf("expected 1 file, got %d (err %v)", len(maybeFiles), err)
 	}
-	blocks := maybeFiles[0].Metadata.DataBlocks
+	file := maybeFiles[0]
+	regionStart := int64(file.Metadata.BlockFilterRegionOffset)
+	regionEnd := regionStart + int64(file.Metadata.BlockFilterRegionSize)
+	if file.Metadata.BlockFilterRegionSize <= 0 {
+		t.Fatalf("file has no block filter region: %+v", file.Metadata)
+	}
 
-	intersectsFilterSection := func(reads []readRange) bool {
-		for _, read := range reads {
-			for _, block := range blocks {
-				sectionStart := int64(block.Offset)
-				sectionEnd := int64(block.Offset + block.BloomFiltersSize)
-				if read.offset < sectionEnd && read.offset+int64(read.length) > sectionStart {
-					return true
-				}
+	readsIntoRegion := func() int {
+		count := 0
+		for _, read := range tracking.readsFor(file.PointerBytes) {
+			if read.offset < regionEnd && read.offset+int64(read.length) > regionStart {
+				count++
 			}
 		}
-		return false
+		return count
 	}
 
 	// Match-all query: no bloom conditions, no regex.
@@ -710,17 +860,15 @@ func TestNoFilterReadWhenNoBloomConditions(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("match-all returned %d rows, want 2", len(rows))
 	}
-	if intersectsFilterSection(tracking.snapshot()) {
-		t.Fatalf("block filter section was read for a query with no bloom conditions")
+	if n := readsIntoRegion(); n != 0 {
+		t.Fatalf("%d reads touched the block filter region for a query with no bloom conditions", n)
 	}
 
-	// Control: a bloom-conditioned query must read the filter section.
-	tracking.mu.Lock()
-	tracking.reads = nil
-	tracking.mu.Unlock()
+	// Control: a bloom-conditioned query must read the region.
+	tracking.resetReads()
 	_ = collectQueryRows(t, engine, NewQuery().Token("one").Build())
-	if !intersectsFilterSection(tracking.snapshot()) {
-		t.Fatalf("control query with bloom conditions did not read the filter section (tracker broken?)")
+	if n := readsIntoRegion(); n != 1 {
+		t.Fatalf("control query with bloom conditions issued %d region reads, want 1", n)
 	}
 }
 
@@ -783,7 +931,7 @@ func TestFileFiltersReleasedAfterFileTest(t *testing.T) {
 	}
 }
 
-// --- 5E: merge-time rebuild ---
+// --- merge-time rebuild ---
 
 // TestMergeRebuildsFilters merges blocks whose filters have different sizes
 // (measured sizing makes that the norm) and asserts the merged block's
@@ -906,91 +1054,115 @@ func TestMergeRebuildsFilters(t *testing.T) {
 	}
 }
 
-// TestV1FilterSectionInsideV2Container exercises the case that motivates
-// content-based filter section dispatch: a v1 block that cannot merge (alone
-// in its partition) is raw-copied — v1 JSON filter section and all — into a
-// v2 output file, and bloom-conditioned queries against it still work.
-func TestV1FilterSectionInsideV2Container(t *testing.T) {
-	dir := t.TempDir()
-	// v1 file: a "p" block that will merge with the v2 file's "p" block, and
-	// a "q" block alone in its partition, which the merge raw-copies.
-	writeV1TestFile(t, filepath.Join(dir, "v1file.dat"), []v1TestBlock{
-		{partitionID: "p", rows: []map[string]any{{"id": "v1p1", "part": "p"}}},
-		{partitionID: "q", rows: []map[string]any{{"id": "v1q1", "part": "q"}}},
-	}, true)
+// TestMergeRebuildsBlockFilterRegion merges files whose blocks mostly cannot
+// combine — each partition is alone, so most blocks are copied verbatim — and
+// asserts the output is a well-formed multi-block file: its blocks' filter
+// sections were rebuilt into one contiguous region behind the row data, the
+// copied sections still decode, and every row is still findable through a
+// bloom-conditioned query.
+func TestMergeRebuildsBlockFilterRegion(t *testing.T) {
+	const partitions = 6
 
+	dir := t.TempDir()
 	engine, store := newFileSystemStoreEngine(t, dir, func(config *BloomSearchEngineConfig) {
+		config.RowDataCompression = CompressionNone
 		config.PartitionFunc = func(row map[string]any) string {
 			part, _ := row["part"].(string)
 			return part
 		}
 	})
-	ingestAndFlush(t, engine, []map[string]any{{"id": "v2p1", "part": "p"}})
-
 	ctx := context.Background()
+
+	// Two files: partition "p0" exists in both (its blocks merge), every other
+	// partition exists in one file only (its block is copied verbatim).
+	var wantIDs []string
+	for f := 0; f < 2; f++ {
+		var rows []map[string]any
+		for p := 0; p < partitions; p++ {
+			part := fmt.Sprintf("p%d", p)
+			if p != 0 && p%2 != f {
+				continue
+			}
+			id := fmt.Sprintf("f%d-%s", f, part)
+			rows = append(rows, map[string]any{"id": id, "part": part})
+			wantIDs = append(wantIDs, id)
+		}
+		ingestAndFlush(t, engine, rows)
+	}
+
 	if _, err := engine.Merge(ctx); err != nil {
 		t.Fatalf("merge failed: %v", err)
 	}
 
-	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
-	if err != nil || len(maybeFiles) != 1 {
-		t.Fatalf("expected 1 merged file, got %d (err %v)", len(maybeFiles), err)
+	after, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
+	if err != nil || len(after) != 1 {
+		t.Fatalf("expected 1 merged file, got %d (err %v)", len(after), err)
 	}
-	merged := maybeFiles[0]
+	merged := after[0]
+	metadata := merged.Metadata
+	if len(metadata.DataBlocks) != partitions {
+		t.Fatalf("expected %d blocks in the merged file (one per partition), got %d", partitions, len(metadata.DataBlocks))
+	}
 
-	var qBlock *DataBlockMetadata
-	for i := range merged.Metadata.DataBlocks {
-		if merged.Metadata.DataBlocks[i].PartitionID == "q" {
-			qBlock = &merged.Metadata.DataBlocks[i]
+	// The output's row data is contiguous from 0 and its filter sections are
+	// contiguous inside the recorded region.
+	rowDataEnd := 0
+	for i := range metadata.DataBlocks {
+		rowDataEnd += metadata.DataBlocks[i].RowDataSize
+	}
+	if metadata.BlockFilterRegionOffset != rowDataEnd {
+		t.Fatalf("merged region starts at %d, want %d (right after %d bytes of row data)",
+			metadata.BlockFilterRegionOffset, rowDataEnd, rowDataEnd)
+	}
+	regionEnd := metadata.BlockFilterRegionOffset + metadata.BlockFilterRegionSize
+	sectionBytes := 0
+	for i, block := range metadata.DataBlocks {
+		if block.BloomFilterOffset < metadata.BlockFilterRegionOffset || block.BloomFilterOffset+block.BloomFilterSize > regionEnd {
+			t.Fatalf("merged block %d filter section [%d,%d) is outside the region [%d,%d)",
+				i, block.BloomFilterOffset, block.BloomFilterOffset+block.BloomFilterSize,
+				metadata.BlockFilterRegionOffset, regionEnd)
 		}
+		sectionBytes += block.BloomFilterSize
 	}
-	if qBlock == nil {
-		t.Fatalf("no q block in merged file: %+v", merged.Metadata.DataBlocks)
+	if sectionBytes != metadata.BlockFilterRegionSize {
+		t.Fatalf("merged blocks' sections total %d bytes but the region is %d", sectionBytes, metadata.BlockFilterRegionSize)
 	}
 
-	// The q block was raw-copied: its filter section inside the v2 container
-	// is still v1 JSON (leading '{'), and the shared reader parses it.
-	raw, err := os.ReadFile(string(merged.PointerBytes))
-	if err != nil {
-		t.Fatalf("failed to read merged file: %v", err)
-	}
-	if raw[qBlock.Offset] != '{' {
-		t.Fatalf("expected raw-copied v1 JSON filter section (leading '{'), got %#x", raw[qBlock.Offset])
-	}
+	// Every block's rebuilt or copied section decodes and holds its rows.
 	file, err := store.OpenFile(ctx, merged.PointerBytes)
 	if err != nil {
 		t.Fatalf("failed to open merged file: %v", err)
 	}
-	qFilters, err := ReadDataBlockBloomFilters(file, *qBlock)
-	file.Close()
-	if err != nil {
-		t.Fatalf("failed to parse v1 filter section inside v2 file: %v", err)
-	}
-	if !qFilters.TokenBloomFilter.TestString("v1q1") {
-		t.Fatalf("copied v1 block filter lost its token")
+	defer file.Close()
+	for i, block := range metadata.DataBlocks {
+		filters, err := ReadDataBlockBloomFilters(file, block)
+		if err != nil {
+			t.Fatalf("merged block %d (partition %q) filters unreadable: %v", i, block.PartitionID, err)
+		}
+		if !filters.FieldTokenBloomFilter.TestString(makeFieldTokenKey("part", block.PartitionID)) {
+			t.Fatalf("merged block %d lost its partition field:token entry", i)
+		}
 	}
 
-	// End-to-end bloom-conditioned query against the copied block.
-	if ids := rowIDs(collectQueryRows(t, engine, NewQuery().Token("v1q1").Build())); ids["v1q1"] != 1 || len(ids) != 1 {
-		t.Fatalf("token query against copied v1 block: got %v", ids)
-	}
-	// The rebuilt p block still finds both its rows.
-	for _, id := range []string{"v1p1", "v2p1"} {
+	// Bloom-conditioned queries still find every row exactly once.
+	for _, id := range wantIDs {
 		if ids := rowIDs(collectQueryRows(t, engine, NewQuery().Token(id).Build())); ids[id] != 1 {
-			t.Fatalf("row %s not found after merge: %v", id, ids)
+			t.Fatalf("row %s not found exactly once after merge: %v", id, ids)
 		}
 	}
 }
 
 // TestMergeAbortsOnCorruptSourceBlock corrupts a source block before a merge
-// — the raw-copy path (row data and filter section) and the rebuild path —
+// — the verbatim-copy path (row data and filter section) and the rebuild path —
 // and asserts the merge aborts cleanly: both source files stay intact and
-// referenced, and no output artifacts are left behind.
+// referenced, and no output artifacts are left behind. The copy path verifies
+// the source's filter section before its bytes reach the output's filter
+// region, so a corrupt section can never be copied through.
 func TestMergeAbortsOnCorruptSourceBlock(t *testing.T) {
 	cases := []struct {
 		name string
 		// partition of the block to corrupt: "q" is alone in its partition
-		// (raw-copied), "p" exists in both files (rebuilt).
+		// (copied verbatim), "p" exists in both files (rebuilt).
 		partition string
 		// corrupt inside the filter section instead of the row data
 		filterSection bool
@@ -1016,7 +1188,7 @@ func TestMergeAbortsOnCorruptSourceBlock(t *testing.T) {
 			dir := t.TempDir()
 			seed, store := newFileSystemStoreEngine(t, dir, configure)
 			// file1: p+q blocks; file2: p block only. The p blocks merge, the
-			// q block is raw-copied.
+			// q block is copied verbatim.
 			ingestAndFlush(t, seed, []map[string]any{
 				{"id": "p1", "part": "p"},
 				{"id": "q1", "part": "q"},
@@ -1052,9 +1224,9 @@ func TestMergeAbortsOnCorruptSourceBlock(t *testing.T) {
 				t.Fatalf("target block not found")
 			}
 
-			corruptOffset := targetBlock.Offset + targetBlock.BloomFiltersSize // first row data byte
+			corruptOffset := targetBlock.RowDataOffset // first row data byte
 			if tc.filterSection {
-				corruptOffset = targetBlock.Offset + 1 // inside the filter section
+				corruptOffset = targetBlock.BloomFilterOffset + 1 // inside the filter section
 			}
 			raw, err := os.ReadFile(targetPath)
 			if err != nil {

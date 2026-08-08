@@ -44,8 +44,10 @@ type QueryStats struct {
 	// Duration is the time from Query returning the cursor until the last
 	// block worker finished, or the elapsed time so far while in flight.
 	Duration time.Duration
-	// BlockStats holds per-block detail, one element per block job that ran.
-	// Collection is lossless: every block job contributes exactly one entry.
+	// BlockStats holds per-block detail, one element per candidate block the
+	// query evaluated — including blocks their filters pruned, which the file
+	// stage records without ever enqueueing a block job. Collection is lossless:
+	// every candidate block contributes exactly one entry.
 	BlockStats []BlockStats
 }
 

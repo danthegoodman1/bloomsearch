@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -17,24 +18,67 @@ import (
 )
 
 // Tests for the query read path's per-query handle pool: a candidate file is
-// opened for its block filter pass and its block scans reuse that handle, so
-// DataStore opens scale with candidate files rather than with data blocks.
+// opened once to read its block filter region and its block scans reuse that
+// handle, so DataStore opens scale with candidate files rather than with data
+// blocks.
 
 // instrumentedDataStore wraps a DataStore and watches every handle the engine
 // opens through it: how many were opened and closed, whether any handle was
 // closed twice, and whether two goroutines ever used one at the same time
-// (which the DataStore contract forbids). readFault, when set, fails reads.
+// (which the DataStore contract forbids). It also records every read's byte
+// range per file, which is how tests assert where the read path goes and how
+// many requests it takes to get there. readFault, when set, fails reads.
 type instrumentedDataStore struct {
 	inner DataStore
 
 	opens         atomic.Int64
 	closes        atomic.Int64
+	reads         atomic.Int64
 	doubleCloses  atomic.Int64
 	concurrentUse atomic.Int64
+
+	rangesMu sync.Mutex
+	ranges   map[string][]readRange
 
 	// readFault is consulted before each Read with the handle's file pointer
 	// and the offset the read starts at; a non-nil result fails the read.
 	readFault func(pointer []byte, offset int64) error
+}
+
+// readRange is one read request against a file: where it started and how many
+// bytes it drew. A request is one Seek followed by an io.ReadFull — what an
+// object store would charge as a range GET — so successive Read calls draining
+// one ReadFull are folded into a single range (see instrumentedHandle.accumulate)
+// rather than counted separately.
+type readRange struct {
+	offset int64
+	length int
+}
+
+func (s *instrumentedDataStore) record(pointer []byte, offset int64, length int) {
+	s.rangesMu.Lock()
+	defer s.rangesMu.Unlock()
+	if s.ranges == nil {
+		s.ranges = make(map[string][]readRange)
+	}
+	s.ranges[string(pointer)] = append(s.ranges[string(pointer)], readRange{offset: offset, length: length})
+}
+
+// readsFor returns the reads recorded against one file, in no particular order
+// across concurrent readers.
+func (s *instrumentedDataStore) readsFor(pointer []byte) []readRange {
+	s.rangesMu.Lock()
+	defer s.rangesMu.Unlock()
+	return slices.Clone(s.ranges[string(pointer)])
+}
+
+// resetReads forgets every recorded read, so a second query over the same store
+// is measured on its own.
+func (s *instrumentedDataStore) resetReads() {
+	s.rangesMu.Lock()
+	defer s.rangesMu.Unlock()
+	s.ranges = nil
+	s.reads.Store(0)
 }
 
 func (s *instrumentedDataStore) CreateFile(ctx context.Context) (io.WriteCloser, []byte, error) {
@@ -62,6 +106,44 @@ type instrumentedHandle struct {
 	inUse  atomic.Bool
 	closed atomic.Bool
 	pos    atomic.Int64
+
+	// The read request currently being drained, closed out by the next Seek or by
+	// Close. Counts are settled once the query's handle pool has closed every
+	// handle, which happens before the cursor reports its terminal state.
+	requestMu    sync.Mutex
+	requestStart int64
+	requestLen   int
+	requestOpen  bool
+}
+
+// accumulate folds one Read into the request it belongs to: a Read starting where
+// the previous one ended is the same io.ReadFull still being drained, which the
+// OS is free to split, not a second request.
+func (h *instrumentedHandle) accumulate(offset int64, n int) {
+	h.requestMu.Lock()
+	defer h.requestMu.Unlock()
+
+	if h.requestOpen && h.requestStart+int64(h.requestLen) == offset {
+		h.requestLen += n
+		return
+	}
+	h.flushLocked()
+	h.requestOpen, h.requestStart, h.requestLen = true, offset, n
+}
+
+func (h *instrumentedHandle) flushLocked() {
+	if !h.requestOpen {
+		return
+	}
+	h.store.record(h.pointer, h.requestStart, h.requestLen)
+	h.store.reads.Add(1)
+	h.requestOpen = false
+}
+
+func (h *instrumentedHandle) flush() {
+	h.requestMu.Lock()
+	defer h.requestMu.Unlock()
+	h.flushLocked()
 }
 
 // enter and exit bracket every use of the handle. A failed claim means another
@@ -91,6 +173,7 @@ func (h *instrumentedHandle) Read(p []byte) (int, error) {
 	}
 	n, err := h.inner.Read(p)
 	if n > 0 {
+		h.accumulate(offset, n)
 		h.pos.Store(offset + int64(n))
 	}
 	return n, err
@@ -102,6 +185,8 @@ func (h *instrumentedHandle) Seek(offset int64, whence int) (int64, error) {
 
 	pos, err := h.inner.Seek(offset, whence)
 	if err == nil {
+		// A seek ends whatever request was being drained.
+		h.flush()
 		h.pos.Store(pos)
 	}
 	return pos, err
@@ -112,6 +197,7 @@ func (h *instrumentedHandle) Close() error {
 		h.store.doubleCloses.Add(1)
 		return nil
 	}
+	h.flush()
 	h.store.closes.Add(1)
 	return h.inner.Close()
 }
@@ -239,7 +325,7 @@ func TestQueryOpensPerFileNotPerBlock(t *testing.T) {
 	const rowsPerBlock = 4
 
 	// The needle query survives exactly one block filter per file, so exactly
-	// one block scan follows the file's filter pass and reuses its handle:
+	// one block scan follows the file's filter region read and reuses its handle:
 	// one open per file, whatever the concurrency budget.
 	for _, blocksPerFile := range []int{4, 8} {
 		for _, concurrency := range []int{1, 4, 1000} {
@@ -317,6 +403,312 @@ func TestQueryOpensPerFileNotPerBlock(t *testing.T) {
 			store.check(t)
 		})
 	}
+}
+
+// TestQueryFilterReadsPerFileNotPerBlock: a bloom-conditioned query consults
+// every block of a candidate file with a single read, because the file's block
+// filter sections are contiguous on disk and these files' regions fit inside one
+// blockFilterChunkTarget chunk. The read count per file — and the query's total —
+// must therefore not grow when the same files hold 16x the blocks, which is the
+// whole point of the block filter region. Regions too large for one chunk are
+// covered by TestQueryFilterRegionReadsAreChunked.
+func TestQueryFilterReadsPerFileNotPerBlock(t *testing.T) {
+	const files = 3
+	const rowsPerBlock = 4
+
+	blockCounts := []int{2, 8, 32}
+	totalReads := make(map[int]int64, len(blockCounts))
+
+	for _, blocksPerFile := range blockCounts {
+		t.Run(fmt.Sprintf("blocks=%d", blocksPerFile), func(t *testing.T) {
+			fsStore := buildMultiBlockFiles(t, t.TempDir(), files, blocksPerFile, rowsPerBlock)
+			store := &instrumentedDataStore{inner: fsStore}
+			engine := queryEngineOver(t, fsStore, store, 4)
+
+			ctx := context.Background()
+			maybeFiles, err := collectMaybeFiles(ctx, fsStore.GetMaybeFilesForQuery(ctx, nil))
+			if err != nil {
+				t.Fatalf("failed to list files: %v", err)
+			}
+
+			rows, res := drainQuery(t, engine, NewQuery().Token(blockTestMarkerToken).Build())
+			defer res.Close()
+			if err := res.Err(); err != nil {
+				t.Fatalf("query error: %v", err)
+			}
+			if len(rows) != files*rowsPerBlock {
+				t.Fatalf("delivered %d rows, want %d", len(rows), files*rowsPerBlock)
+			}
+
+			for _, file := range maybeFiles {
+				if filterReads := regionReads(t, store, file); len(filterReads) != 1 {
+					t.Fatalf("%d reads touched the block filter region of a %d-block file, want exactly 1",
+						len(filterReads), len(file.Metadata.DataBlocks))
+				}
+			}
+
+			if opens := store.opens.Load(); opens != files {
+				t.Fatalf("opened %d handles for %d files, want %d", opens, files, files)
+			}
+			totalReads[blocksPerFile] = store.reads.Load()
+			store.check(t)
+		})
+	}
+
+	// One region read plus one row data read per file, whatever the block count.
+	for _, blocksPerFile := range blockCounts {
+		if got, want := totalReads[blocksPerFile], totalReads[blockCounts[0]]; got != want {
+			t.Fatalf("a %d-block-per-file query issued %d reads, but a %d-block-per-file one issued %d: reads scale with blocks",
+				blocksPerFile, got, blockCounts[0], want)
+		}
+	}
+	if want := int64(2 * files); totalReads[blockCounts[0]] != want {
+		t.Fatalf("query issued %d reads over %d files, want %d (one filter region read and one row data read each)",
+			totalReads[blockCounts[0]], files, want)
+	}
+}
+
+// regionReads returns the read requests the store recorded against a file that
+// touched its block filter region.
+func regionReads(t *testing.T, store *instrumentedDataStore, file MaybeFile) []readRange {
+	t.Helper()
+
+	if file.Metadata.BlockFilterRegionSize <= 0 {
+		t.Fatalf("file has no block filter region: %+v", file.Metadata)
+	}
+	regionStart := int64(file.Metadata.BlockFilterRegionOffset)
+	regionEnd := regionStart + int64(file.Metadata.BlockFilterRegionSize)
+
+	var reads []readRange
+	for _, read := range store.readsFor(file.PointerBytes) {
+		if read.offset < regionEnd && read.offset+int64(read.length) > regionStart {
+			reads = append(reads, read)
+		}
+	}
+	return reads
+}
+
+const (
+	// largeSectionCapacity sizes a hand-rolled block's filters so its section runs
+	// about 1.5MiB: two fit in a blockFilterChunkTarget chunk and three do not.
+	// The tests below assert that packing, so a drift in bloom sizing fails loudly
+	// instead of quietly changing what they measure.
+	largeSectionCapacity = 440_000
+	// oversizedSectionCapacity sizes a single section larger than a whole chunk.
+	oversizedSectionCapacity = 1_300_000
+)
+
+// buildLargeFilterRegionFile writes one file of blocks blocks whose filter
+// sections are each sized for capacity entries — far more than the single row a
+// block holds — so the file's block filter region spans several chunks without a
+// corpus large enough to earn filters that big. Block i is alone in partition "i"
+// and holds {"id": "p<i>", "part": "<i>"}, so a partition prefilter selects an
+// exact set of blocks.
+func buildLargeFilterRegionFile(t *testing.T, dir string, blocks int, capacity uint) *FileSystemDataStore {
+	t.Helper()
+
+	raw := make([]rawTestBlock, blocks)
+	for i := range raw {
+		partition := fmt.Sprintf("%d", i)
+		raw[i] = rawTestBlock{
+			partitionID:    partition,
+			filterCapacity: capacity,
+			rows:           []map[string]any{{"id": fmt.Sprintf("p%d", i), "part": partition}},
+		}
+	}
+	writeRawTestFile(t, filepath.Join(dir, "largeregion.dat"), raw, true, nil)
+	return NewFileSystemDataStore(dir)
+}
+
+// uniformSectionSize returns the size every block's filter section has, failing if
+// they differ: the chunk-count expectations below are closed forms over equal,
+// contiguous sections.
+func uniformSectionSize(t *testing.T, metadata FileMetadata) int {
+	t.Helper()
+
+	size := metadata.DataBlocks[0].BloomFilterSize
+	for i, block := range metadata.DataBlocks {
+		if block.BloomFilterSize != size {
+			t.Fatalf("block %d filter section is %d bytes but block 0 is %d: the expectations assume uniform sections",
+				i, block.BloomFilterSize, size)
+		}
+	}
+	return size
+}
+
+// singleFile returns the one file a fixture wrote.
+func singleFile(t *testing.T, store MetaStore) MaybeFile {
+	t.Helper()
+
+	ctx := context.Background()
+	maybeFiles, err := collectMaybeFiles(ctx, store.GetMaybeFilesForQuery(ctx, nil))
+	if err != nil {
+		t.Fatalf("failed to list files: %v", err)
+	}
+	if len(maybeFiles) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(maybeFiles))
+	}
+	return maybeFiles[0]
+}
+
+// TestQueryFilterRegionReadsAreChunked: a block filter region too large to read
+// in one go is read in chunks of at most blockFilterChunkTarget bytes — several
+// sections per chunk, and never a chunk's worth of memory more than that. The cap
+// is what keeps a file worker's transient memory bounded no matter how many
+// blocks a file holds; batching within it is what keeps the request count far
+// below one per block.
+func TestQueryFilterRegionReadsAreChunked(t *testing.T) {
+	const blocks = 6
+
+	fsStore := buildLargeFilterRegionFile(t, t.TempDir(), blocks, largeSectionCapacity)
+	file := singleFile(t, fsStore)
+	sectionSize := uniformSectionSize(t, file.Metadata)
+
+	// The fixture only measures anything if the region needs several chunks.
+	perChunk := blockFilterChunkTarget / sectionSize
+	if perChunk != 2 {
+		t.Fatalf("%d-byte sections pack %d per %d-byte chunk, want 2 (retune largeSectionCapacity)",
+			sectionSize, perChunk, blockFilterChunkTarget)
+	}
+	wantReads := (blocks + perChunk - 1) / perChunk
+
+	store := &instrumentedDataStore{inner: fsStore}
+	engine := queryEngineOver(t, fsStore, store, 4)
+
+	// Field("part") is in every block, so every block is consulted and survives.
+	rows, res := drainQuery(t, engine, NewQuery().Field("part").Build())
+	defer res.Close()
+	if err := res.Err(); err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != blocks {
+		t.Fatalf("delivered %d rows, want %d", len(rows), blocks)
+	}
+
+	reads := regionReads(t, store, file)
+	if len(reads) != wantReads {
+		t.Fatalf("%d reads covered a %d-byte region of %d sections, want %d (%d sections per %d-byte chunk)",
+			len(reads), file.Metadata.BlockFilterRegionSize, blocks, wantReads, perChunk, blockFilterChunkTarget)
+	}
+	for _, read := range reads {
+		if read.length > blockFilterChunkTarget {
+			t.Fatalf("a region read drew %d bytes, above the %d-byte chunk cap", read.length, blockFilterChunkTarget)
+		}
+	}
+	if len(reads) >= blocks {
+		t.Fatalf("%d reads for %d sections: chunks are not batching sections", len(reads), blocks)
+	}
+	store.check(t)
+}
+
+// TestQueryFilterRegionReadsSkipSparseGaps: when a prefilter leaves only a few
+// candidate blocks scattered across a large region, the reads cover their sections
+// and not the gaps between them. Each chunk starts at the section of the block
+// being evaluated, so a gap wider than the cap is never paid for — which is why
+// sparse coverage costs fewer reads than dense coverage of the same region.
+func TestQueryFilterRegionReadsSkipSparseGaps(t *testing.T) {
+	const blocks = 6
+
+	fsStore := buildLargeFilterRegionFile(t, t.TempDir(), blocks, largeSectionCapacity)
+	file := singleFile(t, fsStore)
+	sectionSize := uniformSectionSize(t, file.Metadata)
+
+	// Two candidates at opposite ends of the region, further apart than a chunk.
+	sparseQuery := NewQuery().Field("part").
+		MatchPrefilter(Partition(PartitionIn("0", fmt.Sprintf("%d", blocks-1)))).
+		Build()
+
+	store := &instrumentedDataStore{inner: fsStore}
+	engine := queryEngineOver(t, fsStore, store, 4)
+	rows, res := drainQuery(t, engine, sparseQuery)
+	defer res.Close()
+	if err := res.Err(); err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("delivered %d rows, want 2", len(rows))
+	}
+
+	sparse := regionReads(t, store, file)
+	if len(sparse) != 2 {
+		t.Fatalf("%d region reads for 2 sparse candidates, want 2 (one per candidate section)", len(sparse))
+	}
+	for _, read := range sparse {
+		if read.length != sectionSize {
+			t.Fatalf("a region read drew %d bytes for a %d-byte section: the gap between the sparse candidates was read too",
+				read.length, sectionSize)
+		}
+	}
+	store.check(t)
+
+	// Dense coverage of the same region takes more reads, which is the comparison
+	// that makes the point.
+	denseStore := &instrumentedDataStore{inner: fsStore}
+	denseEngine := queryEngineOver(t, fsStore, denseStore, 4)
+	_, denseRes := drainQuery(t, denseEngine, NewQuery().Field("part").Build())
+	defer denseRes.Close()
+	if err := denseRes.Err(); err != nil {
+		t.Fatalf("dense query error: %v", err)
+	}
+	if dense := regionReads(t, denseStore, file); len(dense) <= len(sparse) {
+		t.Fatalf("dense coverage took %d region reads and sparse took %d: sparse candidates are not saving requests",
+			len(dense), len(sparse))
+	}
+	denseStore.check(t)
+}
+
+// TestQueryOversizedFilterSectionIsRead: a single filter section larger than the
+// chunk cap is read on its own, in full. The cap bounds how much slack a read may
+// carry, never whether a block can be consulted — a block whose filters do not fit
+// a chunk must still be evaluated rather than failed.
+func TestQueryOversizedFilterSectionIsRead(t *testing.T) {
+	dir := t.TempDir()
+	writeRawTestFile(t, filepath.Join(dir, "oversized.dat"), []rawTestBlock{
+		{partitionID: "big", filterCapacity: oversizedSectionCapacity,
+			rows: []map[string]any{{"id": "bigrow", "part": "big"}}},
+		{partitionID: "small", rows: []map[string]any{{"id": "smallrow", "part": "small"}}},
+	}, true, nil)
+
+	fsStore := NewFileSystemDataStore(dir)
+	file := singleFile(t, fsStore)
+
+	var big DataBlockMetadata
+	for _, block := range file.Metadata.DataBlocks {
+		if block.PartitionID == "big" {
+			big = block
+		}
+	}
+	if big.BloomFilterSize <= blockFilterChunkTarget {
+		t.Fatalf("the oversized block's section is %d bytes, not above the %d-byte cap (retune oversizedSectionCapacity)",
+			big.BloomFilterSize, blockFilterChunkTarget)
+	}
+
+	store := &instrumentedDataStore{inner: fsStore}
+	engine := queryEngineOver(t, fsStore, store, 4)
+
+	rows, res := drainQuery(t, engine, NewQuery().Token("bigrow").Build())
+	defer res.Close()
+	if err := res.Err(); err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	if ids := rowIDs(rows); ids["bigrow"] != 1 || len(ids) != 1 {
+		t.Fatalf("row behind an oversized filter section not found exactly once: %v", ids)
+	}
+
+	oversized := 0
+	for _, read := range regionReads(t, store, file) {
+		if read.offset != int64(big.BloomFilterOffset) {
+			continue
+		}
+		oversized++
+		if read.length != big.BloomFilterSize {
+			t.Fatalf("the oversized section was read as %d bytes, want its full %d", read.length, big.BloomFilterSize)
+		}
+	}
+	if oversized != 1 {
+		t.Fatalf("%d reads started at the oversized section, want exactly 1", oversized)
+	}
+	store.check(t)
 }
 
 // TestQueryHandleExclusivity: no pooled handle is ever read or seeked by two
@@ -450,7 +842,7 @@ func (s *descendingBlockMetaStore) GetMaybeFilesForQuery(ctx context.Context, qu
 			for i, block := range file.Metadata.DataBlocks {
 				descending[len(descending)-1-i] = block
 			}
-			slices.SortFunc(descending, func(a, b DataBlockMetadata) int { return cmp.Compare(b.Offset, a.Offset) })
+			slices.SortFunc(descending, func(a, b DataBlockMetadata) int { return cmp.Compare(b.RowDataOffset, a.RowDataOffset) })
 			file.Metadata.DataBlocks = descending
 
 			s.mu.Lock()
@@ -469,9 +861,9 @@ func (s *descendingBlockMetaStore) Update(ctx context.Context, writes []WriteOpe
 }
 
 // TestQueryFilterPassOrdersBlocksItself: a MetaStore that yields data blocks out
-// of offset order still gets the right block scanned — the filter pass orders
-// the blocks for its forward read pass, and it orders a copy, leaving the
-// store's slice untouched.
+// of row data order still gets the right block scanned — the file worker orders
+// the blocks so its row data reads move forward through the file, and it orders a
+// copy, leaving the store's slice untouched.
 func TestQueryFilterPassOrdersBlocksItself(t *testing.T) {
 	const files = 2
 	const blocksPerFile = 5
@@ -514,7 +906,7 @@ func TestQueryFilterPassOrdersBlocksItself(t *testing.T) {
 		t.Fatalf("store yielded %d files, want %d", len(metaStore.yields), files)
 	}
 	for i, blocks := range metaStore.yields {
-		if !slices.IsSortedFunc(blocks, func(a, b DataBlockMetadata) int { return cmp.Compare(b.Offset, a.Offset) }) {
+		if !slices.IsSortedFunc(blocks, func(a, b DataBlockMetadata) int { return cmp.Compare(b.RowDataOffset, a.RowDataOffset) }) {
 			t.Fatalf("file %d: the engine reordered the MetaStore's own block slice", i)
 		}
 	}
@@ -524,7 +916,7 @@ func TestQueryFilterPassOrdersBlocksItself(t *testing.T) {
 // errInjectedFilterFault is the sentinel the filter-read fault injects.
 var errInjectedFilterFault = errors.New("injected filter read fault")
 
-// TestQueryFilterReadFailureIsolatesFile: when one file's block filter section
+// TestQueryFilterReadFailureIsolatesFile: when one file's block filter region
 // cannot be read, that file is abandoned with a single recorded error while the
 // other files' rows are delivered in full, and the abandoned file's blocks
 // still each contribute one BlockStats entry.
@@ -543,16 +935,14 @@ func TestQueryFilterReadFailureIsolatesFile(t *testing.T) {
 	}
 	poisoned := maybeFiles[0]
 
-	// Fail only reads that start at a block offset, which is where a filter
-	// section begins; row data starts past the section, so scans are untouched.
-	filterOffsets := make(map[int64]bool, len(poisoned.Metadata.DataBlocks))
-	for _, block := range poisoned.Metadata.DataBlocks {
-		filterOffsets[int64(block.Offset)] = true
-	}
+	// Fail only the read of the poisoned file's block filter region, which starts
+	// at the region offset when every block is a candidate. Row data lives before
+	// the region, so the scans of the other files' blocks are untouched.
+	regionOffset := int64(poisoned.Metadata.BlockFilterRegionOffset)
 	store := &instrumentedDataStore{
 		inner: fsStore,
 		readFault: func(pointer []byte, offset int64) error {
-			if string(pointer) == string(poisoned.PointerBytes) && filterOffsets[offset] {
+			if string(pointer) == string(poisoned.PointerBytes) && offset == regionOffset {
 				return errInjectedFilterFault
 			}
 			return nil
@@ -631,7 +1021,7 @@ func TestQueryBlockStatsParityUnderFilterPruning(t *testing.T) {
 	wantScanned := make(map[blockKey]bool)
 	for _, file := range maybeFiles {
 		for _, block := range file.Metadata.DataBlocks {
-			key := blockKey{file: string(file.PointerBytes), offset: block.Offset}
+			key := blockKey{file: string(file.PointerBytes), offset: block.RowDataOffset}
 			wantTotals[key] = int64(block.Rows)
 			if block.PartitionID == "0" {
 				wantScanned[key] = true
