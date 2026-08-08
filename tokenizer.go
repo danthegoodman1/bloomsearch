@@ -8,12 +8,16 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// The functions in this file define the single canonical representation of a
-// row for indexing and matching: the row's marshaled JSON bytes, enumerated by
-// forEachPathValue. Ingest indexing (bloom filter population) and query-time
-// row verification both walk rows through this one implementation, which makes
-// disagreement between them — the source of every false negative — impossible
-// by construction.
+// The functions in this file define the canonical representation of a row for
+// indexing and matching: the row's marshaled JSON bytes, enumerated as
+// (path, value, isLeaf) emissions. Ingest indexing (bloom filter population)
+// and query-time row verification both walk rows through the one production
+// walker (pathWalker in row_matcher.go), which makes disagreement between
+// them — the source of every false negative — impossible by construction.
+// forEachPathValue here is the reference enumeration with identical semantics,
+// used by the exported Test* helpers and by the property/differential tests,
+// which cross-validate the two implementations; the two walkers must stay
+// emission-for-emission identical.
 //
 // Field path semantics:
 //   - Paths are object keys joined with the delimiter. Keys are always treated
@@ -190,7 +194,14 @@ type rowLeaf struct {
 // rowMatchSets is a row's enumeration under the shared walker, in the same
 // shape the bloom filters were populated from at ingest: every path (including
 // intermediates), tokens from primitive leaves, and exact-leaf-path::token
-// pairs. Expressions are evaluated against these sets.
+// pairs. Expressions are evaluated against these sets. This is the reference
+// row-verification implementation; the engine's scan path evaluates the same
+// semantics through compiledRowMatcher (row_matcher.go), and
+// TestCompiledMatcherEquivalence holds the two together — with one carve-out:
+// the compiled matcher compares FieldToken (path, token) pairs directly
+// instead of this joined key, which is strictly stricter when a path or token
+// itself contains "::" (it removes a joined-key false-positive class and can
+// never lose a true match; pinned by TestFieldTokenJoinedKeyCollisionPinned).
 type rowMatchSets struct {
 	paths       map[string]struct{}
 	tokens      map[string]struct{}

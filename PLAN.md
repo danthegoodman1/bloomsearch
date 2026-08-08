@@ -225,11 +225,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 6A: Zero-reflection, low-alloc ingest indexing | Missing: implementation + ingest benchmark delta. |
-| Incomplete | Work | 6B: Compiled per-query matcher; zero-alloc token compare; no per-row copy | Missing: implementation + scan benchmark delta. |
-| Incomplete | Work | 6C: Pooled codecs with single-threaded settings | Missing: implementation + zstd-path benchmark delta. |
-| Incomplete | Work | 6D: Merge copy elimination + near-linear grouping | Missing: implementation + merge benchmark delta. |
-| Incomplete | Gate | Benchmarks hit targets; PERFORMANCE.md regenerated from real runs | Missing: benchstat artifacts. |
+| Complete | Work | 6A: Low-alloc ingest indexing | Entry-set scratch reuse on the shared walker; `requestPool` deleted. Ingest 50→21 allocs/row (−58%), −13-17% time (reviewer-reproduced). |
+| Complete | Work | 6B: Compiled per-query matcher; zero-alloc token compare; no per-row copy | `row_matcher.go`: single-walk monotone early-exit matcher, `pathWalker` (fuzz-verified emission-identical to reference, 3000 docs + adversarial shapes), zero-alloc fold/word scanner (≡ tokenizer, unicode-verified), unsafe-view matching with copy-on-match. Hit 7.0→3.5ms (2.01×), allocs −74%; Regex 2.48×, allocs −82%. Tests: `TestCompiledMatcherEquivalence`, `TestMatchedRowNoAliasing`, `TestCustomTokenizerStillWorks`, `TestFieldTokenJoinedKeyCollisionPinned` (documented stricter-only `::` carve-out). |
+| Complete | Work | 6C: Pooled codecs + scan buffers | `codec_pool.go`: zstd/snappy pools (concurrency-1, drop-on-error — reviewer traced every path), 64MiB-capped scan buffer pool; batched row delivery (64/batch, cancellation contract preserved). |
+| Complete | Work | 6D: Merge alloc reduction + near-linear grouping | Rebuild walk on compiled scratch; injective `blockMergeKey` bucketing (membership proven identical); print-only report loop deleted. Merge allocs 84.9k→12.8k (−85%), time parity. |
+| Complete | Gate | Benchmarks hit targets; PERFORMANCE.md updated from real runs | All targets met (hit ≥2× in every reviewer pairing; scan allocs −74% vs ≥50% target; ingest −58% vs ≥50%; merge −85% vs ≥47% target). Interleaved benchstat, reviewer-reproduced. Phase 6 benchstat section in PERFORMANCE.md; full doc regeneration in Phase 7E. `go test -race` ok (7.9s, coordinator-verified). |
 
 ## Phase 7: Surface hygiene and documentation truth
 

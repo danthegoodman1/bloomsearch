@@ -1,5 +1,41 @@
 # Performance Testing
 
+## Phase 6 hot-path results (benchstat, interleaved before/after)
+
+`go test -bench` suite (`bench_test.go`), 4 interleaved runs per side on an M3 Max
+(baseline = Phase 5 HEAD 9bd6a6c, new = compiled row matcher + entry-set scratch
+reuse + pooled codecs/buffers + batched row delivery):
+
+```
+                       │  baseline   │      phase 6        vs base
+                       │   sec/op    │   sec/op
+Ingest-16                3.974µ ± ∞    3.315µ ± ∞   -16.58% (p=0.029 n=4)
+QueryFieldTokenHit-16    7.042m ± ∞    3.481m ± ∞   -50.57% (p=0.029 n=4)
+QueryTokenMiss-16        268.6µ ± ∞    271.2µ ± ∞         ~ (p=0.886 n=4)
+QueryRegex-16           10.232m ± ∞    4.149m ± ∞   -59.45% (p=0.029 n=4)
+Merge-16                 28.94m ± ∞    28.79m ± ∞         ~ (p=0.886 n=4)
+
+                       │  allocs/op  │  allocs/op
+Ingest-16                 50.00 ± ∞     21.00 ± ∞   -58.00% (p=0.029 n=4)
+QueryFieldTokenHit-16   264.46k ± ∞    68.58k ± ∞   -74.07% (p=0.029 n=4)
+QueryTokenMiss-16         512.0 ± ∞     516.0 ± ∞    +0.78% (p=0.029 n=4)
+QueryRegex-16           360.85k ± ∞    64.62k ± ∞   -82.09% (p=0.029 n=4)
+Merge-16                 84.89k ± ∞    12.84k ± ∞   -84.88% (p=0.029 n=4)
+
+                       │    B/op     │    B/op
+Ingest-16               2.006Ki ± ∞   1.129Ki ± ∞   -43.71% (p=0.029 n=4)
+QueryFieldTokenHit-16  26.956Mi ± ∞   7.652Mi ± ∞   -71.61% (p=0.029 n=4)
+QueryTokenMiss-16       382.8Ki ± ∞   381.1Ki ± ∞    -0.46% (p=0.029 n=4)
+QueryRegex-16          47.211Mi ± ∞   7.529Mi ± ∞   -84.05% (p=0.029 n=4)
+Merge-16                6.812Mi ± ∞   3.605Mi ± ∞   -47.08% (p=0.029 n=4)
+```
+
+Ingest throughput metric: 251.7k → 301.7k rows/s (+19.9%). The
+`TestPropertyNoFalseNegatives` end-to-end property test (thousands of derived
+queries) runs ~0.57s → ~0.48s.
+
+## Earlier exploration
+
 I've explored using:
 
 1. Per-file concurrency instead of per-block

@@ -11,8 +11,6 @@ import (
 	"hash/crc32"
 
 	"github.com/bits-and-blooms/bloom/v3"
-	"github.com/klauspost/compress/snappy"
-	"github.com/klauspost/compress/zstd"
 )
 
 var (
@@ -340,6 +338,14 @@ type DataBlockMetadata struct {
 // block's UncompressedSize — the stream must decode to exactly that many
 // bytes — so a corrupt stream cannot force unbounded allocation.
 func decodeBlockRowData(compressed []byte, block *DataBlockMetadata) ([]byte, error) {
+	return decodeBlockRowDataInto(nil, compressed, block)
+}
+
+// decodeBlockRowDataInto is decodeBlockRowData decoding into dst when dst has
+// capacity for the block's UncompressedSize (a fresh buffer is allocated
+// otherwise; dst's length is ignored). With CompressionNone the returned slice
+// is compressed itself, never dst.
+func decodeBlockRowDataInto(dst []byte, compressed []byte, block *DataBlockMetadata) ([]byte, error) {
 	if block.HasRowDataHash {
 		actualHash := crc32.Checksum(compressed, crc32cTable)
 		if actualHash != block.RowDataHash {
@@ -352,13 +358,15 @@ func decodeBlockRowData(compressed []byte, block *DataBlockMetadata) ([]byte, er
 	case CompressionNone:
 		return compressed, nil
 	case CompressionSnappy:
-		decompressor = snappy.NewReader(bytes.NewReader(compressed))
+		reader := getPooledSnappyReader(bytes.NewReader(compressed))
+		defer putPooledSnappyReader(reader)
+		decompressor = reader
 	case CompressionZstd:
-		decoder, err := zstd.NewReader(bytes.NewReader(compressed))
+		decoder, err := getPooledZstdDecoder(bytes.NewReader(compressed))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 		}
-		defer decoder.Close()
+		defer putPooledZstdDecoder(decoder)
 		decompressor = decoder
 	default:
 		return nil, fmt.Errorf("unsupported compression type: %s", block.Compression)
@@ -367,7 +375,12 @@ func decodeBlockRowData(compressed []byte, block *DataBlockMetadata) ([]byte, er
 	if block.UncompressedSize < 0 {
 		return nil, fmt.Errorf("invalid uncompressed size %d", block.UncompressedSize)
 	}
-	rowData := make([]byte, block.UncompressedSize)
+	var rowData []byte
+	if cap(dst) >= block.UncompressedSize {
+		rowData = dst[:block.UncompressedSize]
+	} else {
+		rowData = make([]byte, block.UncompressedSize)
+	}
 	if _, err := io.ReadFull(decompressor, rowData); err != nil {
 		return nil, fmt.Errorf("row data shorter than metadata UncompressedSize %d: %w", block.UncompressedSize, err)
 	}
@@ -384,7 +397,9 @@ func decodeBlockRowData(compressed []byte, block *DataBlockMetadata) ([]byte, er
 
 // readBlockRowData reads a block's compressed row data fully (bounded by the
 // block's metadata Size) and returns the verified, decompressed row bytes;
-// see decodeBlockRowData for the verification order and bounds.
+// see decodeBlockRowData for the verification order and bounds. The returned
+// buffer is plainly allocated and safe to retain (the merge path retains
+// views into it via custom-tokenizer output; see bloomEntrySets.indexRow).
 func readBlockRowData(file io.ReadSeeker, block *DataBlockMetadata) ([]byte, error) {
 	compressedSize := block.Size - block.BloomFiltersSize
 	if block.BloomFiltersSize < 0 || compressedSize < 0 {
@@ -400,6 +415,57 @@ func readBlockRowData(file io.ReadSeeker, block *DataBlockMetadata) ([]byte, err
 	}
 
 	return decodeBlockRowData(compressed, block)
+}
+
+// readPooledBlockRowData is readBlockRowData with both the compressed and
+// decompressed buffers drawn from the scan buffer pool. The caller must call
+// release exactly once, only after no view into the returned buffer can be
+// dereferenced again: the buffer will be handed to another block scan and
+// overwritten. The query scan path qualifies — row matching parses transient
+// views and delivered rows are materialized from independent copies — which is
+// exactly what TestMatchedRowNoAliasing guards. The merge path must keep using
+// readBlockRowData: its entry-set indexing can retain custom-tokenizer output
+// aliasing the buffer.
+func readPooledBlockRowData(file io.ReadSeeker, block *DataBlockMetadata) (rowData []byte, release func(), err error) {
+	compressedSize := block.Size - block.BloomFiltersSize
+	if block.BloomFiltersSize < 0 || compressedSize < 0 {
+		return nil, nil, fmt.Errorf("invalid block sizes (size %d, bloom filter section %d)", block.Size, block.BloomFiltersSize)
+	}
+	if block.UncompressedSize < 0 {
+		return nil, nil, fmt.Errorf("invalid uncompressed size %d", block.UncompressedSize)
+	}
+
+	if _, err := file.Seek(int64(block.Offset+block.BloomFiltersSize), io.SeekStart); err != nil {
+		return nil, nil, fmt.Errorf("failed to seek to row data: %w", err)
+	}
+	compressed := getScanBuffer(compressedSize)
+	if _, err := io.ReadFull(file, compressed); err != nil {
+		putScanBuffer(compressed)
+		return nil, nil, fmt.Errorf("failed to read row data: %w", err)
+	}
+
+	if normalizeCompression(block.Compression) == CompressionNone {
+		// The decoded data is the compressed buffer itself (after the CRC
+		// check); it is released as the row data.
+		rowData, err := decodeBlockRowData(compressed, block)
+		if err != nil {
+			putScanBuffer(compressed)
+			return nil, nil, err
+		}
+		return rowData, func() { putScanBuffer(compressed) }, nil
+	}
+
+	dst := getScanBuffer(block.UncompressedSize)
+	rowData, err = decodeBlockRowDataInto(dst, compressed, block)
+	// The decompressors copy into rowData and their pooled state is Reset
+	// inside decode, so the compressed buffer is reusable as soon as decode
+	// returns.
+	putScanBuffer(compressed)
+	if err != nil {
+		putScanBuffer(dst)
+		return nil, nil, err
+	}
+	return rowData, func() { putScanBuffer(rowData) }, nil
 }
 
 // blockRowScanner iterates the length-prefixed rows of a decoded row data

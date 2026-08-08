@@ -9,10 +9,19 @@ import (
 	"time"
 )
 
-// queryRowBuffer is the size of the engine-owned row buffer between block
-// workers and the Results cursor: enough to smooth worker/consumer
-// interleaving without letting a stalled consumer accumulate unbounded rows.
-const queryRowBuffer = 256
+// Matched rows travel from block workers to the Results cursor in worker-local
+// batches: per-row sends on a shared channel made the channel lock the scan
+// bottleneck once row verification itself became cheap. queryRowBatchSize rows
+// are accumulated per worker before one channel send; queryRowBatchBuffer
+// batches may sit in the channel, bounding buffered-but-undelivered rows at
+// queryRowBatchBuffer×queryRowBatchSize (256, the same bound the previous
+// per-row buffer provided) so a stalled consumer cannot accumulate unbounded
+// rows. The tradeoff is first-row latency: a matched row waits until its batch
+// fills or its block's scan ends, so delivery lags by at most one block scan.
+const (
+	queryRowBatchSize   = 64
+	queryRowBatchBuffer = 4
+)
 
 // QueryStats summarizes the work a query performed. Obtain it from
 // Results.Stats; it is complete once Next has returned false.
@@ -27,10 +36,10 @@ type QueryStats struct {
 	// actually read across all blocks (bloom-skipped blocks contribute zero).
 	RowsScanned  int64
 	BytesScanned int64
-	// RowsMatched counts rows that matched the query during scanning. On a
-	// clean completion it equals the number of rows observed through Next;
-	// after cancellation or Close it may exceed them, because matched rows
-	// buffered for delivery are dropped at termination.
+	// RowsMatched counts matched rows delivered toward the cursor. On a clean
+	// completion it equals the number of rows observed through Next; after
+	// cancellation or Close the two may differ, because matched rows still
+	// buffered (or batched in a worker) at termination are dropped.
 	RowsMatched int64
 	// Duration is the time from Query returning the cursor until the last
 	// block worker finished, or the elapsed time so far while in flight.
@@ -65,8 +74,8 @@ type Results struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	rowChan chan map[string]any // closed once all block workers finish
-	done    chan struct{}       // closed once all block workers finish and stats are frozen
+	rowChan chan []map[string]any // closed once all block workers finish
+	done    chan struct{}         // closed once all block workers finish and stats are frozen
 
 	rowsMatched atomic.Int64
 
@@ -80,9 +89,12 @@ type Results struct {
 
 	start time.Time
 
-	// Iteration state, owned by the goroutine calling Next/Row.
-	current  map[string]any
-	iterDone bool
+	// Iteration state, owned by the goroutine calling Next/Row. pending holds
+	// the batch currently being handed out row by row.
+	current    map[string]any
+	pending    []map[string]any
+	pendingIdx int
+	iterDone   bool
 
 	closeOnce sync.Once
 }
@@ -95,7 +107,7 @@ func newResults(ctx context.Context) *Results {
 		callerCtx: ctx,
 		ctx:       internalCtx,
 		cancel:    cancel,
-		rowChan:   make(chan map[string]any, queryRowBuffer),
+		rowChan:   make(chan []map[string]any, queryRowBatchBuffer),
 		done:      make(chan struct{}),
 		start:     time.Now(),
 	}
@@ -125,8 +137,14 @@ func (r *Results) Next() bool {
 	default:
 	}
 
+	if r.pendingIdx < len(r.pending) {
+		r.current = r.pending[r.pendingIdx]
+		r.pendingIdx++
+		return true
+	}
+
 	select {
-	case row, ok := <-r.rowChan:
+	case batch, ok := <-r.rowChan:
 		if !ok {
 			// Clean completion: all workers finished and every buffered row
 			// has been delivered. Block errors (if any) are the terminal
@@ -135,7 +153,10 @@ func (r *Results) Next() bool {
 			r.finish(r.joinedBlockErrs())
 			return false
 		}
-		r.current = row
+		// Workers only deliver non-empty batches.
+		r.pending = batch
+		r.pendingIdx = 1
+		r.current = batch[0]
 		return true
 	case <-r.ctx.Done():
 		return r.terminate()
@@ -241,6 +262,8 @@ func (r *Results) terminate() bool {
 func (r *Results) finish(err error) {
 	r.iterDone = true
 	r.current = nil
+	r.pending = nil
+	r.pendingIdx = 0
 	r.mu.Lock()
 	if !r.finalized {
 		r.finalized = true
@@ -256,31 +279,63 @@ func (r *Results) joinedBlockErrs() error {
 	return errors.Join(r.blockErrs...)
 }
 
-// deliver hands a matched row to the cursor. The fast path is a non-blocking
-// send into the row buffer. When the buffer is full, the worker releases its
-// global query-semaphore slot before blocking, so a stalled consumer parks
-// only its own query's workers — other queries proceed — then re-acquires the
-// slot before resuming the scan. Returns the context error when the query
-// terminated instead of accepting the row.
-func (r *Results) deliver(slot *querySlot, row map[string]any) error {
+// deliver hands a non-empty batch of matched rows to the cursor, transferring
+// ownership of the slice. The fast path is a non-blocking send into the batch
+// buffer. When the buffer is full, the worker releases its global
+// query-semaphore slot before blocking, so a stalled consumer parks only its
+// own query's workers — other queries proceed — then re-acquires the slot
+// before resuming the scan. Returns the context error when the query
+// terminated instead of accepting the batch.
+func (r *Results) deliver(slot *querySlot, batch []map[string]any) error {
 	select {
-	case r.rowChan <- row:
-		r.rowsMatched.Add(1)
+	case r.rowChan <- batch:
+		r.rowsMatched.Add(int64(len(batch)))
 		return nil
 	default:
 	}
 
 	slot.release()
 	select {
-	case r.rowChan <- row:
+	case r.rowChan <- batch:
 	case <-r.ctx.Done():
 		return r.ctx.Err()
 	}
-	r.rowsMatched.Add(1)
+	r.rowsMatched.Add(int64(len(batch)))
 	if !slot.acquire() {
 		return r.ctx.Err()
 	}
 	return nil
+}
+
+// rowBatcher accumulates one block worker's matched rows and delivers them in
+// queryRowBatchSize batches. Each batch slice is handed off to the cursor, so
+// flush starts a fresh one. Callers must flush at the end of a scan (including
+// error exits, so rows matched before a mid-block failure are still
+// delivered).
+type rowBatcher struct {
+	results *Results
+	slot    *querySlot
+	batch   []map[string]any
+}
+
+func (b *rowBatcher) add(row map[string]any) error {
+	if b.batch == nil {
+		b.batch = make([]map[string]any, 0, queryRowBatchSize)
+	}
+	b.batch = append(b.batch, row)
+	if len(b.batch) >= queryRowBatchSize {
+		return b.flush()
+	}
+	return nil
+}
+
+func (b *rowBatcher) flush() error {
+	if len(b.batch) == 0 {
+		return nil
+	}
+	batch := b.batch
+	b.batch = nil
+	return b.results.deliver(b.slot, batch)
 }
 
 // recordBlockStats appends one block's stats. Collection is engine-internal

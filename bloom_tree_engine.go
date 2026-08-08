@@ -50,10 +50,13 @@ func makeFieldTokenKey(field, token string) string {
 	return field + "::" + token
 }
 
-// compressionEncoders holds compression-related objects
+// compressionEncoders holds compression-related objects. Encoders come from
+// the package codec pools (see codec_pool.go): call finalizeCompression to
+// flush the stream, then release to recycle the encoders.
 type compressionEncoders struct {
 	writer        io.Writer
 	zstdEncoder   *zstd.Encoder
+	zstdLevel     int
 	snappyEncoder *snappy.Writer
 }
 
@@ -63,14 +66,15 @@ func (b *BloomSearchEngine) createCompressionWriter(dest io.Writer) (*compressio
 
 	switch b.config.RowDataCompression {
 	case CompressionZstd:
-		var err error
-		encoders.zstdEncoder, err = zstd.NewWriter(dest, zstd.WithEncoderLevel(zstd.EncoderLevel(b.config.ZstdCompressionLevel)))
+		zstdEncoder, err := getPooledZstdEncoder(dest, b.config.ZstdCompressionLevel)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
 		}
-		encoders.writer = encoders.zstdEncoder
+		encoders.zstdEncoder = zstdEncoder
+		encoders.zstdLevel = b.config.ZstdCompressionLevel
+		encoders.writer = zstdEncoder
 	case CompressionSnappy:
-		encoders.snappyEncoder = snappy.NewBufferedWriter(dest)
+		encoders.snappyEncoder = getPooledSnappyWriter(dest)
 		encoders.writer = encoders.snappyEncoder
 	default:
 		encoders.writer = dest
@@ -94,6 +98,21 @@ func (e *compressionEncoders) finalizeCompression() error {
 	return nil
 }
 
+// release returns the encoders to the codec pools. Call only after
+// finalizeCompression succeeded; encoders in an uncertain state (failed
+// finalize, abandoned buffer) are simply dropped for GC by not releasing.
+func (e *compressionEncoders) release() {
+	if e.zstdEncoder != nil {
+		putPooledZstdEncoder(e.zstdEncoder, e.zstdLevel)
+		e.zstdEncoder = nil
+	}
+	if e.snappyEncoder != nil {
+		putPooledSnappyWriter(e.snappyEncoder)
+		e.snappyEncoder = nil
+	}
+	e.writer = nil
+}
+
 // bloomEntrySets accumulates the distinct bloom entries — field paths,
 // tokens, and field::token pairs — of a set of rows. Ingest and merge collect
 // entries into these sets instead of inserting into filters directly, so that
@@ -104,6 +123,15 @@ type bloomEntrySets struct {
 	fields      map[string]struct{}
 	tokens      map[string]struct{}
 	fieldTokens map[string]struct{}
+
+	// Reused indexing scratch: the path walker's buffer, a token fold buffer,
+	// and a field::token key buffer. Entry strings are only materialized when
+	// an entry is absent from its set, so re-seen paths/tokens/pairs cost no
+	// allocation. Not safe for concurrent use — each set has one owner (a
+	// partition buffer on the ingest actor, or the merge goroutine).
+	walker   pathWalker
+	tokenBuf []byte
+	keyBuf   []byte
 }
 
 func newBloomEntrySets() *bloomEntrySets {
@@ -117,22 +145,58 @@ func newBloomEntrySets() *bloomEntrySets {
 // indexRow walks a marshaled row through the shared walker and records every
 // bloom entry it produces: every path (including intermediate object/array
 // paths) as a field entry, leaf-value tokens as token entries, and
-// exact-leaf-path::token pairs as field-token entries.
+// exact-leaf-path::token pairs as field-token entries. The row is parsed
+// through an unsafe string view of rowBytes, which is safe because rowBytes is
+// never mutated; strings the view yields may be retained in the sets (they
+// keep the row's backing array alive through GC, exactly as substrings of the
+// previous per-row copy did).
 func (s *bloomEntrySets) indexRow(rowBytes []byte, tokenizer ValueTokenizerFunc) {
-	forEachPathValue(gjson.ParseBytes(rowBytes), ".", func(path string, value gjson.Result, isLeaf bool) {
-		s.fields[path] = struct{}{}
+	fastTokens := isBasicWhitespaceLowerTokenizer(tokenizer)
+	s.walker.walk(gjson.Parse(unsafeString(rowBytes)), ".", func(path []byte, value gjson.Result, isLeaf bool) bool {
+		if _, ok := s.fields[string(path)]; !ok {
+			s.fields[string(path)] = struct{}{}
+		}
 		if !isLeaf {
-			return
+			return true
 		}
 		text, ok := leafTokenInput(value)
 		if !ok {
-			return
+			return true
+		}
+		if fastTokens {
+			// Zero-alloc equivalent of BasicWhitespaceLowerTokenizer: fold each
+			// whitespace-separated word into the reused token buffer.
+			forEachWord(text, func(word string) bool {
+				s.tokenBuf = appendFoldedWord(s.tokenBuf[:0], word)
+				if _, ok := s.tokens[string(s.tokenBuf)]; !ok {
+					s.tokens[string(s.tokenBuf)] = struct{}{}
+				}
+				s.addFieldToken(path, unsafeString(s.tokenBuf))
+				return true
+			})
+			return true
 		}
 		for _, token := range tokenizer(text) {
-			s.tokens[token] = struct{}{}
-			s.fieldTokens[makeFieldTokenKey(path, token)] = struct{}{}
+			if _, ok := s.tokens[token]; !ok {
+				s.tokens[token] = struct{}{}
+			}
+			s.addFieldToken(path, token)
 		}
+		return true
 	})
+}
+
+// addFieldToken records the field::token pair for a leaf, building the joined
+// key (same layout as makeFieldTokenKey) in the reused key buffer and only
+// materializing it when absent. token may be a transient view (e.g. of the
+// fold buffer): it is only appended into the key buffer, never retained.
+func (s *bloomEntrySets) addFieldToken(path []byte, token string) {
+	s.keyBuf = append(s.keyBuf[:0], path...)
+	s.keyBuf = append(s.keyBuf, "::"...)
+	s.keyBuf = append(s.keyBuf, token...)
+	if _, ok := s.fieldTokens[string(s.keyBuf)]; !ok {
+		s.fieldTokens[string(s.keyBuf)] = struct{}{}
+	}
 }
 
 // unionInto adds every entry to dst.
@@ -186,12 +250,6 @@ type ingestRequest struct {
 	forceFlush bool // if true, this is a force flush request
 }
 
-func (r *ingestRequest) reset() {
-	r.rows = nil
-	r.doneChan = nil
-	r.forceFlush = false
-}
-
 type flushRequest struct {
 	partitionBuffers map[string]*partitionBuffer
 	doneChans        []chan error
@@ -202,13 +260,12 @@ type BloomSearchEngine struct {
 	metaStore MetaStore
 	dataStore DataStore
 
-	ingestChan  chan *ingestRequest
-	flushChan   chan flushRequest
-	requestPool *sync.Pool
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	ingestDone  chan struct{}
+	ingestChan chan *ingestRequest
+	flushChan  chan flushRequest
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	ingestDone chan struct{}
 
 	// flushCtx governs flush-path store calls and done-channel delivery. It is
 	// derived from context.Background, not from b.ctx: once rows are accepted
@@ -406,13 +463,8 @@ func NewBloomSearchEngine(config BloomSearchEngineConfig, metaStore MetaStore, d
 		metaStore: metaStore,
 		dataStore: dataStore,
 
-		ingestChan: make(chan *ingestRequest, config.IngestBufferSize),
-		flushChan:  make(chan flushRequest, 1), // Buffered flush channel
-		requestPool: &sync.Pool{
-			New: func() interface{} {
-				return &ingestRequest{}
-			},
-		},
+		ingestChan:  make(chan *ingestRequest, config.IngestBufferSize),
+		flushChan:   make(chan flushRequest, 1), // Buffered flush channel
 		ctx:         ctx,
 		cancel:      cancel,
 		flushCtx:    flushCtx,
@@ -513,9 +565,7 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 		return ErrEngineStopped
 	}
 
-	req := b.requestPool.Get().(*ingestRequest)
-	req.rows = rows
-	req.doneChan = doneChan
+	req := &ingestRequest{rows: rows, doneChan: doneChan}
 
 	// Sending under the read lock means Stop cannot set stopped (and cancel
 	// b.ctx) until this send lands, so the shutdown drain always sees it. The
@@ -525,8 +575,6 @@ func (b *BloomSearchEngine) IngestRows(ctx context.Context, rows []map[string]an
 	case b.ingestChan <- req:
 		return nil
 	case <-ctx.Done():
-		req.reset()
-		b.requestPool.Put(req)
 		return ctx.Err()
 	}
 }
@@ -543,11 +591,8 @@ func (b *BloomSearchEngine) Flush(ctx context.Context) error {
 		return ErrEngineStopped
 	}
 
-	req := b.requestPool.Get().(*ingestRequest)
-	req.rows = nil
-	req.forceFlush = true
 	doneChan := make(chan error, 1)
-	req.doneChan = doneChan
+	req := &ingestRequest{forceFlush: true, doneChan: doneChan}
 
 	select {
 	case b.ingestChan <- req:
@@ -556,8 +601,6 @@ func (b *BloomSearchEngine) Flush(ctx context.Context) error {
 		return <-doneChan
 	case <-ctx.Done():
 		b.stateMu.RUnlock()
-		req.reset()
-		b.requestPool.Put(req)
 		return ctx.Err()
 	}
 }
@@ -683,12 +726,6 @@ func (b *BloomSearchEngine) processIngestRequest(
 	bufferedBytes *int,
 	bufferStartTime *time.Time,
 ) {
-	// Process the request and return to pool at the end
-	defer func() {
-		req.reset()
-		b.requestPool.Put(req)
-	}()
-
 	// If this is a force flush request, route it through the flush FIFO even
 	// with nothing buffered: flushBufferedData enqueues an ack-only flush
 	// request in that case, so the ack is ordered behind all in-flight flush
@@ -786,6 +823,8 @@ func (b *BloomSearchEngine) processIngestRequest(
 	// Track if we should flush
 	shouldFlush := false
 
+	var lengthBytes [LengthPrefixSize]byte
+
 	// Process each partition
 	for partitionID, rows := range partitionedRows {
 		partitionBuffer := partitionBuffers[partitionID]
@@ -824,9 +863,8 @@ func (b *BloomSearchEngine) processIngestRequest(
 			// Write length prefix (uint32) followed by row bytes. The
 			// destination is an in-memory buffer, so failures here are
 			// exceptional; they are still reported rather than swallowed.
-			lengthBytes := make([]byte, LengthPrefixSize)
-			binary.LittleEndian.PutUint32(lengthBytes, uint32(len(rowBytes)))
-			if _, err := partitionBuffer.compressionEncoders.writer.Write(lengthBytes); err != nil {
+			binary.LittleEndian.PutUint32(lengthBytes[:], uint32(len(rowBytes)))
+			if _, err := partitionBuffer.compressionEncoders.writer.Write(lengthBytes[:]); err != nil {
 				SendOptionalWithContext(ctx, req.doneChan, fmt.Errorf("failed to buffer row length: %w", err))
 				return
 			}
@@ -1026,12 +1064,14 @@ func (b *BloomSearchEngine) handleFlush(ctx context.Context, flushReq flushReque
 
 	// For each partition buffer, write the data block to the data store
 	for _, partitionBuffer := range flushReq.partitionBuffers {
-		// Finalize compression encoders before writing
+		// Finalize compression encoders before writing, then recycle them (the
+		// stream is complete; the compressed bytes live in the buffer).
 		var compressedData []byte
 		if err := partitionBuffer.compressionEncoders.finalizeCompression(); err != nil {
 			fail(fmt.Errorf("failed to finalize compression: %w", err), false)
 			return
 		}
+		partitionBuffer.compressionEncoders.release()
 		compressedData = partitionBuffer.buffer.Bytes()
 
 		// Build the block's filters right-sized from the measured distinct
@@ -1220,6 +1260,10 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 		return nil, fmt.Errorf("failed to compile regex query: %w", err)
 	}
 
+	// Row verification is compiled once per query: pre-split paths, verbatim
+	// target tokens, and a single-walk evaluator (see compiledRowMatcher).
+	rowMatcher := compileRowMatcher(rowBloomQuery, compiledRegexQuery, ".", b.config.Tokenizer)
+
 	pruneBloomQuery := AndBloomQueries(rowBloomQuery, RegexFieldGuardBloomQuery(query.Regex))
 
 	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
@@ -1338,11 +1382,12 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, 
 
 			slot := querySlot{sem: b.querySemaphore, ctx: r.ctx}
 			defer slot.release()
+			scratch := newRowMatchScratch(rowMatcher)
 			for job := range jobs {
 				if !slot.acquire() {
 					return
 				}
-				b.processDataBlock(r, &slot, job, rowBloomQuery, pruneBloomQuery, compiledRegexQuery)
+				b.processDataBlock(r, &slot, job, pruneBloomQuery, rowMatcher, scratch)
 				slot.release()
 			}
 		}()
@@ -1384,9 +1429,9 @@ func (b *BloomSearchEngine) processDataBlock(
 	r *Results,
 	slot *querySlot,
 	job dataBlockJob,
-	rowBloomQuery *BloomQuery,
 	pruneBloomQuery *BloomQuery,
-	regexQuery *compiledRegexQuery,
+	rowMatcher *compiledRowMatcher,
+	scratch *rowMatchScratch,
 ) {
 	blockStartTime := time.Now()
 	var bloomFilterSkipped bool
@@ -1453,11 +1498,21 @@ func (b *BloomSearchEngine) processDataBlock(
 	// cleanly instead of streaming corrupt rows to the caller, and a corrupt
 	// length prefix is rejected by the scanner instead of driving a giant
 	// allocation.
-	rowData, err := readBlockRowData(file, &job.blockMetadata)
+	rowData, releaseRowData, err := readPooledBlockRowData(file, &job.blockMetadata)
 	if err != nil {
 		fail(fmt.Errorf("failed to read block row data: %w", err))
 		return
 	}
+	// The block buffer returns to the pool when this scan exits: by then every
+	// row view has been dropped (matching parses transient views; matched rows
+	// are materialized as independent copies before batching).
+	defer releaseRowData()
+
+	// Matched rows are delivered in batches; the deferred flush covers every
+	// scan exit (end of data, block error, cancellation) so rows matched
+	// before a mid-block failure still reach the cursor.
+	batcher := rowBatcher{results: r, slot: slot}
+	defer batcher.flush()
 
 	scanner := blockRowScanner{data: rowData}
 	for {
@@ -1478,21 +1533,21 @@ func (b *BloomSearchEngine) processDataBlock(
 		rowsScanned++
 		bytesScanned += int64(LengthPrefixSize) + int64(len(rowBytes))
 
-		rowValue := gjson.ParseBytes(rowBytes)
-		if !TestGJSONForQuery(rowValue, rowBloomQuery, regexQuery, ".", b.config.Tokenizer) {
+		// Matching parses a zero-copy view of the row (rowBytes is a subslice
+		// of the block buffer, immutable for the whole scan); a matched row is
+		// materialized from an independent copy so delivered maps never alias
+		// the block buffer (see materializeRow).
+		if !rowMatcher.matchRowBytes(rowBytes, scratch) {
 			continue
 		}
 
-		// Materialize the row from the same gjson parse used for matching —
-		// one parse per row. gjson materializes JSON numbers as float64,
-		// matching encoding/json.
-		row, isObject := rowValue.Value().(map[string]any)
-		if !isObject {
-			fail(fmt.Errorf("row is not a JSON object"))
+		row, err := materializeRow(rowBytes)
+		if err != nil {
+			fail(err)
 			return
 		}
 
-		if err := r.deliver(slot, row); err != nil {
+		if err := batcher.add(row); err != nil {
 			return
 		}
 	}
@@ -1568,33 +1623,8 @@ func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 		totalMergeFiles += len(group)
 	}
 
-	// Show remaining single files that won't be merged
-	singleFileCount := 0
-	for _, candidate := range mergeCandidates {
-		// Check if this file is already in a merge group
-		inMergeGroup := false
-		for _, group := range mergeGroups {
-			for _, groupFile := range group {
-				if string(candidate.filePointer) == string(groupFile.filePointer) {
-					inMergeGroup = true
-					break
-				}
-			}
-			if inMergeGroup {
-				break
-			}
-		}
-
-		if !inMergeGroup {
-			fmt.Printf("  Single file %d: Partitions: %v, TotalSize: %d, TotalRows: %d, TotalBlocks: %d\n",
-				singleFileCount, candidate.statistics.partitionIDs, candidate.statistics.totalSize,
-				candidate.statistics.totalRows, candidate.statistics.blockCount)
-			singleFileCount++
-		}
-	}
-
-	fmt.Printf("\nSUMMARY: %d merge groups (%d files), %d single files, %d total files\n",
-		len(mergeGroups), totalMergeFiles, singleFileCount, len(mergeCandidates))
+	fmt.Printf("\nSUMMARY: %d merge groups (%d files), %d total files\n",
+		len(mergeGroups), totalMergeFiles, len(mergeCandidates))
 
 	// Calculate statistics for files that will be merged
 	var totalFilesProcessed int64
@@ -1696,41 +1726,44 @@ func (b *BloomSearchEngine) merge(ctx context.Context) (*MergeStats, error) {
 	return stats, postCommitCleanupErr
 }
 
-// dataBlocksAreMergeable checks if two data blocks can be merged together.
-// Bloom filter parameters impose no constraint: merged blocks rebuild their
-// filters from row data, sized for the merged rows' measured entry counts.
-func (b *BloomSearchEngine) dataBlocksAreMergeable(block1, block2 DataBlockMetadata) bool {
-	// Must have the same partition ID
-	if block1.PartitionID != block2.PartitionID {
-		return false
+// blockMergeKey returns an injective key over the properties two blocks must
+// share to be mergeable: the partition ID and the minmax key set. Blocks with
+// different keys never merge — merging a block that lacks a minmax key with
+// one that has it would give the keyless block's rows the other block's range,
+// widening strict-prefilter visibility to rows whose block never indexed the
+// key; such blocks are copied as-is instead. Bloom filter parameters impose no
+// constraint: merged blocks rebuild their filters from row data. Components
+// are length-prefixed so distinct (partition, key set) tuples cannot collide.
+// Two blocks with equal keys are mergeable iff blocksWithinMergeLimits.
+func blockMergeKey(block *DataBlockMetadata) string {
+	keys := make([]string, 0, len(block.MinMaxIndexes))
+	for key := range block.MinMaxIndexes {
+		keys = append(keys, key)
 	}
+	sort.Strings(keys)
 
-	// Blocks must index the same minmax key set. Merging a block that lacks a
-	// key with one that has it would give the keyless block's rows the other
-	// block's range — widening strict-prefilter visibility to rows whose
-	// block never indexed the key. Such blocks are copied as-is instead.
-	if len(block1.MinMaxIndexes) != len(block2.MinMaxIndexes) {
-		return false
+	buf := make([]byte, 0, len(block.PartitionID)+16)
+	buf = binary.AppendUvarint(buf, uint64(len(block.PartitionID)))
+	buf = append(buf, block.PartitionID...)
+	for _, key := range keys {
+		buf = binary.AppendUvarint(buf, uint64(len(key)))
+		buf = append(buf, key...)
 	}
-	for key := range block1.MinMaxIndexes {
-		if _, exists := block2.MinMaxIndexes[key]; !exists {
-			return false
-		}
-	}
+	return string(buf)
+}
 
-	// Check if merging would exceed size limits
-	combinedRows := block1.Rows + block2.Rows
-	combinedUncompressedSize := block1.UncompressedSize + block2.UncompressedSize
+// blockMergeShape is the size profile of a block for pairwise merge-limit
+// checks within a blockMergeKey bucket.
+type blockMergeShape struct {
+	rows             int
+	uncompressedSize int
+}
 
-	if combinedRows > b.config.MaxRowGroupRows {
-		return false
-	}
-
-	if combinedUncompressedSize > b.config.MaxRowGroupBytes {
-		return false
-	}
-
-	return true
+// blocksWithinMergeLimits reports whether merging two blocks (which must
+// already share a blockMergeKey) stays within the row-group limits.
+func (b *BloomSearchEngine) blocksWithinMergeLimits(shape1, shape2 blockMergeShape) bool {
+	return shape1.rows+shape2.rows <= b.config.MaxRowGroupRows &&
+		shape1.uncompressedSize+shape2.uncompressedSize <= b.config.MaxRowGroupBytes
 }
 
 // mergeMinMaxIndexes merges minmax indexes from two data blocks
@@ -1803,6 +1836,12 @@ func (b *BloomSearchEngine) calculateFileStatistics(metadata FileMetadata) fileS
 // merged blocks rebuild their filters from row data, so any two files with
 // mergeable row groups are candidates (with measured filter sizing, files
 // essentially never share filter parameters).
+//
+// Compatibility is indexed by blockMergeKey (partition + minmax key set): a
+// candidate joins a group when one of its blocks shares a key with a group
+// block and the pair stays within merge limits. Only same-key blocks are ever
+// compared, so grouping cost no longer scales with cross-partition block
+// pairs.
 func (b *BloomSearchEngine) identifyFileMergeGroups(files []fileMergeCandidate) [][]fileMergeCandidate {
 	if len(files) < 2 {
 		return nil
@@ -1825,11 +1864,23 @@ func (b *BloomSearchEngine) identifyFileMergeGroups(files []fileMergeCandidate) 
 		return a.statistics.totalSize < b.statistics.totalSize
 	})
 
+	// Precompute every candidate's blocks indexed by merge key.
+	candidateBlocks := make([]map[string][]blockMergeShape, len(candidates))
+	for i := range candidates {
+		blocks := candidates[i].metadata.DataBlocks
+		index := make(map[string][]blockMergeShape, len(blocks))
+		for j := range blocks {
+			key := blockMergeKey(&blocks[j])
+			index[key] = append(index[key], blockMergeShape{blocks[j].Rows, blocks[j].UncompressedSize})
+		}
+		candidateBlocks[i] = index
+	}
+
 	var mergeGroups [][]fileMergeCandidate
 	totalFilesInGroups := 0
 
 	// Track which files have already been assigned to a group
-	fileAssigned := make(map[int]bool)
+	fileAssigned := make([]bool, len(candidates))
 
 	// Greedy approach: try to group files that can benefit from row group merging
 	for i, file := range candidates {
@@ -1844,6 +1895,12 @@ func (b *BloomSearchEngine) identifyFileMergeGroups(files []fileMergeCandidate) 
 		currentGroup := []fileMergeCandidate{file}
 		currentGroupSize := file.statistics.totalSize
 		fileAssigned[i] = true
+
+		// The group's blocks, indexed by merge key, growing as files join.
+		groupBlocks := make(map[string][]blockMergeShape, len(candidateBlocks[i]))
+		for key, shapes := range candidateBlocks[i] {
+			groupBlocks[key] = append(groupBlocks[key], shapes...)
+		}
 
 		// Add compatible files to this group
 		for j := i + 1; j < len(candidates); j++ {
@@ -1862,10 +1919,13 @@ func (b *BloomSearchEngine) identifyFileMergeGroups(files []fileMergeCandidate) 
 				continue
 			}
 
-			if b.hasCompatibleRowGroups(currentGroup, candidate) {
+			if b.hasMergeableBlockPair(groupBlocks, candidateBlocks[j]) {
 				currentGroup = append(currentGroup, candidate)
 				currentGroupSize = newSize
 				fileAssigned[j] = true
+				for key, shapes := range candidateBlocks[j] {
+					groupBlocks[key] = append(groupBlocks[key], shapes...)
+				}
 			}
 		}
 
@@ -1878,13 +1938,17 @@ func (b *BloomSearchEngine) identifyFileMergeGroups(files []fileMergeCandidate) 
 	return mergeGroups
 }
 
-// hasCompatibleRowGroups checks if a candidate file has row groups that can be merged with existing group
-func (b *BloomSearchEngine) hasCompatibleRowGroups(currentGroup []fileMergeCandidate, candidate fileMergeCandidate) bool {
-	// Check if candidate has row groups that can be merged with any in the current group
-	for _, groupFile := range currentGroup {
-		for _, candidateBlock := range candidate.metadata.DataBlocks {
-			for _, groupBlock := range groupFile.metadata.DataBlocks {
-				if b.dataBlocksAreMergeable(candidateBlock, groupBlock) {
+// hasMergeableBlockPair reports whether any candidate block shares a merge key
+// with a group block within merge limits.
+func (b *BloomSearchEngine) hasMergeableBlockPair(groupBlocks, candBlocks map[string][]blockMergeShape) bool {
+	for key, candShapes := range candBlocks {
+		groupShapes, ok := groupBlocks[key]
+		if !ok {
+			continue
+		}
+		for _, cand := range candShapes {
+			for _, group := range groupShapes {
+				if b.blocksWithinMergeLimits(cand, group) {
 					return true
 				}
 			}
@@ -1983,40 +2047,56 @@ type blockWithFile struct {
 
 // processPartitionBlocks handles merging data blocks for a single partition
 func (b *BloomSearchEngine) processPartitionBlocks(ctx context.Context, writer io.Writer, allBlocks []blockWithFile, blockIndices []int, partitionID string, currentOffset *int, newDataBlocks *[]DataBlockMetadata, fileEntries *bloomEntrySets) error {
-	// Group mergeable blocks together
-	var mergeGroups [][]int // groups of block indices that can be merged
-	processed := make(map[int]bool)
-
+	// Bucket blocks by merge key (within one partition, that is the minmax
+	// key set); blocks in different buckets can never merge, so grouping only
+	// compares same-key blocks.
+	buckets := make(map[string][]int)
+	var bucketOrder []string
 	for _, blockIdx := range blockIndices {
-		if processed[blockIdx] {
-			continue
+		key := blockMergeKey(&allBlocks[blockIdx].block)
+		if _, ok := buckets[key]; !ok {
+			bucketOrder = append(bucketOrder, key)
 		}
+		buckets[key] = append(buckets[key], blockIdx)
+	}
 
-		currentGroup := []int{blockIdx}
-		currentRows := allBlocks[blockIdx].block.Rows
-		currentSize := allBlocks[blockIdx].block.UncompressedSize
-		processed[blockIdx] = true
-
-		// Find blocks that can be merged with this one
-		for _, otherIdx := range blockIndices {
-			if processed[otherIdx] {
+	// Greedy grouping within each bucket: a seed block collects the following
+	// blocks that pair with it and cumulatively fit within row-group limits.
+	var mergeGroups [][]int // groups of block indices that can be merged
+	for _, key := range bucketOrder {
+		bucket := buckets[key]
+		used := make([]bool, len(bucket))
+		for s := range bucket {
+			if used[s] {
 				continue
 			}
+			used[s] = true
+			seed := &allBlocks[bucket[s]].block
+			seedShape := blockMergeShape{seed.Rows, seed.UncompressedSize}
+			currentGroup := []int{bucket[s]}
+			currentRows := seed.Rows
+			currentSize := seed.UncompressedSize
 
-			otherBlock := allBlocks[otherIdx].block
-			if b.dataBlocksAreMergeable(allBlocks[blockIdx].block, otherBlock) {
+			for o := s + 1; o < len(bucket); o++ {
+				if used[o] {
+					continue
+				}
+				otherBlock := &allBlocks[bucket[o]].block
+				if !b.blocksWithinMergeLimits(seedShape, blockMergeShape{otherBlock.Rows, otherBlock.UncompressedSize}) {
+					continue
+				}
 				// Check if adding this block would exceed limits
 				if currentRows+otherBlock.Rows <= b.config.MaxRowGroupRows &&
 					currentSize+otherBlock.UncompressedSize <= b.config.MaxRowGroupBytes {
-					currentGroup = append(currentGroup, otherIdx)
+					currentGroup = append(currentGroup, bucket[o])
 					currentRows += otherBlock.Rows
 					currentSize += otherBlock.UncompressedSize
-					processed[otherIdx] = true
+					used[o] = true
 				}
 			}
-		}
 
-		mergeGroups = append(mergeGroups, currentGroup)
+			mergeGroups = append(mergeGroups, currentGroup)
+		}
 	}
 
 	// Process each merge group
@@ -2169,10 +2249,12 @@ func (b *BloomSearchEngine) mergeDataBlocks(ctx context.Context, writer io.Write
 		}
 	}
 
-	// Finalize compression
+	// Finalize compression and recycle the encoders (the compressed bytes
+	// live in the buffer).
 	if err := compressionEncoders.finalizeCompression(); err != nil {
 		return fmt.Errorf("failed to finalize compression: %w", err)
 	}
+	compressionEncoders.release()
 
 	// Every row has streamed through: build the block's exact-sized filters
 	// and write the block as [filter section][compressed row data].

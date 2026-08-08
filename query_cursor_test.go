@@ -396,9 +396,9 @@ func TestQueryCursorSlowConsumerNoStarvation(t *testing.T) {
 	// Wait until A's delivery buffer is full, which forces its workers onto
 	// the blocking-send path where they must give up their semaphore slots.
 	deadline := time.Now().Add(5 * time.Second)
-	for len(stalled.rowChan) < queryRowBuffer {
+	for len(stalled.rowChan) < queryRowBatchBuffer {
 		if time.Now().After(deadline) {
-			t.Fatalf("stalled query never filled its row buffer: %d/%d", len(stalled.rowChan), queryRowBuffer)
+			t.Fatalf("stalled query never filled its row buffer: %d/%d", len(stalled.rowChan), queryRowBatchBuffer)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
