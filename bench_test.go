@@ -281,8 +281,12 @@ func buildBlockyDataset(b *testing.B, dir string, files, rowsPerFile int) {
 // DataStore requests per query alongside the timing. latency models
 // object-storage per-request cost; concurrency bounds the fan-out.
 func benchManyBlockQuery(b *testing.B, q *Query, latency time.Duration, concurrency int, wantResults bool) {
+	benchManyBlockQueryFiles(b, q, blockyFiles, latency, concurrency, wantResults)
+}
+
+func benchManyBlockQueryFiles(b *testing.B, q *Query, files int, latency time.Duration, concurrency int, wantResults bool) {
 	dir := b.TempDir()
-	buildBlockyDataset(b, dir, blockyFiles, blockyRowsPerFile)
+	buildBlockyDataset(b, dir, files, blockyRowsPerFile)
 
 	fs := NewFileSystemDataStore(dir)
 	store := &requestCountingStore{inner: fs, latency: latency}
@@ -339,6 +343,15 @@ func BenchmarkManyBlocksNeedleRemote(b *testing.B) {
 // filter traffic is amortized against real scanning.
 func BenchmarkManyBlocksBroadRemote(b *testing.B) {
 	benchManyBlockQuery(b, NewQuery().FieldToken("service", "payment").Build(), 250*time.Microsecond, 16, true)
+}
+
+// BenchmarkManyBlocksNeedleFanout is the deployment shape: candidate files
+// outnumber query concurrency (32 files, 512 blocks, 8-way), so request latency
+// lands on the critical path instead of being hidden by spare fan-out. The
+// benchmarks above cannot show a request-count reduction because they run more
+// workers than they have files.
+func BenchmarkManyBlocksNeedleFanout(b *testing.B) {
+	benchManyBlockQueryFiles(b, NewQuery().Token(blockyMarkerToken).Build(), 32, 250*time.Microsecond, 8, true)
 }
 
 // BenchmarkMerge merges 6 small files into one. Dataset rebuild is untimed.
