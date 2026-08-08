@@ -163,8 +163,8 @@ func bloomExpressionNeeds(expression *BloomExpression, needs *rowQueryNeeds) {
 	if expression == nil {
 		return
 	}
-	if expression.condition != nil {
-		switch expression.condition.Type {
+	if expression.Condition != nil {
+		switch expression.Condition.Type {
 		case BloomField:
 			needs.fields = true
 		case BloomToken:
@@ -173,11 +173,11 @@ func bloomExpressionNeeds(expression *BloomExpression, needs *rowQueryNeeds) {
 			if needs.fieldTokenPaths == nil {
 				needs.fieldTokenPaths = make(map[string]struct{})
 			}
-			needs.fieldTokenPaths[expression.condition.Field] = struct{}{}
+			needs.fieldTokenPaths[expression.Condition.Field] = struct{}{}
 		}
 	}
-	for i := range expression.children {
-		bloomExpressionNeeds(&expression.children[i], needs)
+	for i := range expression.Children {
+		bloomExpressionNeeds(&expression.Children[i], needs)
 	}
 }
 
@@ -264,25 +264,25 @@ func (s *rowMatchSets) matchesBloomExpression(expression *BloomExpression) bool 
 		return true
 	}
 
-	switch expression.expressionType {
-	case bloomExpressionCondition:
-		if expression.condition == nil {
+	switch expression.ExpressionType {
+	case BloomExpressionCondition:
+		if expression.Condition == nil {
 			return true
 		}
-		return s.matchesBloomCondition(expression.condition)
-	case bloomExpressionOr:
-		if len(expression.children) == 0 {
+		return s.matchesBloomCondition(expression.Condition)
+	case BloomExpressionOr:
+		if len(expression.Children) == 0 {
 			return false
 		}
-		for i := range expression.children {
-			if s.matchesBloomExpression(&expression.children[i]) {
+		for i := range expression.Children {
+			if s.matchesBloomExpression(&expression.Children[i]) {
 				return true
 			}
 		}
 		return false
-	case bloomExpressionAnd:
-		for i := range expression.children {
-			if !s.matchesBloomExpression(&expression.children[i]) {
+	case BloomExpressionAnd:
+		for i := range expression.Children {
+			if !s.matchesBloomExpression(&expression.Children[i]) {
 				return false
 			}
 		}
@@ -324,12 +324,12 @@ func (s *rowMatchSets) matchesRegexExpression(expression *compiledRegexExpressio
 	}
 
 	switch expression.expressionType {
-	case regexExpressionCondition:
+	case RegexExpressionCondition:
 		if expression.condition == nil {
 			return true
 		}
 		return s.matchesRegexCondition(expression.condition, delimiter)
-	case regexExpressionOr:
+	case RegexExpressionOr:
 		if len(expression.children) == 0 {
 			return false
 		}
@@ -339,7 +339,7 @@ func (s *rowMatchSets) matchesRegexExpression(expression *compiledRegexExpressio
 			}
 		}
 		return false
-	case regexExpressionAnd:
+	case RegexExpressionAnd:
 		for i := range expression.children {
 			if !s.matchesRegexExpression(&expression.children[i], delimiter) {
 				return false
@@ -397,8 +397,8 @@ func TestJSONForBloomCondition(jsonBytes []byte, condition *BloomCondition, deli
 		return true
 	}
 	expression := &BloomExpression{
-		expressionType: bloomExpressionCondition,
-		condition:      condition,
+		ExpressionType: BloomExpressionCondition,
+		Condition:      condition,
 	}
 	return TestJSONForBloomQuery(jsonBytes, &BloomQuery{Expression: expression}, delimiter, tokenizer)
 }
@@ -440,26 +440,26 @@ func compileRegexExpression(expression *RegexExpression) (*compiledRegexExpressi
 		return nil, nil
 	}
 
-	switch expression.expressionType {
-	case regexExpressionCondition:
-		if expression.condition == nil {
+	switch expression.ExpressionType {
+	case RegexExpressionCondition:
+		if expression.Condition == nil {
 			return nil, nil
 		}
-		compiledPattern, err := regexp.Compile(expression.condition.Pattern)
+		compiledPattern, err := regexp.Compile(expression.Condition.Pattern)
 		if err != nil {
 			return nil, err
 		}
 		return &compiledRegexExpression{
-			expressionType: regexExpressionCondition,
+			expressionType: RegexExpressionCondition,
 			condition: &compiledRegexCondition{
-				field:   expression.condition.Field,
+				field:   expression.Condition.Field,
 				pattern: compiledPattern,
 			},
 		}, nil
-	case regexExpressionAnd, regexExpressionOr:
-		children := make([]compiledRegexExpression, 0, len(expression.children))
-		for i := range expression.children {
-			child, err := compileRegexExpression(&expression.children[i])
+	case RegexExpressionAnd, RegexExpressionOr:
+		children := make([]compiledRegexExpression, 0, len(expression.Children))
+		for i := range expression.Children {
+			child, err := compileRegexExpression(&expression.Children[i])
 			if err != nil {
 				return nil, err
 			}
@@ -468,11 +468,11 @@ func compileRegexExpression(expression *RegexExpression) (*compiledRegexExpressi
 			}
 		}
 		return &compiledRegexExpression{
-			expressionType: expression.expressionType,
+			expressionType: expression.ExpressionType,
 			children:       children,
 		}, nil
 	default:
-		return nil, fmt.Errorf("unknown regex expression type: %s", expression.expressionType)
+		return nil, fmt.Errorf("unknown regex expression type: %s", expression.ExpressionType)
 	}
 }
 

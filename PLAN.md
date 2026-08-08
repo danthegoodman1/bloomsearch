@@ -87,11 +87,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: Engine-side FilterDataBlocks on every MaybeFile | Missing: implementation + MemoryMetaStore prefilter regression. |
-| Incomplete | Work | 2B: MemoryMetaStore mutex + naming reconciliation | Missing: implementation + concurrent flush/query race test. |
-| Incomplete | Work | 2C: FileSystemDataStore skips unreadable files; temp-name + rename-on-close; de-"testing" rename | Missing: implementation + concurrent flush/query + garbage-file tests. |
-| Incomplete | Work | 2D: Expression trees exported with lossless JSON round-trip | Missing: API + round-trip test + translation example. |
-| Incomplete | Gate | Prefilters hold with every shipped store, concurrently | Missing: passing gate tests under `-race`. |
+| Complete | Work | 2A: Engine-side FilterDataBlocks on every MaybeFile | Enforcement in `Query` before file-level bloom eval; red-before-green proven via prefilter-ignoring wrapper store. Test: `TestPrefilterEnforcedByEngine` (partition + minmax, both stores). |
+| Complete | Work | 2B: MemoryMetaStore mutex + naming reconciliation | `sync.RWMutex` + store-side FilterDataBlocks; renamed to memory_meta_store.go / `NewMemoryMetaStore`. Test: `TestMemoryMetaStoreConcurrentAccess` under `-race`. |
+| Complete | Work | 2C: FileSystemDataStore skips unreadable files; temp-name + rename-on-close; de-"testing" rename | Reservation-first CreateFile (O_EXCL final-path reservation, Sync→Close→Rename), unreadable/vanished files skipped; renamed to file_system_store.go. Tests: `TestFileSystemStoreSkipsUnreadableFiles`, `TestFileSystemStoreConcurrentFlushQuery` (deterministic, 10/10), `TestFileSystemStoreCreateFileNeverClobbersExisting` (red-check verified). Measured fsync cost ~3.9ms/flushed file, amortized invisible. |
+| Complete | Work | 2D: Expression trees exported with lossless JSON round-trip | Exported fields/constants on all three trees; byte-identical re-marshal + semantic-equality tests incl. must-be-false cases. Tests: `TestQueryExpressionJSONRoundTrip`, `TestPrefilterExpressionSQLTranslation`. |
+| Complete | Gate | Prefilters hold with every shipped store, concurrently | `go test -race -count=1 ./...` ok (30.3s, coordinator-verified); reviewer approved after one blocker round (final-path clobber, fixed via reservation). Discovered Flush-ordering bug recorded in Phase 3A. Benchmarks neutral vs Phase 1. |
 
 ## Phase 3: Lifecycle, durability, and merge safety
 
@@ -100,6 +100,7 @@ No acknowledged row is ever lost, no waiter ever hangs, and merge cannot commit 
 
 Scope:
 - Stop path: drain `ingestChan` before the final flush (queued requests are silently dropped today, bloom_tree_engine.go:367-383 — acked rows lost, doneChan waiters and `Flush()` hang forever); run the shutdown flush with `Stop`'s context, not the canceled `b.ctx` (bloom_tree_engine.go:735,810); done-channel delivery must not race ctx cancellation or skip remaining channels on first error (chan_helpers.go:37-55).
+- `Flush()` ordering (found by Phase 2's concurrent flush/query test): an empty-buffer force flush acks immediately with no ordering against flush requests still queued or in flight on the flush worker — `Flush()` can return before previously ingested rows are durable. `Flush` must not ack until all earlier flush work has completed.
 - Flush error paths: close the writer, `TombstoneFile` the partial output, and deliver the error (every error return after `CreateFile` currently leaks both, bloom_tree_engine.go:749-818).
 - Batch atomicity: marshal/validate all rows before mutating buffers or blooms so a mid-batch error doesn't half-persist the batch (bloom_tree_engine.go:586-597); fix the nil-compression-encoder poisoned-partition panic (bloom_tree_engine.go:513-531).
 - Merge commit safety: check `writer.Close()` before `MetaStore.Update` (ignored via defer today, bloom_tree_engine.go:1630 — can delete sole copies after a failed S3 finalize); tombstone the merge output on any pre-commit failure; in-process single-flight guard on `Merge` (concurrent merges commit duplicate rows today); distinguish "merge committed, GC failed" from "merge failed" in the return.
@@ -123,7 +124,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 3A: Stop drains ingestChan; shutdown flush uses live ctx; reliable done delivery | Missing: implementation + stop-under-load test. |
+| Incomplete | Work | 3A: Stop drains ingestChan; shutdown flush uses live ctx; reliable done delivery; Flush acks only after all earlier flush work completes | Missing: implementation + stop-under-load test + TestFlushWaitsForInFlightFlushes. |
 | Incomplete | Work | 3B: Flush error paths close writer + tombstone + deliver error | Missing: implementation + fault-injection flush test. |
 | Incomplete | Work | 3C: Batch atomicity + nil-encoder poisoned-partition fix | Missing: implementation + mid-batch-error and bad-zstd-level tests. |
 | Incomplete | Work | 3D: Merge gates commit on Close; tombstones aborted output; single-flight; GC-failure distinct | Missing: implementation + failing-Close merge test + concurrent-Merge test. |

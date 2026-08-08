@@ -51,74 +51,89 @@ const (
 	CombinatorOR  Combinator = "OR"
 )
 
-type prefilterConditionType string
+// PrefilterConditionType discriminates the variants of a PrefilterCondition.
+type PrefilterConditionType string
 
 const (
-	prefilterConditionPartition prefilterConditionType = "PARTITION"
-	prefilterConditionMinMax    prefilterConditionType = "MINMAX"
+	PrefilterConditionPartition PrefilterConditionType = "PARTITION"
+	PrefilterConditionMinMax    PrefilterConditionType = "MINMAX"
 )
 
+// PrefilterCondition is a leaf of a PrefilterExpression tree. Its fields are
+// exported (and JSON round-trippable) so MetaStore implementations can
+// translate prefilters into their own query languages; use Partition and
+// MinMax to construct conditions.
+//
+// ConditionType selects which fields are meaningful: PartitionCondition for
+// PrefilterConditionPartition, MinMaxFieldName and MinMaxCondition for
+// PrefilterConditionMinMax.
 type PrefilterCondition struct {
-	conditionType      prefilterConditionType
-	partitionCondition *StringCondition
-	minMaxFieldName    string
-	minMaxCondition    *NumericCondition
+	ConditionType      PrefilterConditionType
+	PartitionCondition *StringCondition  `json:",omitempty"`
+	MinMaxFieldName    string            `json:",omitempty"`
+	MinMaxCondition    *NumericCondition `json:",omitempty"`
 }
 
-type prefilterExpressionType string
+// PrefilterExpressionType discriminates the variants of a PrefilterExpression.
+type PrefilterExpressionType string
 
 const (
-	prefilterExpressionCondition prefilterExpressionType = "CONDITION"
-	prefilterExpressionAnd       prefilterExpressionType = "AND"
-	prefilterExpressionOr        prefilterExpressionType = "OR"
+	PrefilterExpressionCondition PrefilterExpressionType = "CONDITION"
+	PrefilterExpressionAnd       PrefilterExpressionType = "AND"
+	PrefilterExpressionOr        PrefilterExpressionType = "OR"
 )
 
+// PrefilterExpression is a node of a prefilter tree: either a single
+// Condition (PrefilterExpressionCondition) or an AND/OR over Children. Its
+// fields are exported so MetaStore implementations can walk and translate the
+// tree; use Partition, MinMax, PrefilterAnd, and PrefilterOr to construct
+// expressions.
 type PrefilterExpression struct {
-	expressionType prefilterExpressionType
-	condition      *PrefilterCondition
-	children       []PrefilterExpression
+	ExpressionType PrefilterExpressionType
+	Condition      *PrefilterCondition   `json:",omitempty"`
+	Children       []PrefilterExpression `json:",omitempty"`
 }
 
 func Partition(condition StringCondition) PrefilterExpression {
 	return PrefilterExpression{
-		expressionType: prefilterExpressionCondition,
-		condition: &PrefilterCondition{
-			conditionType:      prefilterConditionPartition,
-			partitionCondition: &condition,
+		ExpressionType: PrefilterExpressionCondition,
+		Condition: &PrefilterCondition{
+			ConditionType:      PrefilterConditionPartition,
+			PartitionCondition: &condition,
 		},
 	}
 }
 
 func MinMax(fieldName string, condition NumericCondition) PrefilterExpression {
 	return PrefilterExpression{
-		expressionType: prefilterExpressionCondition,
-		condition: &PrefilterCondition{
-			conditionType:   prefilterConditionMinMax,
-			minMaxFieldName: fieldName,
-			minMaxCondition: &condition,
+		ExpressionType: PrefilterExpressionCondition,
+		Condition: &PrefilterCondition{
+			ConditionType:   PrefilterConditionMinMax,
+			MinMaxFieldName: fieldName,
+			MinMaxCondition: &condition,
 		},
 	}
 }
 
 func PrefilterAnd(expressions ...PrefilterExpression) PrefilterExpression {
 	return PrefilterExpression{
-		expressionType: prefilterExpressionAnd,
-		children:       flattenPrefilterExpressions(expressions, prefilterExpressionAnd),
+		ExpressionType: PrefilterExpressionAnd,
+		Children:       flattenPrefilterExpressions(expressions, PrefilterExpressionAnd),
 	}
 }
 
 func PrefilterOr(expressions ...PrefilterExpression) PrefilterExpression {
 	return PrefilterExpression{
-		expressionType: prefilterExpressionOr,
-		children:       flattenPrefilterExpressions(expressions, prefilterExpressionOr),
+		ExpressionType: PrefilterExpressionOr,
+		Children:       flattenPrefilterExpressions(expressions, PrefilterExpressionOr),
 	}
 }
 
-func flattenPrefilterExpressions(expressions []PrefilterExpression, expressionType prefilterExpressionType) []PrefilterExpression {
+func flattenPrefilterExpressions(expressions []PrefilterExpression, expressionType PrefilterExpressionType) []PrefilterExpression {
 	flattened := make([]PrefilterExpression, 0, len(expressions))
 	for _, expression := range expressions {
-		if expression.expressionType == expressionType && expression.condition == nil {
-			flattened = append(flattened, expression.children...)
+		if expression.ExpressionType == expressionType && expression.Condition == nil {
+			flattened = append(flattened, expression.Children...)
 			continue
 		}
 		flattened = append(flattened, expression)
@@ -387,25 +402,25 @@ func evaluatePrefilterExpression(metadata *DataBlockMetadata, expression *Prefil
 		return true
 	}
 
-	switch expression.expressionType {
-	case prefilterExpressionCondition:
-		if expression.condition == nil {
+	switch expression.ExpressionType {
+	case PrefilterExpressionCondition:
+		if expression.Condition == nil {
 			return true
 		}
-		return evaluatePrefilterCondition(metadata, expression.condition)
-	case prefilterExpressionOr:
-		if len(expression.children) == 0 {
+		return evaluatePrefilterCondition(metadata, expression.Condition)
+	case PrefilterExpressionOr:
+		if len(expression.Children) == 0 {
 			return false
 		}
-		for i := range expression.children {
-			if evaluatePrefilterExpression(metadata, &expression.children[i]) {
+		for i := range expression.Children {
+			if evaluatePrefilterExpression(metadata, &expression.Children[i]) {
 				return true
 			}
 		}
 		return false
-	case prefilterExpressionAnd:
-		for i := range expression.children {
-			if !evaluatePrefilterExpression(metadata, &expression.children[i]) {
+	case PrefilterExpressionAnd:
+		for i := range expression.Children {
+			if !evaluatePrefilterExpression(metadata, &expression.Children[i]) {
 				return false
 			}
 		}
@@ -416,25 +431,25 @@ func evaluatePrefilterExpression(metadata *DataBlockMetadata, expression *Prefil
 }
 
 func evaluatePrefilterCondition(metadata *DataBlockMetadata, condition *PrefilterCondition) bool {
-	switch condition.conditionType {
-	case prefilterConditionPartition:
-		if condition.partitionCondition == nil {
+	switch condition.ConditionType {
+	case PrefilterConditionPartition:
+		if condition.PartitionCondition == nil {
 			return true
 		}
 		// Strict prefilter semantics: if partition metadata is missing, this block cannot satisfy partition conditions.
 		if metadata.PartitionID == "" {
 			return false
 		}
-		return EvaluateStringCondition(metadata.PartitionID, *condition.partitionCondition)
-	case prefilterConditionMinMax:
-		if condition.minMaxCondition == nil {
+		return EvaluateStringCondition(metadata.PartitionID, *condition.PartitionCondition)
+	case PrefilterConditionMinMax:
+		if condition.MinMaxCondition == nil {
 			return true
 		}
-		minMaxIndex, exists := metadata.MinMaxIndexes[condition.minMaxFieldName]
+		minMaxIndex, exists := metadata.MinMaxIndexes[condition.MinMaxFieldName]
 		if !exists {
 			return false
 		}
-		return EvaluateMinMaxCondition(minMaxIndex, *condition.minMaxCondition)
+		return EvaluateMinMaxCondition(minMaxIndex, *condition.MinMaxCondition)
 	default:
 		return false
 	}
@@ -474,18 +489,23 @@ type BloomCondition struct {
 	Token string // for TOKEN and FIELD_TOKEN
 }
 
+// BloomExpressionType discriminates the variants of a BloomExpression.
 type BloomExpressionType string
 
 const (
-	bloomExpressionCondition BloomExpressionType = "CONDITION"
-	bloomExpressionAnd       BloomExpressionType = "AND"
-	bloomExpressionOr        BloomExpressionType = "OR"
+	BloomExpressionCondition BloomExpressionType = "CONDITION"
+	BloomExpressionAnd       BloomExpressionType = "AND"
+	BloomExpressionOr        BloomExpressionType = "OR"
 )
 
+// BloomExpression is a node of a bloom query tree: either a single Condition
+// (BloomExpressionCondition) or an AND/OR over Children. Its fields are
+// exported so stores and tools can walk and translate the tree; use Field,
+// Token, FieldToken, And, and Or to construct expressions.
 type BloomExpression struct {
-	expressionType BloomExpressionType
-	condition      *BloomCondition
-	children       []BloomExpression
+	ExpressionType BloomExpressionType
+	Condition      *BloomCondition   `json:",omitempty"`
+	Children       []BloomExpression `json:",omitempty"`
 }
 
 type BloomQuery struct {
@@ -497,18 +517,23 @@ type RegexCondition struct {
 	Pattern string
 }
 
+// RegexExpressionType discriminates the variants of a RegexExpression.
 type RegexExpressionType string
 
 const (
-	regexExpressionCondition RegexExpressionType = "CONDITION"
-	regexExpressionAnd       RegexExpressionType = "AND"
-	regexExpressionOr        RegexExpressionType = "OR"
+	RegexExpressionCondition RegexExpressionType = "CONDITION"
+	RegexExpressionAnd       RegexExpressionType = "AND"
+	RegexExpressionOr        RegexExpressionType = "OR"
 )
 
+// RegexExpression is a node of a regex query tree: either a single Condition
+// (RegexExpressionCondition) or an AND/OR over Children. Its fields are
+// exported so stores and tools can walk and translate the tree; use
+// FieldRegex, RegexAnd, and RegexOr to construct expressions.
 type RegexExpression struct {
-	expressionType RegexExpressionType
-	condition      *RegexCondition
-	children       []RegexExpression
+	ExpressionType RegexExpressionType
+	Condition      *RegexCondition   `json:",omitempty"`
+	Children       []RegexExpression `json:",omitempty"`
 }
 
 type RegexQuery struct {
@@ -523,8 +548,8 @@ type RegexQuery struct {
 // paths, Field("a")).
 func Field(field string) BloomExpression {
 	return BloomExpression{
-		expressionType: bloomExpressionCondition,
-		condition: &BloomCondition{
+		ExpressionType: BloomExpressionCondition,
+		Condition: &BloomCondition{
 			Type:  BloomField,
 			Field: field,
 		},
@@ -533,8 +558,8 @@ func Field(field string) BloomExpression {
 
 func Token(token string) BloomExpression {
 	return BloomExpression{
-		expressionType: bloomExpressionCondition,
-		condition: &BloomCondition{
+		ExpressionType: BloomExpressionCondition,
+		Condition: &BloomCondition{
 			Type:  BloomToken,
 			Token: token,
 		},
@@ -549,8 +574,8 @@ func Token(token string) BloomExpression {
 // {"tags": ["admin"]}.
 func FieldToken(field, token string) BloomExpression {
 	return BloomExpression{
-		expressionType: bloomExpressionCondition,
-		condition: &BloomCondition{
+		ExpressionType: BloomExpressionCondition,
+		Condition: &BloomCondition{
 			Type:  BloomFieldToken,
 			Field: field,
 			Token: token,
@@ -560,23 +585,23 @@ func FieldToken(field, token string) BloomExpression {
 
 func And(expressions ...BloomExpression) BloomExpression {
 	return BloomExpression{
-		expressionType: bloomExpressionAnd,
-		children:       flattenExpressions(expressions, bloomExpressionAnd),
+		ExpressionType: BloomExpressionAnd,
+		Children:       flattenExpressions(expressions, BloomExpressionAnd),
 	}
 }
 
 func Or(expressions ...BloomExpression) BloomExpression {
 	return BloomExpression{
-		expressionType: bloomExpressionOr,
-		children:       flattenExpressions(expressions, bloomExpressionOr),
+		ExpressionType: BloomExpressionOr,
+		Children:       flattenExpressions(expressions, BloomExpressionOr),
 	}
 }
 
 func flattenExpressions(expressions []BloomExpression, expressionType BloomExpressionType) []BloomExpression {
 	flattened := make([]BloomExpression, 0, len(expressions))
 	for _, expression := range expressions {
-		if expression.expressionType == expressionType && expression.condition == nil {
-			flattened = append(flattened, expression.children...)
+		if expression.ExpressionType == expressionType && expression.Condition == nil {
+			flattened = append(flattened, expression.Children...)
 			continue
 		}
 		flattened = append(flattened, expression)
@@ -589,8 +614,8 @@ func flattenExpressions(expressions []BloomExpression, expressionType BloomExpre
 // literal for numbers and booleans; null values never match).
 func FieldRegex(field, pattern string) RegexExpression {
 	return RegexExpression{
-		expressionType: regexExpressionCondition,
-		condition: &RegexCondition{
+		ExpressionType: RegexExpressionCondition,
+		Condition: &RegexCondition{
 			Field:   field,
 			Pattern: pattern,
 		},
@@ -599,23 +624,23 @@ func FieldRegex(field, pattern string) RegexExpression {
 
 func RegexAnd(expressions ...RegexExpression) RegexExpression {
 	return RegexExpression{
-		expressionType: regexExpressionAnd,
-		children:       flattenRegexExpressions(expressions, regexExpressionAnd),
+		ExpressionType: RegexExpressionAnd,
+		Children:       flattenRegexExpressions(expressions, RegexExpressionAnd),
 	}
 }
 
 func RegexOr(expressions ...RegexExpression) RegexExpression {
 	return RegexExpression{
-		expressionType: regexExpressionOr,
-		children:       flattenRegexExpressions(expressions, regexExpressionOr),
+		ExpressionType: RegexExpressionOr,
+		Children:       flattenRegexExpressions(expressions, RegexExpressionOr),
 	}
 }
 
 func flattenRegexExpressions(expressions []RegexExpression, expressionType RegexExpressionType) []RegexExpression {
 	flattened := make([]RegexExpression, 0, len(expressions))
 	for _, expression := range expressions {
-		if expression.expressionType == expressionType && expression.condition == nil {
-			flattened = append(flattened, expression.children...)
+		if expression.ExpressionType == expressionType && expression.Condition == nil {
+			flattened = append(flattened, expression.Children...)
 			continue
 		}
 		flattened = append(flattened, expression)
@@ -628,42 +653,42 @@ func regexExpressionToBloomFieldExpression(expression *RegexExpression) *BloomEx
 		return nil
 	}
 
-	switch expression.expressionType {
-	case regexExpressionCondition:
-		if expression.condition == nil {
+	switch expression.ExpressionType {
+	case RegexExpressionCondition:
+		if expression.Condition == nil {
 			return nil
 		}
 		condition := &BloomCondition{
 			Type:  BloomField,
-			Field: expression.condition.Field,
+			Field: expression.Condition.Field,
 		}
 		return &BloomExpression{
-			expressionType: bloomExpressionCondition,
-			condition:      condition,
+			ExpressionType: BloomExpressionCondition,
+			Condition:      condition,
 		}
-	case regexExpressionAnd:
-		children := make([]BloomExpression, 0, len(expression.children))
-		for i := range expression.children {
-			child := regexExpressionToBloomFieldExpression(&expression.children[i])
+	case RegexExpressionAnd:
+		children := make([]BloomExpression, 0, len(expression.Children))
+		for i := range expression.Children {
+			child := regexExpressionToBloomFieldExpression(&expression.Children[i])
 			if child != nil {
 				children = append(children, *child)
 			}
 		}
 		return &BloomExpression{
-			expressionType: bloomExpressionAnd,
-			children:       children,
+			ExpressionType: BloomExpressionAnd,
+			Children:       children,
 		}
-	case regexExpressionOr:
-		children := make([]BloomExpression, 0, len(expression.children))
-		for i := range expression.children {
-			child := regexExpressionToBloomFieldExpression(&expression.children[i])
+	case RegexExpressionOr:
+		children := make([]BloomExpression, 0, len(expression.Children))
+		for i := range expression.Children {
+			child := regexExpressionToBloomFieldExpression(&expression.Children[i])
 			if child != nil {
 				children = append(children, *child)
 			}
 		}
 		return &BloomExpression{
-			expressionType: bloomExpressionOr,
-			children:       children,
+			ExpressionType: BloomExpressionOr,
+			Children:       children,
 		}
 	default:
 		return nil

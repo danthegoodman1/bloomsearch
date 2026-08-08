@@ -853,25 +853,25 @@ func (b *BloomSearchEngine) evaluateBloomExpression(
 		return true
 	}
 
-	switch expression.expressionType {
-	case bloomExpressionCondition:
-		if expression.condition == nil {
+	switch expression.ExpressionType {
+	case BloomExpressionCondition:
+		if expression.Condition == nil {
 			return true
 		}
-		return b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, expression.condition)
-	case bloomExpressionOr:
-		if len(expression.children) == 0 {
+		return b.evaluateBloomCondition(fieldFilter, tokenFilter, fieldTokenFilter, expression.Condition)
+	case BloomExpressionOr:
+		if len(expression.Children) == 0 {
 			return false
 		}
-		for i := range expression.children {
-			if b.evaluateBloomExpression(fieldFilter, tokenFilter, fieldTokenFilter, &expression.children[i]) {
+		for i := range expression.Children {
+			if b.evaluateBloomExpression(fieldFilter, tokenFilter, fieldTokenFilter, &expression.Children[i]) {
 				return true
 			}
 		}
 		return false
-	case bloomExpressionAnd:
-		for i := range expression.children {
-			if !b.evaluateBloomExpression(fieldFilter, tokenFilter, fieldTokenFilter, &expression.children[i]) {
+	case BloomExpressionAnd:
+		for i := range expression.Children {
+			if !b.evaluateBloomExpression(fieldFilter, tokenFilter, fieldTokenFilter, &expression.Children[i]) {
 				return false
 			}
 		}
@@ -960,6 +960,21 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 	if err != nil {
 		return err
 	}
+
+	// The engine enforces strict prefilter semantics itself: MetaStore-side
+	// prefiltering is only an optimization, so re-filter whatever the store
+	// returned. FilterDataBlocks allocates a new slice, and MaybeFile is a
+	// value, so the store's own metadata is never mutated. Files left with no
+	// matching blocks are dropped.
+	prefilteredFiles := make([]MaybeFile, 0, len(maybeFiles))
+	for _, maybeFile := range maybeFiles {
+		maybeFile.Metadata.DataBlocks = FilterDataBlocks(maybeFile.Metadata.DataBlocks, query.Prefilter)
+		if len(maybeFile.Metadata.DataBlocks) == 0 {
+			continue
+		}
+		prefilteredFiles = append(prefilteredFiles, maybeFile)
+	}
+	maybeFiles = prefilteredFiles
 
 	// Test file-level bloom filters, using concurrency only above a threshold
 	const concurrencyThreshold = 20
