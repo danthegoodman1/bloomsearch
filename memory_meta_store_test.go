@@ -74,21 +74,19 @@ func TestPrefilterEnforcedByEngine(t *testing.T) {
 			runPrefilterQuery := func(t *testing.T, expression PrefilterExpression, wantIDs map[string]bool) {
 				t.Helper()
 				query := NewQuery().MatchPrefilter(expression).Build()
-				resultChan := make(chan map[string]any, len(rows)*2)
-				errorChan := make(chan error, 16)
-				if err := engine.Query(ctx, query, resultChan, errorChan, nil); err != nil {
+				res, err := engine.Query(ctx, query)
+				if err != nil {
 					t.Fatalf("query failed: %v", err)
 				}
+				defer res.Close()
 
 				gotIDs := make(map[string]bool)
-				for row := range resultChan {
-					id, _ := row["id"].(string)
+				for res.Next() {
+					id, _ := res.Row()["id"].(string)
 					gotIDs[id] = true
 				}
-				select {
-				case err := <-errorChan:
+				if err := res.Err(); err != nil {
 					t.Fatalf("query worker error: %v", err)
-				default:
 				}
 
 				if len(gotIDs) != len(wantIDs) {

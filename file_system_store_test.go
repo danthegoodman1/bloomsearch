@@ -230,20 +230,18 @@ func collectQueryRows(t *testing.T, engine *BloomSearchEngine, query *Query) []m
 	t.Helper()
 
 	ctx := context.Background()
-	resultChan := make(chan map[string]any, 1024)
-	errorChan := make(chan error, 16)
-	if err := engine.Query(ctx, query, resultChan, errorChan, nil); err != nil {
+	res, err := engine.Query(ctx, query)
+	if err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
+	defer res.Close()
 
 	var rows []map[string]any
-	for row := range resultChan {
-		rows = append(rows, row)
+	for res.Next() {
+		rows = append(rows, res.Row())
 	}
-	select {
-	case err := <-errorChan:
+	if err := res.Err(); err != nil {
 		t.Fatalf("query worker error: %v", err)
-	default:
 	}
 	return rows
 }
@@ -446,17 +444,14 @@ func TestFileSystemStoreConcurrentFlushQuery(t *testing.T) {
 			default:
 			}
 
-			resultChan := make(chan map[string]any, 4096)
-			errorChan := make(chan error, 16)
-			if err := engine.Query(ctx, query, resultChan, errorChan, nil); err != nil {
+			res, err := engine.Query(ctx, query)
+			if err != nil {
 				return fmt.Errorf("query failed: %w", err)
 			}
-			for range resultChan {
+			for res.Next() {
 			}
-			select {
-			case err := <-errorChan:
+			if err := res.Err(); err != nil {
 				return fmt.Errorf("query worker error: %w", err)
-			default:
 			}
 		}
 	}

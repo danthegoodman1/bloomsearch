@@ -47,37 +47,26 @@ if err := <-doneChan; err != nil {
     log.Fatal(err)
 }
 
-// Collect the resulting rows that match
-resultChan := make(chan map[string]any, 100)
-// If any of the workers error, they report it here
-errorChan := make(chan error, 10)
-
-err := engine.Query(
+// Stream the matching rows through the engine-owned cursor
+results, err := engine.Query(
     ctx,
     // Query for rows where `.level: "error"`
     NewQuery().Field("level").Token("error").Build(),
-    resultChan,
-    errorChan,
 )
 if err != nil {
     log.Fatal(err)
 }
+defer results.Close() // safe to call at any point; ends the query early
 
-// Process results
-for {
-    select {
-    case <-ctx.Done():
-        return
-    case row, activeWorkers := <-resultChan:
-        if !activeWorkers {
-            return
-        }
-        // Process matching row
-        fmt.Printf("Found row: %+v\n", row)
-    case err := <-errorChan:
-        log.Printf("Query error: %v", err)
-        // Continue processing other results, or cancel context
-    }
+for results.Next() {
+    // Process matching row
+    fmt.Printf("Found row: %+v\n", results.Row())
+}
+// Err is nil on clean completion; failed blocks report joined errors here
+// (the query continues past them), and a canceled query reports its
+// context error
+if err := results.Err(); err != nil {
+    log.Fatal(err)
 }
 ```
 
@@ -387,12 +376,12 @@ Memory usage scales with concurrent file reads, not dataset size.
 
 This flow is a bit simplified, see `BloomSearchEngine.Query` for more detail.
 
-As you notice, `BloomSearchEngine.Query` takes in a `resultChan` and `errorChan`. This is because each row group
-processor reads the row group one row at a time, allowing to stream matches back to the caller.
+`BloomSearchEngine.Query` returns an engine-owned `Results` cursor. Each row group
+processor reads the row group one row at a time, streaming matches into the cursor, so the caller receives rows through `Next`/`Row` as they are found.
 
 This enables processing of arbitrarily large results as well.
 
-When the `resultChan` closes, there are no more active row group processors, and the caller can exit.
+When `Next` returns `false`, no row group processors remain: `Err` reports the terminal state (nil on clean completion, the joined block errors when some blocks failed, or the context error when the query was canceled), and `Stats` is complete. Call `Close` to terminate a query early.
 
 #### Distributed Query Processing ([issue](https://github.com/danthegoodman1/bloomsearch/issues/14))
 

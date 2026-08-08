@@ -161,12 +161,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 4A: Cursor/iterator Query API; engine owns all channels | Missing: API + ported tests. |
-| Incomplete | Work | 4B: Cancellation → terminal error; error semantics decided + documented | Missing: implementation + cancellation test. |
-| Incomplete | Work | 4C: Semaphore not held while blocked on consumer | Missing: implementation + slow-consumer starvation test. |
-| Incomplete | Work | 4D: Accurate BlockStats; defined delivery contract | Missing: implementation + stats assertion test. |
-| Incomplete | Work | 4E: Single-parse row materialization | Missing: implementation + allocation delta noted. |
-| Incomplete | Gate | Suite `-race` clean; docs compile | Missing: passing run + doc test. |
+| Complete | Work | 4A: Cursor/iterator Query API; engine owns all channels | `Query(ctx, q) (*Results, error)` in query_results.go (Next/Row/Err/Stats/Close); old signature deleted; all tests ported assertion-for-assertion (reviewer-verified zero weakening). Test: `TestQueryCursorBasic`. |
+| Complete | Work | 4B: Cancellation → terminal error; error semantics decided + documented | Skip-and-report per block (`errors.Join`); ctx cancel terminal with buffered rows dropped; setup-phase cancel returns `(nil, err)`. Tests: `TestQueryCursorCancellation`, `TestQueryCursorBlockErrorContinues`, `TestQueryCursorCloseEarly`. |
+| Complete | Work | 4C: Semaphore not held while blocked on consumer | try-send/release/blocking-send/re-acquire in `deliver`; leak-free on every exit path (reviewer-enumerated). Red-checked vs HEAD starvation. Test: `TestQueryCursorSlowConsumerNoStarvation`. |
+| Complete | Work | 4D: Accurate BlockStats; defined delivery contract | Actual scanned rows/bytes (0 when skipped); lossless mutex-guarded collection; `QueryStats` aggregates. Test: `TestBlockStatsAccuracy`. |
+| Complete | Work | 4E: Single-parse row materialization | `rowValue.Value()` map (checked assertion); second `json.Unmarshal` deleted. FieldTokenHit allocs −31% (p=0.029, reviewer-reproduced), Regex −24%. Test: `TestQueryRowMaterializationEquivalence` (incl. 2^53+1, 1e20). |
+| Complete | Gate | Suite `-race` clean; docs compile | `go test -race -count=1 ./...` ok (46.2s, coordinator-verified); concurrency set `-race -count=3` zero flakes; README Quick Start + Query-path prose ported to cursor (compiling `Example` in example_test.go); one review round (blocker was the stale README). |
 
 ## Phase 5: Bloom effectiveness and file format v2
 

@@ -69,22 +69,18 @@ func ingestAndFlush(t *testing.T, engine *BloomSearchEngine, rows []map[string]a
 func queryRows(t *testing.T, engine *BloomSearchEngine, query *Query) []map[string]any {
 	t.Helper()
 
-	resultChan := make(chan map[string]any, 1024)
-	errorChan := make(chan error, 16)
-	if err := engine.Query(context.Background(), query, resultChan, errorChan, nil); err != nil {
+	res, err := engine.Query(context.Background(), query)
+	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
+	defer res.Close()
 
 	var results []map[string]any
-	for row := range resultChan {
-		results = append(results, row)
+	for res.Next() {
+		results = append(results, res.Row())
 	}
-	select {
-	case err := <-errorChan:
-		if err != nil {
-			t.Fatalf("Query returned error: %v", err)
-		}
-	default:
+	if err := res.Err(); err != nil {
+		t.Fatalf("Query returned error: %v", err)
 	}
 	return results
 }

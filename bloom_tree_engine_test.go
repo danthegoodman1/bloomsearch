@@ -43,34 +43,20 @@ func runQueryTest(t *testing.T, engine *BloomSearchEngine, ctx context.Context, 
 	t.Run(testName, func(t *testing.T) {
 		query := queryBuilder.Build()
 
-		// Execute query. Stats are not consumed: the engine never closes
-		// statsChan, so a goroutine ranging it would outlive the test and log
-		// after completion (a race detector failure).
-		resultChan := make(chan map[string]any, 100)
-		errorChan := make(chan error, 10)
-		err := engine.Query(ctx, query, resultChan, errorChan, nil)
+		res, err := engine.Query(ctx, query)
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
+		defer res.Close()
 
 		var results []map[string]any
-		var queryErr error
-
-		for result := range resultChan {
-			results = append(results, result)
-		}
-
-		select {
-		case err := <-errorChan:
-			if err != nil {
-				queryErr = err
-			}
-		default:
+		for res.Next() {
+			results = append(results, res.Row())
 		}
 
 		// Verify results
-		if queryErr != nil {
-			t.Fatalf("Query error: %v", queryErr)
+		if err := res.Err(); err != nil {
+			t.Fatalf("Query error: %v", err)
 		}
 
 		// Check result count
@@ -555,34 +541,20 @@ func TestBloomSearchEngineQueryEndToEndUncompressed(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Execute query. Stats are not consumed: the engine never closes
-			// statsChan, so a goroutine ranging it would outlive the test and
-			// log after completion (a race detector failure).
-			resultChan := make(chan map[string]any, 100)
-			errorChan := make(chan error, 10)
-			err := engine.Query(ctx, tc.query, resultChan, errorChan, nil)
+			res, err := engine.Query(ctx, tc.query)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
+			defer res.Close()
 
 			var results []map[string]any
-			var queryErr error
-
-			for result := range resultChan {
-				results = append(results, result)
-			}
-
-			select {
-			case err := <-errorChan:
-				if err != nil {
-					queryErr = err
-				}
-			default:
+			for res.Next() {
+				results = append(results, res.Row())
 			}
 
 			// Verify results
-			if queryErr != nil {
-				t.Fatalf("Query error: %v", queryErr)
+			if err := res.Err(); err != nil {
+				t.Fatalf("Query error: %v", err)
 			}
 
 			// Check result count
@@ -718,34 +690,20 @@ func TestBloomSearchEngineQueryEndToEndZstd(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Execute query. Stats are not consumed: the engine never closes
-			// statsChan, so a goroutine ranging it would outlive the test and
-			// log after completion (a race detector failure).
-			resultChan := make(chan map[string]any, 100)
-			errorChan := make(chan error, 10)
-			err := engine.Query(ctx, tc.query, resultChan, errorChan, nil)
+			res, err := engine.Query(ctx, tc.query)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
+			defer res.Close()
 
 			var results []map[string]any
-			var queryErr error
-
-			for result := range resultChan {
-				results = append(results, result)
-			}
-
-			select {
-			case err := <-errorChan:
-				if err != nil {
-					queryErr = err
-				}
-			default:
+			for res.Next() {
+				results = append(results, res.Row())
 			}
 
 			// Verify results
-			if queryErr != nil {
-				t.Fatalf("Query error: %v", queryErr)
+			if err := res.Err(); err != nil {
+				t.Fatalf("Query error: %v", err)
 			}
 
 			// Check result count
@@ -881,34 +839,20 @@ func TestBloomSearchEngineQueryEndToEndSnappy(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Execute query. Stats are not consumed: the engine never closes
-			// statsChan, so a goroutine ranging it would outlive the test and
-			// log after completion (a race detector failure).
-			resultChan := make(chan map[string]any, 100)
-			errorChan := make(chan error, 10)
-			err := engine.Query(ctx, tc.query, resultChan, errorChan, nil)
+			res, err := engine.Query(ctx, tc.query)
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
+			defer res.Close()
 
 			var results []map[string]any
-			var queryErr error
-
-			for result := range resultChan {
-				results = append(results, result)
-			}
-
-			select {
-			case err := <-errorChan:
-				if err != nil {
-					queryErr = err
-				}
-			default:
+			for res.Next() {
+				results = append(results, res.Row())
 			}
 
 			// Verify results
-			if queryErr != nil {
-				t.Fatalf("Query error: %v", queryErr)
+			if err := res.Err(); err != nil {
+				t.Fatalf("Query error: %v", err)
 			}
 
 			// Check result count
@@ -1700,27 +1644,21 @@ func TestBloomSearchEngineMergeStreamingOutputCompression(t *testing.T) {
 				t.Fatal("Expected merged block to include row data hash")
 			}
 
-			resultChan := make(chan map[string]any, 10)
-			errorChan := make(chan error, 10)
-			statsChan := make(chan BlockStats, 10)
-			if err := engine.Query(ctx, NewQuery().Field("id").Build(), resultChan, errorChan, statsChan); err != nil {
+			res, err := engine.Query(ctx, NewQuery().Field("id").Build())
+			if err != nil {
 				t.Fatalf("Query failed: %v", err)
 			}
+			defer res.Close()
 
 			resultCount := 0
-			for range resultChan {
+			for res.Next() {
 				resultCount++
+			}
+			if err := res.Err(); err != nil {
+				t.Fatalf("Query returned error: %v", err)
 			}
 			if resultCount != 2 {
 				t.Fatalf("Expected 2 merged query results, got %d", resultCount)
-			}
-
-			select {
-			case queryErr := <-errorChan:
-				if queryErr != nil {
-					t.Fatalf("Query returned error: %v", queryErr)
-				}
-			default:
 			}
 		})
 	}
@@ -1891,14 +1829,14 @@ func TestBloomSearchEngineQueryInvalidRegexReturnsError(t *testing.T) {
 		t.Fatalf("Failed to create engine: %v", err)
 	}
 
-	resultChan := make(chan map[string]any, 10)
-	errorChan := make(chan error, 10)
-	statsChan := make(chan BlockStats, 10)
 	query := NewQuery().FieldRegex("message", "[unterminated(").Build()
 
-	err = engine.Query(context.Background(), query, resultChan, errorChan, statsChan)
+	res, err := engine.Query(context.Background(), query)
 	if err == nil {
 		t.Fatalf("expected regex compile error but got nil")
+	}
+	if res != nil {
+		t.Fatalf("expected nil Results on compile error, got %v", res)
 	}
 	if !strings.Contains(err.Error(), "failed to compile regex query") {
 		t.Fatalf("expected compile regex error, got: %v", err)
@@ -1942,52 +1880,33 @@ func TestBloomSearchEngineRegexFieldGuardPrunesFiles(t *testing.T) {
 		{"id": 2.0, "service": "auth", "message": "timeout"},
 	}, "row with regex field")
 
-	resultChan := make(chan map[string]any, 10)
-	errorChan := make(chan error, 10)
-	statsChan := make(chan BlockStats, 10)
-
 	query := NewQuery().
 		FieldRegex("message", "timeout").
 		Build()
 
-	err = engine.Query(ctx, query, resultChan, errorChan, statsChan)
+	res, err := engine.Query(ctx, query)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
+	defer res.Close()
 
 	var results []map[string]any
-	for row := range resultChan {
-		results = append(results, row)
+	for res.Next() {
+		results = append(results, res.Row())
+	}
+	if err := res.Err(); err != nil {
+		t.Fatalf("Query returned error: %v", err)
 	}
 
-	select {
-	case queryErr := <-errorChan:
-		if queryErr != nil {
-			t.Fatalf("Query returned error: %v", queryErr)
-		}
-	default:
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	var stats []BlockStats
-	for {
-		select {
-		case stat := <-statsChan:
-			stats = append(stats, stat)
-		default:
-			goto doneStats
-		}
-	}
-
-doneStats:
+	stats := res.Stats()
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
 	if results[0]["id"] != 2.0 {
 		t.Fatalf("expected row id=2.0, got %v", results[0]["id"])
 	}
-	if len(stats) != 1 {
-		t.Fatalf("expected only one block to be processed due regex field pruning, got %d", len(stats))
+	if len(stats.BlockStats) != 1 {
+		t.Fatalf("expected only one block to be processed due regex field pruning, got %d", len(stats.BlockStats))
 	}
 }
 
@@ -2045,29 +1964,22 @@ func TestBloomSearchEngineQueryProcessesAllBlocksWithBoundedConcurrency(t *testi
 		t.Fatalf("test setup invalid: expected more blocks (%d) than MaxQueryConcurrency (%d)", totalBlocks, config.MaxQueryConcurrency)
 	}
 
-	resultChan := make(chan map[string]any, totalRows)
-	errorChan := make(chan error, totalRows)
-	statsChan := make(chan BlockStats, totalRows)
-
-	if err := engine.Query(ctx, NewQuery().Build(), resultChan, errorChan, statsChan); err != nil {
+	res, err := engine.Query(ctx, NewQuery().Build())
+	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
+	defer res.Close()
 
 	resultCount := 0
-	for range resultChan {
+	for res.Next() {
 		resultCount++
+	}
+	if err := res.Err(); err != nil {
+		t.Fatalf("Query returned error: %v", err)
 	}
 
 	if resultCount != totalRows {
 		t.Fatalf("Expected %d results but got %d", totalRows, resultCount)
-	}
-
-	select {
-	case queryErr := <-errorChan:
-		if queryErr != nil {
-			t.Fatalf("Query returned error: %v", queryErr)
-		}
-	default:
 	}
 }
 
@@ -2224,46 +2136,36 @@ func TestBloomSearchEngineFileLevelBloomRetainsInFlightRowsAcrossFlushes(t *test
 		t.Fatal("Timed out waiting for second flush completion")
 	}
 
-	queryAllResults := make(chan map[string]any, 10)
-	queryAllErrors := make(chan error, 10)
-	queryAllStats := make(chan BlockStats, 10)
-	if err := engine.Query(ctx, NewQuery().Build(), queryAllResults, queryAllErrors, queryAllStats); err != nil {
+	allRes, err := engine.Query(ctx, NewQuery().Build())
+	if err != nil {
 		t.Fatalf("Failed to start all-rows query: %v", err)
 	}
+	defer allRes.Close()
 
 	allRows := make([]map[string]any, 0, 2)
-	for row := range queryAllResults {
-		allRows = append(allRows, row)
+	for allRes.Next() {
+		allRows = append(allRows, allRes.Row())
 	}
-	select {
-	case queryErr := <-queryAllErrors:
-		if queryErr != nil {
-			t.Fatalf("All-rows query failed: %v", queryErr)
-		}
-	default:
+	if err := allRes.Err(); err != nil {
+		t.Fatalf("All-rows query failed: %v", err)
 	}
 
 	if len(allRows) != 2 {
 		t.Fatalf("Expected 2 total rows after two flushes, got %d", len(allRows))
 	}
 
-	tokenQueryResults := make(chan map[string]any, 10)
-	tokenQueryErrors := make(chan error, 10)
-	tokenQueryStats := make(chan BlockStats, 10)
-	if err := engine.Query(ctx, NewQuery().Token(token).Build(), tokenQueryResults, tokenQueryErrors, tokenQueryStats); err != nil {
+	tokenRes, err := engine.Query(ctx, NewQuery().Token(token).Build())
+	if err != nil {
 		t.Fatalf("Failed to start token query: %v", err)
 	}
+	defer tokenRes.Close()
 
 	var tokenRows []map[string]any
-	for row := range tokenQueryResults {
-		tokenRows = append(tokenRows, row)
+	for tokenRes.Next() {
+		tokenRows = append(tokenRows, tokenRes.Row())
 	}
-	select {
-	case queryErr := <-tokenQueryErrors:
-		if queryErr != nil {
-			t.Fatalf("Token query failed: %v", queryErr)
-		}
-	default:
+	if err := tokenRes.Err(); err != nil {
+		t.Fatalf("Token query failed: %v", err)
 	}
 
 	if len(tokenRows) != 1 {

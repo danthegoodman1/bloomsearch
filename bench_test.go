@@ -123,19 +123,17 @@ func benchQuery(b *testing.B, q *Query, wantResults bool) {
 	b.ResetTimer()
 	total := 0
 	for i := 0; i < b.N; i++ {
-		resultChan := make(chan map[string]any, 1024)
-		errorChan := make(chan error, 16)
-		if err := engine.Query(ctx, q, resultChan, errorChan, nil); err != nil {
+		res, err := engine.Query(ctx, q)
+		if err != nil {
 			b.Fatal(err)
 		}
-		for range resultChan {
+		for res.Next() {
 			total++
 		}
-		select {
-		case err := <-errorChan:
+		if err := res.Err(); err != nil {
 			b.Fatal(err)
-		default:
 		}
+		res.Close()
 	}
 	b.StopTimer()
 	if wantResults && total == 0 {

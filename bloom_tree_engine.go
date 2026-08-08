@@ -172,6 +172,11 @@ type BloomSearchEngine struct {
 	querySemaphore chan struct{}
 }
 
+// BlockStats describes one block job of a query. RowsProcessed and
+// BytesProcessed report what the scan actually read — rows and uncompressed
+// row bytes (length prefix included) — so a bloom-skipped block reports zero.
+// TotalRows and TotalBytes are the block's metadata totals (TotalBytes is the
+// on-disk block size, bloom filters included).
 type BlockStats struct {
 	FilePointer        []byte
 	BlockOffset        int
@@ -1184,31 +1189,16 @@ func (b *BloomSearchEngine) evaluateBloomCondition(
 	return
 }
 
-// Query executes a query and sends results to the provided channels.
-// The result channel feeds individual matching rows. Canceling the context
-// will stop all workers. When the result channel closes, no more work is happening.
+// Query starts a query and returns a Results cursor streaming the matching
+// rows. Everything that can fail fast — regex compilation, the MetaStore
+// lookup, prefilter enforcement, and file-level bloom pruning — runs
+// synchronously and returns (nil, err) without starting anything. On success
+// the engine owns every channel and goroutine behind the cursor; see Results
+// for the iteration, error, cancellation, and stats contracts.
 //
-// The error channel is written to for any errors that occur per-worker. If a worker writes to this channel,
-// it has stopped processing.
-//
-// Example usage:
-//
-//	resultChan := make(chan map[string]any, 1000)
-//	errorChan := make(chan error, 100)
-//	err := engine.Query(ctx, query, resultChan, errorChan, nil)
-//	if err != nil { return err }
-//	for {
-//	  select {
-//	  case <-ctx.Done():
-//	    return ctx.Err()
-//	  case row, ok := <-resultChan:
-//	    if !ok { return nil } // done
-//	    // process row
-//	  case err := <-errorChan:
-//	    return err
-//	  }
-//	}
-func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan chan<- map[string]any, errorChan chan<- error, statsChan chan<- BlockStats) error {
+// Queries are independent of the ingest lifecycle: a stopped engine still
+// serves queries, because reads touch only the MetaStore and DataStore.
+func (b *BloomSearchEngine) Query(ctx context.Context, query *Query) (*Results, error) {
 	if query == nil {
 		query = NewQuery().Build()
 	}
@@ -1220,14 +1210,14 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 
 	compiledRegexQuery, err := CompileRegexQuery(query.Regex)
 	if err != nil {
-		return fmt.Errorf("failed to compile regex query: %w", err)
+		return nil, fmt.Errorf("failed to compile regex query: %w", err)
 	}
 
 	pruneBloomQuery := AndBloomQueries(rowBloomQuery, RegexFieldGuardBloomQuery(query.Regex))
 
 	maybeFiles, err := b.metaStore.GetMaybeFilesForQuery(ctx, query.Prefilter)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// The engine enforces strict prefilter semantics itself: MetaStore-side
@@ -1298,33 +1288,41 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 		}
 	}
 
+	// Cancellation during setup surfaces as a query error rather than
+	// silently proceeding with whichever files happened to be evaluated.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	totalJobs := 0
 	for _, matchingFile := range matchingFiles {
 		totalJobs += len(matchingFile.Metadata.DataBlocks)
 	}
 
+	r := newResults(ctx)
+
 	if totalJobs == 0 {
-		close(resultChan)
-		return nil
+		r.markWorkersDone()
+		return r, nil
 	}
 
 	workerCount := min(b.config.MaxQueryConcurrency, totalJobs)
 	jobs := make(chan dataBlockJob, workerCount)
 
 	var wg sync.WaitGroup
-	workerCtx, workerCancel := context.WithCancel(ctx)
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
+			slot := querySlot{sem: b.querySemaphore, ctx: r.ctx}
+			defer slot.release()
 			for job := range jobs {
-				if err := SendWithContext(workerCtx, b.querySemaphore, struct{}{}); err != nil {
+				if !slot.acquire() {
 					return
 				}
-
-				b.processDataBlock(workerCtx, job, resultChan, errorChan, rowBloomQuery, pruneBloomQuery, compiledRegexQuery, statsChan)
-				<-b.querySemaphore
+				b.processDataBlock(r, &slot, job, rowBloomQuery, pruneBloomQuery, compiledRegexQuery)
+				slot.release()
 			}
 		}()
 	}
@@ -1338,64 +1336,79 @@ func (b *BloomSearchEngine) Query(ctx context.Context, query *Query, resultChan 
 					filePointer:   matchingFile.PointerBytes,
 					blockMetadata: blockMetadata,
 				}
-				if err := SendWithContext(workerCtx, jobs, job); err != nil {
+				if err := SendWithContext(r.ctx, jobs, job); err != nil {
 					return
 				}
 			}
 		}
 	}()
 
-	// Close result channel when all workers are done
 	go func() {
-		defer workerCancel()
 		wg.Wait()
-		close(resultChan) // closing this indicates that all workers are done, and no more errors can come either
+		r.markWorkersDone()
 	}()
 
-	return nil
+	return r, nil
 }
 
-// processDataBlock processes a specific data block job
+// processDataBlock scans one data block for the query behind r, delivering
+// matched rows to the cursor and recording the block's stats losslessly.
+//
+// A failure in this block records its error on the cursor and returns: the
+// query continues with other blocks, because partial results are valuable for
+// search, and the error surfaces from Results.Err once iteration finishes.
+// Cancellation (of the Query context, or via Results.Close) is not a block
+// error; it just stops the scan.
 func (b *BloomSearchEngine) processDataBlock(
-	ctx context.Context,
+	r *Results,
+	slot *querySlot,
 	job dataBlockJob,
-	resultChan chan<- map[string]any,
-	errorChan chan<- error,
 	rowBloomQuery *BloomQuery,
 	pruneBloomQuery *BloomQuery,
 	regexQuery *compiledRegexQuery,
-	statsChan chan<- BlockStats,
 ) {
 	blockStartTime := time.Now()
 	var bloomFilterSkipped bool
+	var rowsScanned, bytesScanned int64
 
-	// Always send stats when we exit, regardless of success/failure
+	// Record stats on every exit path. RowsProcessed/BytesProcessed report
+	// what was actually scanned (zero for a bloom-skipped block); TotalRows/
+	// TotalBytes remain the block's full counts.
 	defer func() {
-		duration := time.Since(blockStartTime)
-
-		blockStats := BlockStats{
+		r.recordBlockStats(BlockStats{
 			FilePointer:        job.filePointer,
 			BlockOffset:        job.blockMetadata.Offset,
-			RowsProcessed:      int64(job.blockMetadata.Rows), // Full block rows
-			BytesProcessed:     int64(job.blockMetadata.Size), // Full block size
+			RowsProcessed:      rowsScanned,
+			BytesProcessed:     bytesScanned,
 			TotalRows:          int64(job.blockMetadata.Rows),
 			TotalBytes:         int64(job.blockMetadata.Size),
-			Duration:           duration,
+			Duration:           time.Since(blockStartTime),
 			BloomFilterSkipped: bloomFilterSkipped,
-		}
-
-		TryWriteChannel(statsChan, blockStats)
+		})
 	}()
+
+	ctx := r.ctx
+
+	// fail records a block error unless the query has terminated: after
+	// cancellation or Close, the terminal state (Results.Err) already tells
+	// the story, and errors provoked by the teardown itself are noise.
+	fail := func(err error) {
+		if ctx.Err() != nil {
+			return
+		}
+		r.recordBlockError(err)
+	}
+
 	file, err := b.dataStore.OpenFile(ctx, job.filePointer)
 	if err != nil {
-		SendWithContext(ctx, errorChan, fmt.Errorf("failed to open file: %w", err))
+		fail(fmt.Errorf("failed to open file: %w", err))
 		return
 	}
 	defer file.Close()
 
 	blockBloomFilters, err := ReadDataBlockBloomFilters(file, job.blockMetadata)
 	if err != nil {
-		SendWithContext(ctx, errorChan, fmt.Errorf("failed to read data block bloom filters: %w", err))
+		fail(fmt.Errorf("failed to read data block bloom filters: %w", err))
 		return
 	}
 
@@ -1411,7 +1424,7 @@ func (b *BloomSearchEngine) processDataBlock(
 
 	rowDataOffset := int64(job.blockMetadata.Offset + job.blockMetadata.BloomFiltersSize)
 	if _, err := file.Seek(rowDataOffset, 0); err != nil {
-		SendWithContext(ctx, errorChan, fmt.Errorf("failed to seek to row data: %w", err))
+		fail(fmt.Errorf("failed to seek to row data: %w", err))
 		return
 	}
 
@@ -1434,13 +1447,13 @@ func (b *BloomSearchEngine) processDataBlock(
 	case CompressionZstd:
 		decoder, err := zstd.NewReader(hashReader)
 		if err != nil {
-			SendWithContext(ctx, errorChan, fmt.Errorf("failed to create zstd decoder: %w", err))
+			fail(fmt.Errorf("failed to create zstd decoder: %w", err))
 			return
 		}
 		rowDataReader = decoder
 		defer decoder.Close()
 	default:
-		SendWithContext(ctx, errorChan, fmt.Errorf("unsupported compression type: %s", job.blockMetadata.Compression))
+		fail(fmt.Errorf("unsupported compression type: %s", job.blockMetadata.Compression))
 		return
 	}
 
@@ -1448,12 +1461,17 @@ func (b *BloomSearchEngine) processDataBlock(
 	var lengthBytes [LengthPrefixSize]byte
 	rowBuf := make([]byte, 0)
 	for {
+		// Cancellation is terminal for the query; stop scanning promptly.
+		if ctx.Err() != nil {
+			return
+		}
+
 		n, err := io.ReadFull(rowDataReader, lengthBytes[:])
 		if err == io.EOF {
 			break // End of data
 		}
 		if err != nil || n != LengthPrefixSize {
-			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row length: %w", err))
+			fail(fmt.Errorf("failed to read row length: %w", err))
 			return
 		}
 
@@ -1467,29 +1485,38 @@ func (b *BloomSearchEngine) processDataBlock(
 
 		n, err = io.ReadFull(rowDataReader, rowBuf)
 		if err != nil || n != int(rowLength) {
-			SendWithContext(ctx, errorChan, fmt.Errorf("failed to read row data: %w", err))
+			fail(fmt.Errorf("failed to read row data: %w", err))
 			return
 		}
+
+		rowsScanned++
+		bytesScanned += int64(LengthPrefixSize) + int64(rowLength)
 
 		rowValue := gjson.ParseBytes(rowBuf)
 		if !TestGJSONForQuery(rowValue, rowBloomQuery, regexQuery, ".", b.config.Tokenizer) {
 			continue
 		}
 
-		row := make(map[string]any)
-		if err := json.Unmarshal(rowBuf, &row); err != nil {
-			SendWithContext(ctx, errorChan, fmt.Errorf("failed to unmarshal row: %w", err))
+		// Materialize the row from the same gjson parse used for matching —
+		// one parse per row. gjson materializes JSON numbers as float64,
+		// matching encoding/json, and ParseBytes copied rowBuf, so the map
+		// does not alias the reused scan buffer.
+		row, ok := rowValue.Value().(map[string]any)
+		if !ok {
+			fail(fmt.Errorf("row is not a JSON object"))
 			return
 		}
 
-		SendWithContext(ctx, resultChan, row)
+		if err := r.deliver(slot, row); err != nil {
+			return
+		}
 	}
 
 	// Verify hash after all data has been read
 	if job.blockMetadata.RowDataHash != 0 {
 		computedHash := hashReader.Sum32()
 		if computedHash != job.blockMetadata.RowDataHash {
-			SendWithContext(ctx, errorChan, fmt.Errorf("row data hash mismatch: expected %x, got %x", job.blockMetadata.RowDataHash, computedHash))
+			fail(fmt.Errorf("row data hash mismatch: expected %x, got %x", job.blockMetadata.RowDataHash, computedHash))
 			return
 		}
 	}
